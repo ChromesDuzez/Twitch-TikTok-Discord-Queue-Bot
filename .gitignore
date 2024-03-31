@@ -145,6 +145,6 @@ dmypy.json
 .prof
 
 #client specific files to ignore
-.properties
+config.properties
 
 # End of https://www.toptal.com/developers/gitignore/api/python
