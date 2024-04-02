@@ -1,17 +1,12 @@
 ## Import statements
-import configparser
 from discord.ext import commands
-import discord
 import typing
 from dataclasses import dataclass, field
+import discord
+import os # default module
+from dotenv import load_dotenv
 
-#Load in config file/config settings
-config = configparser.RawConfigParser()
-try:
-    config.read('config.properties')
-except:
-    print("Failed to read config.properties - Make sure the file exists")
-    exit
+load_dotenv() # load all the variables from the env file
 
 #Dataclass of a User which we will store in a queue
 @dataclass
@@ -54,73 +49,82 @@ def insertUserIntoQueue(queueName, user):
     return success
 
 #Starting the discord bot
-bot = commands.Bot(command_prefix=".", intents=discord.Intents.all())
+#bot = discord.Bot(command_prefix=".", intents=discord.Intents.all())
+bot = discord.Bot()
+
+@bot.slash_command()
+async def sync(ctx):
+    print("sync command")
+    if ctx.channel == bot.get_channel(int(os.getenv('BOT_LOG_ID'))):
+        await bot.tree.sync()
+        await ctx.respond('Command tree synced.')
+    else:
+        await ctx.respond('You must be the owner to use this command!')
 
 
-
-@bot.listen('on_ready')
+@bot.event
 async def on_ready():
     print("Hello! Chromes Py-Bot is ready!")
-    channel = bot.get_channel(int(config.get('Discord', 'BOT_LOG_ID')))
+    channel = bot.get_channel(int(os.getenv('BOT_LOG_ID')))
     await channel.send("Hello! Chromes Py-Bot is ready!")
 
 
 
-@bot.command(
+@bot.slash_command(
         name="ping",
         description="Ping command"
 )
 async def ping(ctx):
-    await ctx.send("pong!")
+    await ctx.respond("pong!")
 
 
 
-@bot.command(
+@bot.slash_command(
         name="helpme",
         description="not gonna help ya btw"
 )
 async def helpme(ctx):
-    await ctx.send("no")
+    await ctx.respond("no")
 
 
 
-@bot.command(
-        name="getQueues",
+@bot.slash_command(
+        name="getqueues",
         description="Get the queues locked or not"
 )
 async def getQueues(ctx):
-    await ctx.send(f"There are {len(ACTIVE_QUEUES)} active queues: {getQueuesString()}")
+    await ctx.respond(f"There are {len(ACTIVE_QUEUES)} active queues: {getQueuesString()}")
 
 
 
-@bot.command(
-        name="createQueue",
+@bot.slash_command(
+        name="createqueue",
         description="it's a little on the nose ik"
 )
 async def createQueue(ctx, name: str, rate: typing.Optional[int] = 1, vc_id: typing.Optional[int] = 0, vc_optional: typing.Optional[bool] = True):
     if name in getActiveQueuesList():
-        await ctx.send(f"Failed to create queue {name} because a queue already exists with that name.")
+        await ctx.respond(f"Failed to create queue {name} because a queue already exists with that name.")
         return
     queue = Queue(name, rate, vc_optional, vc_id)
     ACTIVE_QUEUES.append(queue)
-    await ctx.send(f"Created queue: {queue.name}")
+    await ctx.respond(f"Created queue: {queue.name}")
 
 
 
-@bot.command(
-        name="deleteQueue",
+@bot.slash_command(
+        name="deletequeue",
         description="deletes the queue based on the name you put in"
 )
 async def deleteQueue(ctx, name):
     for q in ACTIVE_QUEUES[::-1]:
         if q.name == name:
             ACTIVE_QUEUES.remove(q)
-    await ctx.send(f"There are now {len(ACTIVE_QUEUES)} active queues: {getQueuesString()}")
+    await ctx.respond(f"There are now {len(ACTIVE_QUEUES)} active queues: {getQueuesString()}")
 
 
 
-@bot.command(
-        name="joinQueue",
+@bot.slash_command(
+        name="joinqueue",
         description="joins the author into the specified queue"
 )
 async def joinQueue(ctx, queue: str, username: typing.Optional[str] = ""):
@@ -130,10 +134,10 @@ async def joinQueue(ctx, queue: str, username: typing.Optional[str] = ""):
         alt_name = author.nick
     user = User(author.display_name, alt_name, username, author.id)
     if insertUserIntoQueue(queue, user):
-        await ctx.send(str(user) + " added to the queue: " + queue)
+        await ctx.respond(str(user) + " added to the queue: " + queue)
     else:
-        await ctx.send(str(user) + " failed to be added to the queue: " + queue)
+        await ctx.respond(str(user) + " failed to be added to the queue: " + queue)
 
 
 
-bot.run(config.get('Discord', 'BOT_TOKEN'))
+bot.run(os.getenv('BOT_TOKEN'))
