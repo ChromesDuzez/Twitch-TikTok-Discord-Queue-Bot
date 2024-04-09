@@ -22,10 +22,10 @@ for cog in cogs_list:
 
 @bot.event
 async def on_ready():
+    await synced()
     print("Hello! Chromes Py-Bot is ready!")
     channel = bot.get_channel(int(os.getenv('BOT_LOG_ID')))
     await channel.send("Hello! Chromes Py-Bot is ready!")
-    await synced()
     
 
 
@@ -33,7 +33,10 @@ async def synced():
     if bot.auto_sync_commands:
         await bot.sync_commands()
     print(f"{bot.user.name} connected.")
-    print(f"slash cmd's synced: {str(bot.commands)}")
+    for cmd in bot.commands:
+        print(f"Syncing: {cmd}")
+        await bot.process_application_commands(cmd)
+
 
 
 bot.run(os.getenv('BOT_TOKEN'))

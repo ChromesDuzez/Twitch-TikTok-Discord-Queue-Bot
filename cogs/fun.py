@@ -22,8 +22,11 @@ class Fun(commands.Cog): # create a class for our cog that inherits from command
                        ):
         print(f"{ctx.author.display_name} initiated freebird command.")
         if name == "":
-            name = ctx.author.display_name
-        await ctx.respond(f"@{name}, can you play freebird? \nhttps://youtu.be/0LwcvjNJTuM?si=pRsa-7PUoPI1T1lC")
+            name = f"<@{ctx.author.id}>"
+        if name[:2:] == "<@":
+            await ctx.respond(f"{name}, can you play freebird? \nhttps://youtu.be/0LwcvjNJTuM?si=pRsa-7PUoPI1T1lC")
+        else:
+            await ctx.respond(f"{name}, can you play freebird? \nhttps://youtu.be/0LwcvjNJTuM?si=pRsa-7PUoPI1T1lC")
 
 
 def setup(bot): # this is called by Pycord to setup the cog
