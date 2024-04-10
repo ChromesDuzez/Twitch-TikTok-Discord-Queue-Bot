@@ -49,6 +49,17 @@ class Fun(commands.Cog): # create a class for our cog that inherits from command
         responses = ["What the heck Cheddar?", "You're so funny Cheddar", "Why is our fill teammate a dictator?", "guys are gonna go", "Vote for Cheddar in the Roles Channel", 
                      "Don't let me find a shockwave grenade"]
         await ctx.respond(random.choice(responses))
+    
+    @discord.slash_command(name="cheese", description="Cheese War")
+    async def cheese(self,
+                     ctx: discord.ApplicationContext
+                     ):
+        try:
+            file = discord.File("media/cheese.mov")
+            await ctx.respond(file=file)
+        except:
+            await ctx.respond("https://media.discordapp.net/attachments/1223351898073989190/1227490539742691349/v0f044gc0000cnns4snog65v1qa2uka0.mov?ex=662898a6&is=661623a6&hm=c5826cf45ad5c73ad9b38c19fc6f77ed62eca688ed38c50bad7983ae57b1213e&")
+    
 
 
 def setup(bot): # this is called by Pycord to setup the cog
