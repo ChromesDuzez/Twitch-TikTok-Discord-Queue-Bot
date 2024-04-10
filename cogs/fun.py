@@ -1,5 +1,6 @@
 import discord
 from discord.ext import commands
+import random
 
 
 class Fun(commands.Cog): # create a class for our cog that inherits from commands.Cog
@@ -26,7 +27,28 @@ class Fun(commands.Cog): # create a class for our cog that inherits from command
         if name[:2:] == "<@":
             await ctx.respond(f"{name}, can you play freebird? \nhttps://youtu.be/0LwcvjNJTuM?si=pRsa-7PUoPI1T1lC")
         else:
-            await ctx.respond(f"{name}, can you play freebird? \nhttps://youtu.be/0LwcvjNJTuM?si=pRsa-7PUoPI1T1lC")
+            await ctx.respond(f"@{name}, can you play freebird? \nhttps://youtu.be/0LwcvjNJTuM?si=pRsa-7PUoPI1T1lC")
+
+    @discord.slash_command(name="doodob", description="yeah cuh")
+    async def doodob(self,
+                     ctx: discord.ApplicationContext
+                     ):
+        await ctx.respond(f"Welcome {ctx.author.display_name} to the Doodob Jedi Temple Discord.")
+    
+    @discord.slash_command(name="shadow", description="bye guyyysss")
+    async def shadow(self,
+                     ctx: discord.ApplicationContext
+                     ):
+        responses = ["Hi cheddar my best friend", "Sorry, guys are gonna go.", "Hi \nEverybody ", "Hi", "<@289752347842707456>  Do you wanna play?"]
+        await ctx.respond(random.choice(responses))
+    
+    @discord.slash_command(name="cheddar", description="Cheddarrrr")
+    async def cheddar(self,
+                     ctx: discord.ApplicationContext
+                     ):
+        responses = ["What the heck Cheddar?", "You're so funny Cheddar", "Why is our fill teammate a dictator?", "guys are gonna go", "Vote for Cheddar in the Roles Channel", 
+                     "Don't let me find a shockwave grenade"]
+        await ctx.respond(random.choice(responses))
 
 
 def setup(bot): # this is called by Pycord to setup the cog
