@@ -13,7 +13,8 @@ class Fun(commands.Cog): # create a class for our cog that inherits from command
     async def helpme(self, 
                      ctx: discord.ApplicationContext
                      ):
-        await ctx.respond("no")
+        responses = ["no", "absolutely not", "negative", "If you were to say \"don't help me\" I'd say \"affirmative\".", "negatory"]
+        await ctx.respond(random.choice(responses))
 
 
     @discord.slash_command(name="freebird", description="can ya?")
