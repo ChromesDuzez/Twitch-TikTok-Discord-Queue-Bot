@@ -48,7 +48,7 @@ class Fun(commands.Cog): # create a class for our cog that inherits from command
                      ctx: discord.ApplicationContext
                      ):
         responses = ["What the heck Cheddar?", "You're so funny Cheddar", "Why is our fill teammate a dictator?", "guys are gonna go", "Vote for Cheddar in the Roles Channel", 
-                     "Don't let me find a shockwave grenade"]
+                     "Don't let me find a shockwave grenade", "nuh uh"]
         await ctx.respond(random.choice(responses))
     
     @discord.slash_command(name="cheese", description="Cheese War")
