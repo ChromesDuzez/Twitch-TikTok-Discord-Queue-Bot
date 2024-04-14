@@ -51,6 +51,19 @@ class Fun(commands.Cog): # create a class for our cog that inherits from command
                      "Don't let me find a shockwave grenade", "nuh uh", "👋  hi chromessss"]
         await ctx.respond(random.choice(responses))
     
+    @discord.slash_command(name="sand", description="Big Brain Big IQ")
+    async def sand(self,
+                   ctx: discord.ApplicationContext
+                   ):
+        print(f"{ctx.author.display_name} initiated sand command.")
+        try:
+            file = discord.File("media/yumm.gif")
+            await ctx.respond(file=file)
+        except:
+            print("Exception caught in sand command.")
+            await ctx.respond("https://media.discordapp.net/attachments/1223351898073989190/1229146773050884166/yumm.gif?ex=662e9f23&is=661c2a23&hm=0db6c19f391899878c80be8c2e0bf83e0a61ce9dab072df5c506bb75c2a96b18&=")
+    
+
     @discord.slash_command(name="cheese", description="Cheese War")
     async def cheese(self,
                      ctx: discord.ApplicationContext
@@ -60,8 +73,10 @@ class Fun(commands.Cog): # create a class for our cog that inherits from command
             file = discord.File("media/cheese.mov")
             await ctx.respond(file=file)
         except:
-            await ctx.respond("https://media.discordapp.net/attachments/1223351898073989190/1227490539742691349/v0f044gc0000cnns4snog65v1qa2uka0.mov?ex=662898a6&is=661623a6&hm=c5826cf45ad5c73ad9b38c19fc6f77ed62eca688ed38c50bad7983ae57b1213e&")
-    
+            print("Exception caught in cheese command.")
+            await ctx.respond("https://media.discordapp.net/attachments/1223351898073989190/1227490539742691349/v0f044gc0000cnns4snog65v1qa2uka0.mov?ex=662898a6&is=661623a6&hm=c5826cf45ad5c73ad9b38c19fc6f77ed62eca688ed38c50bad7983ae57b1213e&=")
+
+
     @discord.slash_command(name="chromes", description="Chromes lines")
     async def chromes(self,
                      ctx: discord.ApplicationContext
