@@ -51,7 +51,7 @@ class Fun(commands.Cog): # create a class for our cog that inherits from command
                      "Don't let me find a shockwave grenade", "nuh uh", "👋  hi chromessss"]
         await ctx.respond(random.choice(responses))
     
-    @discord.slash_command(name="sand", description="Big Brain Big IQ")
+    @discord.slash_command(name="sand", description="Bigger Brain Bigger IQ")
     async def sand(self,
                    ctx: discord.ApplicationContext
                    ):
