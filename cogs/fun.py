@@ -112,10 +112,10 @@ class Fun(commands.Cog): # create a class for our cog that inherits from command
         response = random.choice(responses)
         try:
             file = discord.File(response[0])
-            await ctx.respond(file=file)
+            await ctx.respond("<@438846432703807488>", file=file)
         except:
             print("Exception caught in sqwalla command.")
-            await ctx.respond(response)
+            await ctx.respond("<@438846432703807488>" + str(response))
 
 
 def setup(bot): # this is called by Pycord to setup the cog
