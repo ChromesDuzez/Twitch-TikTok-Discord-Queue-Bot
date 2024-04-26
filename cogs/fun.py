@@ -110,14 +110,35 @@ class Fun(commands.Cog): # create a class for our cog that inherits from command
                      ("media/rat_griddy.mp4","https://cdn.discordapp.com/attachments/1223351898073989190/1233216980480430090/rat_griddy.mp4?ex=662c4a50&is=662af8d0&hm=88f9d6a37045fd7316f40477c4cd11ad37242fc81cdcf0b2e392f7c935817d24&"),
                      ("media/rat_griddy.gif","https://media.discordapp.net/attachments/1223351898073989190/1233216971571466240/rat_griddy.gif?ex=662c4a4e&is=662af8ce&hm=e7ffd62fff59f683865375856cd8203bdf0fb6a2e469aa3a675e5628abfe6d37&=")
                      ]
-        print(f"{ctx.author.display_name} initiated sqwalla command.")
         response = random.choice(responses)
-        try:
-            file = discord.File(response[0])
-            await ctx.respond("<@438846432703807488>", file=file)
-        except:
-            print("Exception caught in sqwalla command.")
-            await ctx.respond("<@438846432703807488>" + str(response))
+        print(f"{ctx.author.display_name} initiated sqwalla command. System is trying to respond with: \n {response}")
+        if type(response) == type(tuple()):
+            try:
+                file = discord.File(response[0])
+                await ctx.respond(f"<@438846432703807488> {response[0][6:-4:].replace("_", " ")}", file=file)
+            except:
+                print("Exception caught in sqwalla command.")
+                await ctx.respond(f"<@438846432703807488>  {response[0][6:-4:].replace("_", " ")} \n {str(response)}")
+        else:
+            await ctx.respond(response)
+    
+    @discord.slash_command(name="doc", description="The One Good Line")
+    async def doc(self,
+                  ctx: discord.ApplicationContext
+                  ):
+        responses = [("media/TheDoctor13b.png","https://media.discordapp.net/attachments/1223332540845129739/1233275432002912277/image.png?ex=662c80c0&is=662b2f40&hm=af4326c6f7c324e2fa853bb41e0edc3290407daab8a6fd4b08ef0847739d6700&=&format=webp&quality=lossless")
+                     ]
+        response = random.choice(responses)
+        print(f"{ctx.author.display_name} initiated sqwalla command. System is trying to respond with: \n {response}")
+        if type(response) == type(tuple()):
+            try:
+                file = discord.File(response[0])
+                await ctx.respond(f"{response[0][6:-4:].replace("_", " ")}", file=file)
+            except:
+                print("Exception caught in sqwalla command.")
+                await ctx.respond(f"{response[0][6:-4:].replace("_", " ")} \n {str(response)}")
+        else:
+            await ctx.respond(response)
 
 
 def setup(bot): # this is called by Pycord to setup the cog
