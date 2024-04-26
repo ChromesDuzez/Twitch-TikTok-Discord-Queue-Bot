@@ -129,7 +129,7 @@ class Fun(commands.Cog): # create a class for our cog that inherits from command
         responses = [("media/TheDoctor13b.png","https://media.discordapp.net/attachments/1223332540845129739/1233275432002912277/image.png?ex=662c80c0&is=662b2f40&hm=af4326c6f7c324e2fa853bb41e0edc3290407daab8a6fd4b08ef0847739d6700&=&format=webp&quality=lossless")
                      ]
         response = random.choice(responses)
-        print(f"{ctx.author.display_name} initiated sqwalla command. System is trying to respond with: \n {response}")
+        print(f"{ctx.author.display_name} initiated doc command. System is trying to respond with: \n {response}")
         if type(response) == type(tuple()):
             try:
                 file = discord.File(response[0])
