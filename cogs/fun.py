@@ -106,7 +106,9 @@ class Fun(commands.Cog): # create a class for our cog that inherits from command
         responses = [("media/little_rat_whip.gif","https://media.discordapp.net/attachments/1224574847213109330/1229649553276276756/little_rat_whip.gif?ex=66307363&is=661dfe63&hm=853f4b284ec1602a00c6431d3a126e1f7406e89f60b151093e69833e183c9203&="),
                      ("media/rat_pelvic_thrust.gif","https://media.discordapp.net/attachments/1224574847213109330/1229649495818506300/rat_pelvic_thrust.gif?ex=66307355&is=661dfe55&hm=549cb4558ae82eb6d473a1e204875bf6121260646d4b46069f922ae35be1f97e&="),
                      ("media/little_rat_whip.mov","https://media.discordapp.net/attachments/1224574847213109330/1229650482931433512/little_rat_whip.mov?ex=66307440&is=661dff40&hm=a3e20e03e9477ec89a3e1bb666919889088046efb3850a63b44578d2a4583ef2&"),
-                     ("media/rat_pelvic_thrust.mov","https://media.discordapp.net/attachments/1224574847213109330/1229650482394304523/rat_pelvic_thrust.mov?ex=66307440&is=661dff40&hm=4b15bfbce821428e736ed69f889404b2af4ed252d5a34819c207c718818e2715&")
+                     ("media/rat_pelvic_thrust.mov","https://media.discordapp.net/attachments/1224574847213109330/1229650482394304523/rat_pelvic_thrust.mov?ex=66307440&is=661dff40&hm=4b15bfbce821428e736ed69f889404b2af4ed252d5a34819c207c718818e2715&"),
+                     ("media/rat_griddy.mp4","https://cdn.discordapp.com/attachments/1223351898073989190/1233216980480430090/rat_griddy.mp4?ex=662c4a50&is=662af8d0&hm=88f9d6a37045fd7316f40477c4cd11ad37242fc81cdcf0b2e392f7c935817d24&"),
+                     ("media/rat_griddy.gif","https://media.discordapp.net/attachments/1223351898073989190/1233216971571466240/rat_griddy.gif?ex=662c4a4e&is=662af8ce&hm=e7ffd62fff59f683865375856cd8203bdf0fb6a2e469aa3a675e5628abfe6d37&=")
                      ]
         print(f"{ctx.author.display_name} initiated sqwalla command.")
         response = random.choice(responses)
