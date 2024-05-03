@@ -34,7 +34,10 @@ class Fun(commands.Cog): # create a class for our cog that inherits from command
     async def doodob(self,
                      ctx: discord.ApplicationContext
                      ):
-        await ctx.respond(f"Welcome {ctx.author.display_name} to the Doodob Jedi Temple Discord.")
+        if(random.randrange(0, 100, 1) == 1):
+            await ctx.respond(f"Welcome {ctx.author.display_name} to the Doodbob Jedi Temple Discord.")
+        else:
+            await ctx.respond(f"Welcome {ctx.author.display_name} to the Doodob Jedi Temple Discord.")
     
     @discord.slash_command(name="shadow", description="bye guyyysss")
     async def shadow(self,
@@ -118,7 +121,8 @@ class Fun(commands.Cog): # create a class for our cog that inherits from command
                 await ctx.respond(f"<@438846432703807488> {response[0][6:-4:].replace("_", " ")}", file=file)
             except:
                 print("Exception caught in sqwalla command.")
-                await ctx.respond(f"<@438846432703807488>  {response[0][6:-4:].replace("_", " ")} \n {str(response)}")
+                #await ctx.respond(f"<@438846432703807488>  {response[0][6:-4:].replace("_", " ")} \n {str(response)}")
+                await ctx.respond("Exception caught in sqwalla command.")
         else:
             await ctx.respond(response)
     
@@ -135,10 +139,45 @@ class Fun(commands.Cog): # create a class for our cog that inherits from command
                 file = discord.File(response[0])
                 await ctx.respond(f"{response[0][6:-4:].replace("_", " ")}", file=file)
             except:
-                print("Exception caught in sqwalla command.")
+                print("Exception caught in doc command.")
                 await ctx.respond(f"{response[0][6:-4:].replace("_", " ")} \n {str(response)}")
         else:
             await ctx.respond(response)
+    
+    @discord.slash_command(name="jersey", description="The One Destined for the Sarlacc Pit")
+    async def jersey(self,
+                  ctx: discord.ApplicationContext
+                  ):
+        responses = [("media/Jersey.png","https://media.discordapp.net/attachments/1224574847213109330/1235687202659237938/Jersey.png?ex=663546e3&is=6633f563&hm=cdc6dec231856b48f503434eb6560736cd5867a57a07aa94474fc6a361b25e0c&=&format=webp&quality=lossless")
+                     ]
+        response = random.choice(responses)
+        print(f"{ctx.author.display_name} initiated jersey command. System is trying to respond with: \n {response}")
+        if type(response) == type(tuple()):
+            try:
+                file = discord.File(response[0])
+                await ctx.respond(f"<@382027721988898827> {response[0][6:-4:].replace("_", " ")}", file=file)
+            except:
+                print("Exception caught in jersey command.")
+                await ctx.respond(f"{response[0][6:-4:].replace("_", " ")} \n {str(response)}")
+        else:
+            await ctx.respond(response)
+    
+    @discord.slash_command(name="slap", description="Slap a user")
+    async def slap(self,
+                   ctx: discord.ApplicationContext,
+                   user: discord.Option(str, default=None, description="Name of the person that you wish to say slap."), # type: ignore
+                   ):
+        print(f"{ctx.author.display_name} initiated slap command.")
+        if ctx.guild == None:
+            await ctx.respond(f"There is no one here for you to slap.")
+        else:
+            if user == None:
+                members = [member for member in ctx.guild.members]
+                member = random.choice(members)
+                user = f"<@{member.id}>"
+            await ctx.respond(f"{ctx.author.display_name} has just smacked {user}")
+
+        
 
 
 def setup(bot): # this is called by Pycord to setup the cog
