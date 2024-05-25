@@ -100,8 +100,8 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
             cursor.execute('''
                 CREATE TABLE customer (
                     id             UNSIGNED BIG INT    PRIMARY KEY,
-                	name           TEXT                NOT NULL,
-                	phoneNumber    TEXT                NULL DEFAULT NULL,
+                    name           TEXT                NOT NULL,
+                    phoneNumber    TEXT                NULL DEFAULT NULL,
                     addressLine1   TEXT                NULL DEFAULT NULL,
                     addressLine2   TEXT                NULL DEFAULT NULL,
                     addressCity    TEXT                NULL DEFAULT NULL,
