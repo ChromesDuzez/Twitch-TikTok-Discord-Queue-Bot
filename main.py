@@ -8,9 +8,10 @@ from dotenv import load_dotenv
 load_dotenv() 
 
 cogs_list = [
-    'moderation',
+    'functionality',
     'fun',
-    'functionality'
+    'timetracking',
+    'moderation'
 ]
 
 #Starting the discord bot

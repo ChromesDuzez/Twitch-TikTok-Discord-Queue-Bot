@@ -148,3 +148,4 @@ dmypy.json
 config.properties
 
 # End of https://www.toptal.com/developers/gitignore/api/python
+*.db

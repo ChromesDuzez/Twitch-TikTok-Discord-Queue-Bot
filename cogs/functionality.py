@@ -111,6 +111,24 @@ class Functionality(commands.Cog): # create a class for our cog that inherits fr
         else:
             await ctx.respond(str(user) + " failed to be added to the queue: " + queue)
 
+    @discord.slash_command(name="queuelist", description="Displays the specified queue.")
+    async def queuelist(self,
+                        ctx: discord.ApplicationContext #,
+                        #queue: discord.Option(str, autocomplete=discord.utils.basic_autocomplete(get_active_queues), description="The Queue to display") #type: ignore
+                        ):
+        
+        embed = discord.Embed(
+            title="Currently Waiting in <Queue Name>",
+            description="A list of all of the people in the current queue.",
+            color=discord.Colour.blurple(), # Pycord provides a class with default colors you can choose from
+        )
+        embed.add_field(name="list", value="No one is in the queue!")
+        embed.set_footer(text="A ChromesDuzez Discord Bot.")
+        embed.set_author(name="Chromes Queue Bot", icon_url="https://images-ext-1.discordapp.net/external/u8AGQg7qA9kEMKt9DaPeDqi_Dv411zgLjIUBqIcI2_E/%3Fsize%3D1024/https/cdn.discordapp.com/guilds/1223328147827720366/users/336231886198276096/avatars/84394ecd081eea0edea003a664d018ed.png")
+        await ctx.respond(embed=embed) # Send the embed with some text
+        
+        
+
 
 def setup(bot): # this is called by Pycord to setup the cog
     bot.add_cog(Functionality(bot)) # add the cog to the bot

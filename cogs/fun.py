@@ -85,7 +85,7 @@ class Fun(commands.Cog): # create a class for our cog that inherits from command
                      ctx: discord.ApplicationContext
                      ):
         print(f"{ctx.author.display_name} initiated chromes command.")
-        responses = ["👋 Hi Cheddarrrrr", "indubitably good sir", "yes yes good showwww", "hahahaha", "heheheheha", "great success", "alrighty then"]
+        responses = ["👋 Hi Cheddarrrrr", "indubitably good sir", "yes yes good showwww", "hahahaha", "heheheheha", "great success", "alrighty then", "oh my lanta"]
         await ctx.respond(random.choice(responses))
 
     @discord.slash_command(name="wave", description="hiiiii")
