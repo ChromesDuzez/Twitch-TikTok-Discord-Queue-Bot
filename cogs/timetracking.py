@@ -27,6 +27,45 @@ class Confirm(discord.ui.View):
         self.stop()
         await interaction.response.send_message("You clicked No!", ephemeral=True)
 
+class Clock(discord.ui.View):
+    def __init__(self, user: discord.User, message: discord.message, bot: discord.bot):
+        super().__init__()
+        self.bot = bot
+        self.user = user
+        self.message = message
+        self.value = None
+
+    @discord.ui.button(label="Clock-In", style=discord.ButtonStyle.green)
+    async def clockin(self, button: discord.ui.Button, interaction: discord.Interaction):
+        if interaction.user != self.user:
+            await interaction.response.send_message("This is not for you!", ephemeral=True)
+            return
+        if self.value == True:
+            await interaction.response.send_message("You are already clocked in!", ephemeral=True)
+            return
+        self.value = True
+        embeds = self.message.embeds
+        embeds[0].color = discord.Colour.brand_green()
+        embeds[0].title = "You ARE currently clocked in."
+        await self.message.edit(embeds=embeds)
+        print(f"{self.user} just clocked in.")
+        await interaction.response.send_message("You clocked in.", ephemeral=True)
+
+    @discord.ui.button(label="Clock-Out", style=discord.ButtonStyle.red)
+    async def clockout(self, button: discord.ui.Button, interaction: discord.Interaction):
+        if interaction.user != self.user:
+            await interaction.response.send_message("This is not for you!", ephemeral=True)
+            return
+        if self.value == False:
+            await interaction.response.send_message("You are already clocked out!", ephemeral=True)
+            return
+        self.value = False
+        embeds = self.message.embeds
+        embeds[0].color = discord.Colour.brand_red()
+        embeds[0].title = "You are currently NOT clocked in."
+        await self.message.edit(embeds=embeds)
+        print(f"{self.user} just clocked out.")
+        await interaction.response.send_message("You clocked out.", ephemeral=True)
 
 
 class TimeTracking(commands.Cog): # create a class for our cog that inherits from commands.Cog
@@ -168,7 +207,17 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
         channelObj = ctx.channel
         if channel is not None:
             channelObj = self.bot.get_channel(int(channel[2:-1:]))
-        message = await channelObj.send("content")
+        userObj = ctx.guild.get_member(int(user[2:-1:]))
+        embed = discord.Embed(
+            title="You are currently NOT clocked in.",
+            color=discord.Colour.brand_red(), # Pycord provides a class with default colors you can choose from
+        )
+        embed.add_field(name="Wondering how to clock in?", value="Click the green clock-in button and watch the field turn green. And to clock out, hit the red clock-out button. Simple as that!")
+        embed.set_footer(text=f"User: {user}")
+        embed.set_author(name=f"{userObj} Time Clock", icon_url="https://media.discordapp.net/attachments/1224574847213109330/1244848933675728978/clkfbambooblack600x600-bgf8f8f8.png?ex=66569b69&is=665549e9&hm=61d63652381160c0339fe9fb51cceb8d6971c1878e01b9cb0a181d43e5d97546&=&format=webp&quality=lossless")
+        message = await channelObj.send(embed=embed)
+        view = Clock(user=userObj, message=message, bot=self.bot)
+        await message.edit(view=view)
         ## store the message id and channel id in the db
         cursor.execute(f"UPDATE employee SET clockChannelId = {message.channel.id}, clockMessageId = {message.id} WHERE id = {user[2:-1:]}")
         ## wrap it all up with a nice clean bow
@@ -250,10 +299,14 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
             #sets up punch clock table
             cursor.execute('''
                 CREATE TABLE punch_clock (
-                    id           UNSIGNED BIG INT    PRIMARY KEY,
-                    employeeID   UNSIGNED BIG INT    NOT NULL,
-                    punchInTime  DATETIME            NULL DEFAULT NULL,
-                    punchOutTime DATETIME            NULL DEFAULT NULL,
+                    id               UNSIGNED BIG INT    PRIMARY KEY,
+                    employeeID       UNSIGNED BIG INT    NOT NULL,
+                    punchInTime      DATETIME            NULL DEFAULT NULL,
+                    punchInApproval  BOOLEAN             NOT NULL DEFAULT "TRUE",
+                    punchOutTime     DATETIME            NULL DEFAULT NULL,
+                    punchOutApproval BOOLEAN             NOT NULL DEFAULT "TRUE",
+                    checkChannelId   UNSIGNED BIG INT    NULL DEFAULT NULL,
+                    checkMessageId   UNSIGNED BIG INT    NULL DEFAULT NULL,
                     FOREIGN KEY (employeeID) REFERENCES employee(id)
                 )
             ''')
