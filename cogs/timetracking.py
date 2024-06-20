@@ -30,49 +30,100 @@ class Confirm(discord.ui.View):
 
 class ApprovePunch(discord.ui.View):
     def __init__(self, punch: int, message: discord.message, bot: discord.bot, db:str):
+        print(f"Created <ApprovePunch: Object> with values: [{punch}, {message}, {db}]")
         super().__init__(timeout=None)
         self.bot = bot
         self.db = db
         self.punch = punch
         self.message = message
-        self.value = None
 
-    @discord.ui.button(label="Yes", style=discord.ButtonStyle.green)
-    async def confirm(self, button: discord.ui.Button, interaction: discord.Interaction):
-        role = None
-        if os.getenv('TIMECARD_ADMIN_ROLES'):
-            role = discord.utils.get(interaction.user.roles, id=os.getenv('TIMECARD_ADMIN_ROLES'))
-        if (not role) and (not interaction.user.guild_permissions.administrator):
-            await interaction.response.send_message("This is not for you!", ephemeral=True)
-            return
-        self.value = True
-        messageContent = self.message.content
-        messageContent = messageContent[:-37:] + "**You approved this login attempt.**"
-        self.stop()
-        await interaction.message.edit(content=messageContent, view=None)
+        # Dynamically add buttons based on the booleans
+        conn = sqlite3.connect(self.db)
+        cursor = conn.cursor()
+        cursor.execute(f"SELECT punchInApproval, punchOutApproval FROM punch_clock WHERE id = {punch}")
+        result = cursor.fetchone()
+        #print(result)#debugging
+        self.punchInApproval = result[0]
+        self.punchOutApproval = result[1]
+        conn.commit()
+        conn.close()
+        if not result[0]:
+            self.add_item(self.ConfirmButton("clock-in"))
+            self.add_item(self.EditPunch("clock-in"))
+        if not result[1]:
+            self.add_item(self.ConfirmButton("clock-out"))
+            self.add_item(self.EditPunch("clock-out"))
+    
+    class ConfirmButton(discord.ui.Button):
+        def __init__(self, label: str):
+            self.CustomLabel = label
+            color = discord.ButtonStyle.green
+            if label == "clock-out":
+                color = discord.ButtonStyle.red
+            super().__init__(label=f"Approve {label}", style=color)
 
-    @discord.ui.button(label="No", style=discord.ButtonStyle.red)
-    async def cancel(self, button: discord.ui.Button, interaction: discord.Interaction):
-        role = None
-        if os.getenv('TIMECARD_ADMIN_ROLES'):
-            role = discord.utils.get(interaction.user.roles, id=os.getenv('TIMECARD_ADMIN_ROLES'))
-        if (not role) and (not interaction.user.guild_permissions.administrator):
-            await interaction.response.send_message("This is not for you!", ephemeral=True)
+        async def callback(self, interaction: discord.Interaction):
+            view: ApprovePunch = self.view
+            role = None
+            if os.getenv('TIMECARD_ADMIN_ROLES'):
+                role = discord.utils.get(interaction.user.roles, id=int(os.getenv('TIMECARD_ADMIN_ROLE')))
+            if (not role) and (not interaction.user.guild_permissions.administrator):
+                await interaction.response.send_message("This is not for you!", ephemeral=True)
+                return
+            if self.CustomLabel == "clock-in":
+                view.punchInApproval = True
+            else:
+                view.punchOutApproval = True
+            conn = sqlite3.connect(view.db)
+            cursor = conn.cursor()
+            cursor.execute(f'UPDATE punch_clock SET punchInApproval = {view.punchInApproval}, punchOutApproval = {view.punchOutApproval} WHERE id = {view.punch}')
+            messageContent = view.message.content
+            approvaltxt = f"**You approved this {self.CustomLabel} attempt.**"
+            #print(messageContent) #debugging
+            if messageContent[-37::] == "Do you approve of this login attempt?":
+                messageContent = messageContent[:-37:] + f"{approvaltxt}"
+            else:
+                messageContent = messageContent + f"\n{approvaltxt}"
+            if view.punchInApproval and view.punchOutApproval:
+                await interaction.message.edit(content=messageContent, view=None)
+                cursor.execute(f'UPDATE punch_clock SET checkChannelId = NULL, checkMessageId = NULL WHERE id = {view.punch}')
+                conn.commit()
+                conn.close()
+            else:
+                conn.commit()
+                conn.close()
+                await interaction.message.edit(content=messageContent, view=ApprovePunch(punch=view.punch, message=view.message, bot=view.bot, db=view.db))
+            await interaction.response.send_message(content=approvaltxt, ephemeral=True)
             return
-        self.value = False
-        messageContent = self.message.content
-        messageContent = messageContent[:-37:] + "**You did NOT approve this login attempt.**"
-        self.stop()
-        await interaction.message.edit(content=messageContent, view=None)
+
+    class EditPunch(discord.ui.Button):
+        def __init__(self, label: str):
+            self.CustomLabel = label
+            color = discord.ButtonStyle.secondary #colors: [primary, secondary, green, red, link]
+            # if label == "clock-out":
+            #     color = discord.ButtonStyle.red
+            super().__init__(label=f"Edit {label}", style=color)
+
+        async def callback(self, interaction: discord.Interaction):
+            view: ApprovePunch = self.view
+            if interaction.user != view.user:
+                await interaction.response.send_message("This is not for you!", ephemeral=True)
+                return
+            view.value = False
+            await interaction.response.send_message("You clicked No!", ephemeral=True)
+            message = await view.fetch_message()
+            await message.edit(content="You did NOT approve this login attempt.", view=None)
+            self.disabled = True
 
 class Clock(discord.ui.View):
-    def __init__(self, user: discord.User, message: discord.message, bot: discord.bot, db:str, value:bool = False):
+    def __init__(self, user: discord.User, message: discord.Message, bot: discord.Bot, db:str, value:bool = False): #, currpunch: int = None
         super().__init__(timeout=None)
-        self.bot = bot
-        self.db = db
-        self.user = user
-        self.message = message
-        self.value = value
+        self.bot: discord.Bot = bot
+        self.db: str = db
+        self.user: discord.User = user
+        self.message: discord.Message = message
+        self.value: bool = value
+        #self.currentpunch: int = currpunch
     
     def get_next_id(self, cursor):
         cursor.execute('SELECT MAX(id) FROM punch_clock')
@@ -82,6 +133,13 @@ class Clock(discord.ui.View):
         else:
             return result + 1
     
+    async def obtain_message(self, bot: discord.bot, channel_id: int, message_id: int):
+        cnl = bot.get_channel(channel_id)
+        if cnl is None:
+            # Fetch the channel if not found in cache
+            cnl = await bot.fetch_channel(channel_id)
+        return await cnl.fetch_message(message_id)
+    
     
     # punch in(user="")
     @discord.ui.button(label="Clock-In", style=discord.ButtonStyle.green)
@@ -90,7 +148,7 @@ class Clock(discord.ui.View):
         role = None
         passedChecks = True
         if os.getenv('TIMECARD_TIMECLOCK_ROLE_ID'):
-            role = discord.utils.get(user.roles, id=os.getenv('TIMECARD_TIMECLOCK_ROLE_ID'))
+            role = discord.utils.get(user.roles, id=int(os.getenv('TIMECARD_TIMECLOCK_ROLE_ID')))
         if interaction.user != self.user:
             await interaction.response.send_message("This is not for you!", ephemeral=True)
             passedChecks = False
@@ -106,23 +164,22 @@ class Clock(discord.ui.View):
             now_str = now.strftime('%Y-%m-%d %H:%M:%S')
             #check if the person who has pressed the button is allowed to clock in w/o approval
             punchInApproval = True
-            approvalMessageid = None
-            approvalMessageChannelid = None
+            approvalMessage: discord.Message = None
             nextid = self.get_next_id(cursor)
+            values = (nextid, user.id, now_str, punchInApproval, None, None)
             if role is None:
                 punchInApproval = False
-                approvalMessage: discord.Message = await self.bot.get_channel(int(os.getenv('TIMECARD_ADMIN_CHANNEL_ID'))).send(f"<@{self.user.id}> attempted to login today at {now_str} in a non-standard way.\nDo you approve of this login attempt?")
-                view = ApprovePunch(punch=nextid, message=approvalMessage, bot=self.bot, db=self.db)
-                await approvalMessage.edit(view=view)
-                approvalMessageid = approvalMessage.id
-                approvalMessageChannelid = approvalMessage.channel.id
+                approvalMessage = await self.bot.get_channel(int(os.getenv('TIMECARD_ADMIN_CHANNEL_ID'))).send(f"<@{self.user.id}> attempted to login today at {now_str} in a non-standard way.\nDo you approve of this login attempt?")
                 #values = (id, employeeID, punchInTime, punchInApproval, checkChannelId, checkMessageId) for reference
-            values = (nextid,user.id, now_str, punchInApproval, approvalMessageid, approvalMessageChannelid)
+                values = (nextid,user.id, now_str, punchInApproval, approvalMessage.channel.id, approvalMessage.id)
             ## store the clock-in in the db
             cursor.execute(f'INSERT INTO punch_clock (id, employeeID, punchInTime, punchInApproval, checkChannelId, checkMessageId) VALUES (?, ?, ?, ?, ?, ?)', values)
             ## wrap it all up with a nice clean bow
             conn.commit()
             conn.close()
+            if not punchInApproval:
+                newview = ApprovePunch(punch=nextid, message=approvalMessage, bot=self.bot, db=self.db)
+                await approvalMessage.edit(view=newview)
             #update the embed
             self.value = True
             embeds = self.message.embeds
@@ -136,19 +193,70 @@ class Clock(discord.ui.View):
     # punch out(user="")
     @discord.ui.button(label="Clock-Out", style=discord.ButtonStyle.red)
     async def clockout(self, button: discord.ui.Button, interaction: discord.Interaction):
+        user = interaction.user
+        role = None
+        passedChecks = True
+        if os.getenv('TIMECARD_TIMECLOCK_ROLE_ID'):
+            role = discord.utils.get(user.roles, id=int(os.getenv('TIMECARD_TIMECLOCK_ROLE_ID')))
         if interaction.user != self.user:
             await interaction.response.send_message("This is not for you!", ephemeral=True)
-            return
+            passedChecks = False
         if self.value == False:
             await interaction.response.send_message("You are already clocked out!", ephemeral=True)
-            return
-        self.value = False
-        embeds = self.message.embeds
-        embeds[0].color = discord.Colour.brand_red()
-        embeds[0].title = "You are currently NOT clocked in."
-        await self.message.edit(embeds=embeds)
-        print(f"{self.user} just clocked out.")
-        await interaction.response.send_message("You clocked out.", ephemeral=True)
+            passedChecks = False
+        if passedChecks:
+            #variables used throughout
+            punchOutApproval = True
+            approvalMessage: discord.Message = None
+            content: str = None
+            #connect to the db
+            conn = sqlite3.connect(self.db)
+            cursor = conn.cursor()
+            cursor.execute(f'SELECT MAX(id) FROM punch_clock WHERE employeeID = {self.user.id} AND punchOutTime is NULL ')
+            currPunch = cursor.fetchone()[0]
+            if currPunch is None:
+                print("Critical error: I dont think we shouldve been able to clock out if the employee was never clocked in!")
+            cursor.execute(f'SELECT checkChannelId, checkMessageId FROM punch_clock WHERE id = {currPunch}')
+            result = cursor.fetchone()
+            if not(result[0] is None and result[1] is None):
+                approvalMessage = await self.obtain_message(bot=self.bot, channel_id=int(result[0]), message_id=int(result[1]))
+            #set the values for clocking in
+            now = datetime.now()
+            now_str = now.strftime('%Y-%m-%d %H:%M:%S')
+            #check if the person who has pressed the button is allowed to clock in w/o approval
+            if role is None:
+                punchOutApproval = False
+                cursor.execute(f'SELECT checkChannelId, checkMessageId FROM punch_clock WHERE id = {currPunch}')
+                result = cursor.fetchone()
+                if result[0] is None and result[1] is None:
+                    approvalMessage = await self.bot.get_channel(int(os.getenv('TIMECARD_ADMIN_CHANNEL_ID'))).send(f"<@{self.user.id}> attempted to logout today at {now_str} in a non-standard way.\nDo you approve of this login attempt?")
+                else:
+                    content = approvalMessage.content
+                    content = content[:-37:] + f"<@{self.user.id}> attempted to logout today at {now_str} in a non-standard way.\n" + content[-37::]
+            ## store the clock-out in the db
+            if approvalMessage:
+                print(f'EXECUTING COMMAND:\nUPDATE punch_clock SET punchOutTime = "{now_str}", punchOutApproval = {punchOutApproval}, checkChannelId = {approvalMessage.channel.id}, checkMessageId = {approvalMessage.id} WHERE id = {currPunch}')#debugging
+                cursor.execute(f'UPDATE punch_clock SET punchOutTime = "{now_str}", punchOutApproval = {punchOutApproval}, checkChannelId = {approvalMessage.channel.id}, checkMessageId = {approvalMessage.id} WHERE id = {currPunch}')
+            else:
+                print(f'EXECUTING COMMAND:\nUPDATE punch_clock SET punchOutTime = "{now_str}", punchOutApproval = {punchOutApproval}, checkChannelId = NULL, checkMessageId = NULL WHERE id = {currPunch}')#debugging
+                cursor.execute(f'UPDATE punch_clock SET punchOutTime = "{now_str}", punchOutApproval = {punchOutApproval}, checkChannelId = NULL, checkMessageId = NULL WHERE id = {currPunch}')
+            ## wrap it all up with a nice clean bow
+            conn.commit()
+            conn.close()
+            if approvalMessage:
+                view = ApprovePunch(punch=currPunch, message=approvalMessage, bot=self.bot, db=self.db)
+                if content:
+                    await approvalMessage.edit(content=content, view=view)
+                else:
+                    await approvalMessage.edit(view=view)
+            #update the embed
+            self.value = False
+            embeds = self.message.embeds
+            embeds[0].color = discord.Colour.brand_red()
+            embeds[0].title = "You are currently NOT clocked in."
+            await self.message.edit(embeds=embeds)
+            print(f"{self.user} just clocked out.")
+            await interaction.response.send_message("You clocked out.", ephemeral=True)
 
 
 class TimeTracking(commands.Cog): # create a class for our cog that inherits from commands.Cog
