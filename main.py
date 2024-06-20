@@ -38,6 +38,12 @@ async def synced():
         print(f"Syncing: {cmd}")
         await bot.process_application_commands(cmd)
 
+@bot.slash_command(description="Shutdown the bot. [Only BOT owner can use this command]")
+@commands.is_owner()
+async def shutdown(ctx):
+    await ctx.respond("Shutting down the bot...")
+    await bot.close()
+
 
 
 bot.run(os.getenv('BOT_TOKEN'))

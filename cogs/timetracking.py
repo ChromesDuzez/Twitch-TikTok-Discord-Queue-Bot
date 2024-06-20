@@ -1,11 +1,12 @@
 import discord
 from discord.ext import commands
+from datetime import datetime
 import sqlite3
 import os
 
 class Confirm(discord.ui.View):
-    def __init__(self, user: discord.User):
-        super().__init__()
+    def __init__(self, user: discord.User, timeout: int = None):
+        super().__init__(timeout=timeout)
         self.user = user
         self.value = None
 
@@ -27,30 +28,112 @@ class Confirm(discord.ui.View):
         self.stop()
         await interaction.response.send_message("You clicked No!", ephemeral=True)
 
-class Clock(discord.ui.View):
-    def __init__(self, user: discord.User, message: discord.message, bot: discord.bot):
-        super().__init__()
+class ApprovePunch(discord.ui.View):
+    def __init__(self, punch: int, message: discord.message, bot: discord.bot, db:str):
+        super().__init__(timeout=None)
         self.bot = bot
-        self.user = user
+        self.db = db
+        self.punch = punch
         self.message = message
         self.value = None
 
-    @discord.ui.button(label="Clock-In", style=discord.ButtonStyle.green)
-    async def clockin(self, button: discord.ui.Button, interaction: discord.Interaction):
-        if interaction.user != self.user:
+    @discord.ui.button(label="Yes", style=discord.ButtonStyle.green)
+    async def confirm(self, button: discord.ui.Button, interaction: discord.Interaction):
+        role = None
+        if os.getenv('TIMECARD_ADMIN_ROLES'):
+            role = discord.utils.get(interaction.user.roles, id=os.getenv('TIMECARD_ADMIN_ROLES'))
+        if (not role) and (not interaction.user.guild_permissions.administrator):
             await interaction.response.send_message("This is not for you!", ephemeral=True)
             return
+        self.value = True
+        messageContent = self.message.content
+        messageContent = messageContent[:-37:] + "**You approved this login attempt.**"
+        self.stop()
+        await interaction.message.edit(content=messageContent, view=None)
+
+    @discord.ui.button(label="No", style=discord.ButtonStyle.red)
+    async def cancel(self, button: discord.ui.Button, interaction: discord.Interaction):
+        role = None
+        if os.getenv('TIMECARD_ADMIN_ROLES'):
+            role = discord.utils.get(interaction.user.roles, id=os.getenv('TIMECARD_ADMIN_ROLES'))
+        if (not role) and (not interaction.user.guild_permissions.administrator):
+            await interaction.response.send_message("This is not for you!", ephemeral=True)
+            return
+        self.value = False
+        messageContent = self.message.content
+        messageContent = messageContent[:-37:] + "**You did NOT approve this login attempt.**"
+        self.stop()
+        await interaction.message.edit(content=messageContent, view=None)
+
+class Clock(discord.ui.View):
+    def __init__(self, user: discord.User, message: discord.message, bot: discord.bot, db:str, value:bool = False):
+        super().__init__(timeout=None)
+        self.bot = bot
+        self.db = db
+        self.user = user
+        self.message = message
+        self.value = value
+    
+    def get_next_id(self, cursor):
+        cursor.execute('SELECT MAX(id) FROM punch_clock')
+        result = cursor.fetchone()[0]
+        if result is None:
+            return 1
+        else:
+            return result + 1
+    
+    
+    # punch in(user="")
+    @discord.ui.button(label="Clock-In", style=discord.ButtonStyle.green)
+    async def clockin(self, button: discord.ui.Button, interaction: discord.Interaction):
+        user = interaction.user
+        role = None
+        passedChecks = True
+        if os.getenv('TIMECARD_TIMECLOCK_ROLE_ID'):
+            role = discord.utils.get(user.roles, id=os.getenv('TIMECARD_TIMECLOCK_ROLE_ID'))
+        if interaction.user != self.user:
+            await interaction.response.send_message("This is not for you!", ephemeral=True)
+            passedChecks = False
         if self.value == True:
             await interaction.response.send_message("You are already clocked in!", ephemeral=True)
-            return
-        self.value = True
-        embeds = self.message.embeds
-        embeds[0].color = discord.Colour.brand_green()
-        embeds[0].title = "You ARE currently clocked in."
-        await self.message.edit(embeds=embeds)
-        print(f"{self.user} just clocked in.")
-        await interaction.response.send_message("You clocked in.", ephemeral=True)
+            passedChecks = False
+        if passedChecks:
+            #connect to the db
+            conn = sqlite3.connect(self.db)
+            cursor = conn.cursor()
+            #set the values for clocking in
+            now = datetime.now()
+            now_str = now.strftime('%Y-%m-%d %H:%M:%S')
+            #check if the person who has pressed the button is allowed to clock in w/o approval
+            punchInApproval = True
+            approvalMessageid = None
+            approvalMessageChannelid = None
+            nextid = self.get_next_id(cursor)
+            if role is None:
+                punchInApproval = False
+                approvalMessage: discord.Message = await self.bot.get_channel(int(os.getenv('TIMECARD_ADMIN_CHANNEL_ID'))).send(f"<@{self.user.id}> attempted to login today at {now_str} in a non-standard way.\nDo you approve of this login attempt?")
+                view = ApprovePunch(punch=nextid, message=approvalMessage, bot=self.bot, db=self.db)
+                await approvalMessage.edit(view=view)
+                approvalMessageid = approvalMessage.id
+                approvalMessageChannelid = approvalMessage.channel.id
+                #values = (id, employeeID, punchInTime, punchInApproval, checkChannelId, checkMessageId) for reference
+            values = (nextid,user.id, now_str, punchInApproval, approvalMessageid, approvalMessageChannelid)
+            ## store the clock-in in the db
+            cursor.execute(f'INSERT INTO punch_clock (id, employeeID, punchInTime, punchInApproval, checkChannelId, checkMessageId) VALUES (?, ?, ?, ?, ?, ?)', values)
+            ## wrap it all up with a nice clean bow
+            conn.commit()
+            conn.close()
+            #update the embed
+            self.value = True
+            embeds = self.message.embeds
+            embeds[0].color = discord.Colour.brand_green()
+            embeds[0].title = "You ARE currently clocked in."
+            await self.message.edit(embeds=embeds)
+            print(f"{self.user} just clocked in.")
+            await interaction.response.send_message("You clocked in.", ephemeral=True)
 
+
+    # punch out(user="")
     @discord.ui.button(label="Clock-Out", style=discord.ButtonStyle.red)
     async def clockout(self, button: discord.ui.Button, interaction: discord.Interaction):
         if interaction.user != self.user:
@@ -135,7 +218,11 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
         if isinstance(error, commands.MissingPermissions):
             await ctx.respond(f"{ctx.author}, you do not have the necessary permissions to use this command.", ephemeral=True)
             print(f"{ctx.author}, you do not have the necessary permissions to use this command.")
-    
+        
+    #edit employee(user, name="", phonenumber="", addressline1="", addressline2="", city="", state="",, zip="") - admin command
+    #remove employee(user) - admin command
+
+                ## Punch Clock Methods
     # create clock(user, channelid="") - admin command
     @discord.slash_command(name="createclock", description="Create a time clock embed for a user.")
     @commands.has_permissions(administrator=True)
@@ -174,40 +261,30 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
             conn.close()
             return
         elif employees[0][1] is not None:
-            view = Confirm(user=ctx.user)
+            view = Confirm(user=ctx.user, timeout=180)
             await ctx.response.send_message("This emplyee already has a time clock, do you want to proceed?", view=view, ephemeral=True)
             await view.wait()
             if view.value:
                 oldMessageID = employees[0][1]
                 oldChannelID = employees[0][0]
                 print(f"Override Confirmed by {view.user}... Trying to delete old time clock message.")
-                try:
-                    # Fetch the channel by ID
-                    valid = True
-                    delchannel = self.bot.get_channel(oldChannelID)
-                    if delchannel is None:
-                        print(f"Channel with ID {oldChannelID} not found.")
-                        valid = False
-                    # Fetch the message by ID
-                    if valid:
-                        message = await delchannel.fetch_message(oldMessageID)
-                        # Delete the message
-                        await message.delete()
-                        print(f"Message with ID {oldMessageID} deleted from channel {oldChannelID}.")
-                except discord.NotFound:
-                    print("Message or channel not found.")
-                except discord.Forbidden:
-                    print("I do not have permission to delete this message.")
-                except discord.HTTPException as e:
-                    print(f"Failed to delete message: {e}")
+                await self.deleteclock(ctx, user, oldChannelID, oldMessageID)
             else:
                 await ctx.followup.send("You chose not to proceed or did not respond in time.", ephemeral=True)
                 return
+        ##figure out if the user is clocked in already
+        clockedIn = False
+        cursor.execute(f"SELECT id, employeeID, punchOutTime FROM punch_clock WHERE employeeID = {user[2:-1:]} ORDER BY id DESC LIMIT 1")
+        punches = cursor.fetchall()
+        if len(punches) > 0:
+            if not punches[0][2]:
+                clockedIn = True
         ## go to channel and send the message
         channelObj = ctx.channel
         if channel is not None:
             channelObj = self.bot.get_channel(int(channel[2:-1:]))
         userObj = ctx.guild.get_member(int(user[2:-1:]))
+        ##create the embed
         embed = discord.Embed(
             title="You are currently NOT clocked in.",
             color=discord.Colour.brand_red(), # Pycord provides a class with default colors you can choose from
@@ -216,7 +293,13 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
         embed.set_footer(text=f"User: {user}")
         embed.set_author(name=f"{userObj} Time Clock", icon_url="https://media.discordapp.net/attachments/1224574847213109330/1244848933675728978/clkfbambooblack600x600-bgf8f8f8.png?ex=66569b69&is=665549e9&hm=61d63652381160c0339fe9fb51cceb8d6971c1878e01b9cb0a181d43e5d97546&=&format=webp&quality=lossless")
         message = await channelObj.send(embed=embed)
-        view = Clock(user=userObj, message=message, bot=self.bot)
+        #if already clocked in (in the database) then we gotta make sure this newly created punch clock starts on the right value
+        if clockedIn:
+            embeds = message.embeds
+            embeds[0].color = discord.Colour.brand_green()
+            embeds[0].title = "You ARE currently clocked in."
+            await message.edit(embeds=embeds)
+        view = Clock(user=userObj, message=message, bot=self.bot, db=self.db, value=clockedIn)
         await message.edit(view=view)
         ## store the message id and channel id in the db
         cursor.execute(f"UPDATE employee SET clockChannelId = {message.channel.id}, clockMessageId = {message.id} WHERE id = {user[2:-1:]}")
@@ -228,23 +311,56 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
 
         
     # delete clock(user) - admin command
+    @discord.slash_command(name="deleteclock", description="Delete a clock embed for a user.")
+    @commands.has_permissions(administrator=True)
+    async def deleteclock(self,
+                          ctx: discord.ApplicationContext,
+                          user: discord.Option(str, description="The discord user you wish to delete their time clock for"), # type: ignore
+                          channelid: discord.Option(int, default=None, description="The discord channelId where the msg you wish to delete is"), # type: ignore
+                          messageid: discord.Option(int, default=None, description="The discord msgId where the msg you wish to delete is"), # type: ignore
+                          ):
+        ctxInitiated = True
+        successful = True
+        employees = None
+        oldChannelID = channelid
+        oldMessageID = messageid
+        if oldChannelID and oldMessageID:
+            ctxInitiated = False
+        if ctxInitiated:
+            # connect to db
+            conn = sqlite3.connect(self.db)
+            cursor = conn.cursor()
+            ## use the data in the db to check that we aren't overwriting good data
+            cursor.execute(f"SELECT clockChannelId, clockMessageId FROM employee WHERE id = {user[2:-1:]}")
+            employees = cursor.fetchall()
+            oldMessageID = employees[0][1]
+            oldChannelID = employees[0][0]
+        try:
+            # Fetch the channel by ID
+            delchannel = self.bot.get_channel(oldChannelID)
+            if delchannel is not None:
+                message = await delchannel.fetch_message(oldMessageID)
+                # Delete the message
+                await message.delete()
+                print(f"Message with ID {oldMessageID} deleted from channel {oldChannelID}.")
+            else:
+                print(f"Channel with ID {oldChannelID} not found.")
+        except discord.NotFound:
+            print("Message or channel not found.")
+            successful = False
+        except discord.Forbidden:
+            print("I do not have permission to delete this message.")
+            successful = False
+        except discord.HTTPException as e:
+            print(f"Failed to delete message: {e}")
+            successful = False
+        if ctxInitiated and successful:
+            ctx.respond(f"Clock deleted successfully for user: {user}!")
 
 
         ### Less important methods ###
-    #edit employee(user, name="", phonenumber="", addressline1="", addressline2="", city="", state="",, zip="") - admin command
-    #remove employee(user) - admin command
-
-
-                ## Punch Clock Methods
+    
     # display punches(user="")
-
-    # punch in(user="")
-
-    # punch out(user="")
-
-    # update clock(user) - private method 
-
-        ### Less important methods ###
     #edit punch(id) - admin command - trigger via button?
 
 
