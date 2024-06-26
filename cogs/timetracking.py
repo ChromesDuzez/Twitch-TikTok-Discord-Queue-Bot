@@ -80,10 +80,12 @@ class ApprovePunch(discord.ui.View):
             messageContent = view.message.content
             approvaltxt = f"**You approved this {self.CustomLabel} attempt.**"
             #print(messageContent) #debugging
+            #print(f"Degugging Message: {messageContent}") #debugging
             if messageContent[-37::] == "Do you approve of this login attempt?":
                 messageContent = messageContent[:-37:] + f"{approvaltxt}"
             else:
                 messageContent = messageContent + f"\n{approvaltxt}"
+            #print(f"Degugging New Message: {messageContent}") #debugging
             if view.punchInApproval and view.punchOutApproval:
                 await interaction.message.edit(content=messageContent, view=None)
                 cursor.execute(f'UPDATE punch_clock SET checkChannelId = NULL, checkMessageId = NULL WHERE id = {view.punch}')
@@ -267,6 +269,49 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
         self.db = self.cwd + "\\timetracker.db"
         self.dbSetup(self.db)
         self.bot = bot
+
+    # Gets all of the view buttons working again after a bot restart
+    @commands.Cog.listener()
+    async def on_ready(self):
+        # Connect to your SQLite database
+        conn = sqlite3.connect(self.db)
+        cursor = conn.cursor()
+        print("Re-initializing Clock Views for each Employee...")
+        cursor.execute("SELECT id, clockChannelId, clockMessageId FROM employee WHERE clockChannelId is not NULL AND clockMessageId is not NULL")
+        for user_data in cursor.fetchall():
+            print(f"Employee: {user_data}")
+            userObj = await self.bot.fetch_user(user_data[0])
+            msg: discord.Message = None
+            chnl = self.bot.get_channel(user_data[1])
+            if chnl is not None:
+                msg = await chnl.fetch_message(user_data[2])
+            else:
+                print(f"Channel with ID {user_data[2]} not found.")
+            if msg is None:
+                print(f"Failed to get Clock for user: {user_data}")
+            else:
+                clockedIn = False
+                if msg.embeds[0].title == "You ARE currently clocked in.":
+                    clockedIn = True
+                new_view = Clock(user=userObj, message=msg, bot=self.bot, db=self.db, value=clockedIn)
+                await msg.edit(view=new_view)
+        print("Finished re-initializing Clock Views for each Employee...")
+        print("Re-initializing Approval Message Views for each Punch...")
+        cursor.execute("SELECT id, checkChannelId, checkMessageId FROM punch_clock WHERE checkChannelId is not NULL AND checkMessageId is not NULL")
+        for punch_data in cursor.fetchall():
+            print(f"Punch: {punch_data}")
+            msg: discord.Message = None
+            chnl = self.bot.get_channel(punch_data[1])
+            if chnl is not None:
+                msg = await chnl.fetch_message(punch_data[2])
+            else:
+                print(f"Channel with ID {punch_data[2]} not found.")
+            if msg is None:
+                print(f"Failed to get Punch Approval Message for punch: {punch_data}")
+            else:
+                new_view = ApprovePunch(punch=punch_data[0], message=msg, bot=self.bot, db=self.db)
+                await msg.edit(view=new_view)
+        print("Finished re-initializing Approval Message Views for each Punch...")
 
                     ## Employee Type Methods
         ### Less important methods ###
