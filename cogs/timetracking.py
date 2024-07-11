@@ -4,6 +4,22 @@ from datetime import datetime, timedelta
 import sqlite3
 import os
 
+def canPressButton(interaction: discord.Interaction, intended_user: discord.User) -> bool:
+    admin_role_id = int(os.getenv('TIMECARD_ADMIN_ROLE'))
+    user = interaction.user
+    guild = interaction.guild
+
+    if user.id == intended_user.id:
+        return True
+
+    if any(role.permissions.administrator for role in user.roles):
+        return True
+
+    if discord.utils.get(user.roles, id=admin_role_id):
+        return True
+
+    return False
+
 class Confirm(discord.ui.View):
     def __init__(self, user: discord.User, timeout: int = None):
         super().__init__(timeout=timeout)
@@ -172,12 +188,12 @@ class CustomerSelectMenu(discord.ui.Select):
         await interaction.response.defer()
         await self.button.handle_customer_selection(interaction, customer_id)
 
-async def reloadClockView(user: discord.User, message: discord.Message, bot: discord.Bot, db:str, value:bool = False, currpunch: int = None):
-    new_view = Clock(user=user, message=message, bot=bot, db=db, value=value, currpunch=currpunch)
+async def reloadClockView(user: discord.User, message: discord.Message, bot: discord.Bot, db:str, value:bool = False, currpunch: int = None, ignoreLunchBreak: bool = False):
+    new_view = Clock(user=user, message=message, bot=bot, db=db, value=value, currpunch=currpunch, ignoreLunchBreak=ignoreLunchBreak)
     await message.edit(view=new_view)
 
 class Clock(discord.ui.View):
-    def __init__(self, user: discord.User, message: discord.Message, bot: discord.Bot, db:str, value:bool = False, currpunch: int = None):
+    def __init__(self, user: discord.User, message: discord.Message, bot: discord.Bot, db:str, value:bool = False, currpunch: int = None, ignoreLunchBreak: bool = False):
         super().__init__(timeout=None)
         self.bot: discord.Bot = bot
         self.db: str = db
@@ -187,28 +203,51 @@ class Clock(discord.ui.View):
         self.currentpunch: int = currpunch
         self.workpunch: int = None
         self.workpunchType: str = None
+        self.ignoreLunchBreak: bool = ignoreLunchBreak
 
+        conn = sqlite3.connect(self.db)
+        cursor = conn.cursor()
         if self.currentpunch:
             # Dynamically add buttons based on whether or not we currently have Construction work or service work in progress
-            conn = sqlite3.connect(self.db)
-            cursor = conn.cursor()
             cursor.execute(f"SELECT id, punchType FROM work_time WHERE punchID = {currpunch} AND timeSpent = 0")
             result = cursor.fetchone()
             #print(result)#debugging
             if result:
                 self.workpunch = result[0]
                 self.workpunchType = result[1]
-            conn.commit()
-            conn.close()
+            
+            # Fetch ignoreLunchBreak value
+            cursor.execute(f"SELECT ignoreLunchBreak FROM punch_clock WHERE id = {currpunch}")
+            self.ignoreLunchBreak = cursor.fetchone()[0]
+
+        # Fetch employee type and allowed work types
+        cursor.execute(f"""
+            SELECT et.construction, et.service, et.office, e.lunchSkipable 
+            FROM employee e 
+            JOIN employee_type et ON e.employeeTypeID = et.id 
+            WHERE e.id = {self.user.id}
+        """)
+        emp_type = cursor.fetchone()
+        self.lunchSkipable = emp_type[3]
+        conn.commit()
+        conn.close()
         
-        if self.workpunch:
-            self.add_item(self.EndWorkPunch(type=self.workpunchType))
-            self.add_item(self.EndWorkPunch(custom=True, type=self.workpunchType))  
-        else:
+        if not self.currentpunch:
             self.add_item(self.ClockInButton())
-            self.add_item(self.StartWorkPunch(punchType="Construction", stl=discord.ButtonStyle.primary))
-            self.add_item(self.StartWorkPunch(punchType="Service", stl=discord.ButtonStyle.secondary))
+        elif self.workpunch:
+            self.add_item(self.EndWorkPunch(type=self.workpunchType))
+            self.add_item(self.EndWorkPunch(custom=True, type=self.workpunchType))
+        else:
             self.add_item(self.ClockOutButton())
+            if emp_type[0]:  # Construction work allowed
+                self.add_item(self.StartWorkPunch(punchType="Construction", stl=discord.ButtonStyle.primary))
+            if emp_type[1]:  # Service work allowed
+                self.add_item(self.StartWorkPunch(punchType="Service", stl=discord.ButtonStyle.primary))
+            if emp_type[2]:  # Office work allowed
+                self.add_item(self.StartWorkPunch(punchType="Office", stl=discord.ButtonStyle.primary))
+            # Conditionally add Ignore Lunch Break button
+            if self.lunchSkipable:
+                self.add_item(self.IgnoreLunchBreakButton(self.ignoreLunchBreak))
     
     def get_next_id(self, cursor, table="punch_clock"):
         cursor.execute(f'SELECT MAX(id) FROM {table}')
@@ -277,6 +316,7 @@ class Clock(discord.ui.View):
                 await self.view.message.edit(embeds=embeds)
                 print(f"{self.view.user} just clocked in.")
                 await interaction.response.send_message("You clocked in.", ephemeral=True)
+                await reloadClockView(user=self.view.user, message=self.view.message, bot=self.view.bot, db=self.view.db, value=self.view.value, currpunch=self.view.currentpunch, ignoreLunchBreak=self.view.ignoreLunchBreak)
 
     # start work punch
     class StartWorkPunch(discord.ui.Button):
@@ -293,8 +333,12 @@ class Clock(discord.ui.View):
                 await interaction.response.send_message("You are currently clocked out and can't start work until you clock in!", ephemeral=True)
                 passedChecks = False
             if passedChecks:
-                modal = CustomerInputModal(button=self)
-                await interaction.response.send_modal(modal)
+                if self.punchType == "Office":
+                    await interaction.response.defer()
+                    await self.handle_customer_selection(interaction=interaction, customer_id=0)
+                else:
+                    modal = CustomerInputModal(button=self)
+                    await interaction.response.send_modal(modal)
         
         async def handle_customer_input(self, interaction: discord.Interaction, user_input: str):
             conn = sqlite3.connect(self.view.db)
@@ -317,17 +361,16 @@ class Clock(discord.ui.View):
             cursor = conn.cursor()
             next_id = self.view.get_next_id(cursor, "work_time")
             time_started = datetime.now().isoformat()
+            cursor.execute(f"SELECT name FROM customer WHERE id = {customer_id}")
+            customerName = cursor.fetchone()[0]
             cursor.execute("INSERT INTO work_time (id, punchID, customerID, punchType, timeStarted) VALUES (?, ?, ?, ?, ?)", 
                         (next_id,self.view.currentpunch, customer_id, self.punchType, time_started))
             conn.commit()
             conn.close()
-            await interaction.followup.send(f"Work punch started for customer ID {customer_id}.", ephemeral=True)
+            await interaction.followup.send(f"Work punch started for customer ID {customer_id} ({customerName}).", ephemeral=True)
             self.view.workpunch = next_id
             self.view.workpunchType = self.punchType
-            await reloadClockView(user=self.view.user, message=self.view.message, bot=self.view.bot, db=self.view.db, value=self.view.value, currpunch=self.view.currentpunch)
-            # self.view.clear_items()
-            # self.view.add_item(self.view.EndWorkPunch(type=self.view.workpunchType))
-            # self.view.add_item(self.view.EndWorkPunch(custom=True, type=self.view.workpunchType))
+            await reloadClockView(user=self.view.user, message=self.view.message, bot=self.view.bot, db=self.view.db, value=self.view.value, currpunch=self.view.currentpunch, ignoreLunchBreak=self.view.ignoreLunchBreak)
     
     # end work punch
     class EndWorkPunch(discord.ui.Button):
@@ -373,15 +416,15 @@ class Clock(discord.ui.View):
         async def completeCallbackMethod(self, interaction: discord.Interaction):
             conn = sqlite3.connect(self.view.db)
             cursor = conn.cursor()
-            print(f"UPDATE work_time SET timeSpent = {self.timeSpent} WHERE id = {self.view.workpunch}")#debugging
-            cursor.execute(f"UPDATE work_time SET timeSpent = {self.timeSpent} WHERE id = {self.view.workpunch}")
+            print(f"UPDATE work_time SET timeSpent = {int(self.timeSpent * 60)} WHERE id = {self.view.workpunch}")#debugging
+            cursor.execute(f"UPDATE work_time SET timeSpent = {int(self.timeSpent * 60)} WHERE id = {self.view.workpunch}")
             conn.commit()
             conn.close()
             self.view.workpunch = None
             self.view.workpunchType = None
             await interaction.respond(f"You have successfully completed your work at the jobsite in {self.timeSpent} hour(s).", ephemeral=True)
             # Switch out the buttons
-            await reloadClockView(user=self.view.user, message=self.view.message, bot=self.view.bot, db=self.view.db, value=self.view.value, currpunch=self.view.currentpunch)
+            await reloadClockView(user=self.view.user, message=self.view.message, bot=self.view.bot, db=self.view.db, value=self.view.value, currpunch=self.view.currentpunch, ignoreLunchBreak=self.view.ignoreLunchBreak)
         
         async def handle_modal_response(self, interaction: discord.Interaction, time_spent: float):
             self.timeSpent = time_spent
@@ -459,6 +502,29 @@ class Clock(discord.ui.View):
                 await self.view.message.edit(embeds=embeds)
                 print(f"{self.view.user} just clocked out.")
                 await interaction.response.send_message("You clocked out.", ephemeral=True)
+                await reloadClockView(user=self.view.user, message=self.view.message, bot=self.view.bot, db=self.view.db, value=self.view.value, currpunch=self.view.currentpunch, ignoreLunchBreak=self.view.ignoreLunchBreak)
+    
+    # toggle whether to ignore lunch break or not
+    class IgnoreLunchBreakButton(discord.ui.Button):
+        def __init__(self, ignoreLunchBreak):
+            label = "Ignore Lunch Break"
+            style = discord.ButtonStyle.success if ignoreLunchBreak else discord.ButtonStyle.danger
+            super().__init__(label=label, style=style)
+        
+        async def callback(self, interaction: discord.Interaction):
+            if not canPressButton(interaction, self.view.user):
+                await interaction.response.send_message("You don't have permission to use this button.", ephemeral=True)
+                return
+            conn = sqlite3.connect(self.view.db)
+            cursor = conn.cursor()
+            new_value = not self.view.ignoreLunchBreak
+            cursor.execute(f"UPDATE punch_clock SET ignoreLunchBreak = ? WHERE id = ?", (new_value, self.view.currentpunch))
+            conn.commit()
+            conn.close()
+            
+            self.view.ignoreLunchBreak = new_value
+            self.style = discord.ButtonStyle.success if new_value else discord.ButtonStyle.danger
+            await interaction.response.edit_message(view=self.view)
 
 
 class TimeTracking(commands.Cog): # create a class for our cog that inherits from commands.Cog
@@ -581,6 +647,13 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
         conn.close()
 
                     ## Employee Methods
+    async def employee_type_autocomplete(ctx: discord.AutocompleteContext):
+        conn = sqlite3.connect(os.getcwd() + "\\timetracker.db")
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, name FROM employee_type")
+        types = cursor.fetchall()
+        conn.close()
+        return [discord.OptionChoice(name=type[1], value=type[0]) for type in types]
     # add employee(name, phonenumber, addressline1, city, state, zip, addressline2="",user="") - admin command   *updating needed
     @discord.slash_command(name="addemployee", description="Add a new Employee to from discord to the system.")
     @commands.has_permissions(administrator=True)
@@ -594,6 +667,8 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
                    zip: discord.Option(str, description="Address Zip of Employee"),   # type: ignore
                    addressline2: discord.Option(str, default="", description="Address Line 2 of Employee"),   # type: ignore
                    user: discord.Option(str, default=None, description="Add a different user to the employee table"),   # type: ignore
+                   payrate: discord.Option(float, default=16.00, description="Payrate for the Employee"),   # type: ignore
+                   employeetype: discord.Option(int, default=2, description="Employee Type", autocomplete=employee_type_autocomplete),   # type: ignore
                    ):
         conn = sqlite3.connect(self.db)
         cursor = conn.cursor()
@@ -615,9 +690,9 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
             await ctx.respond(f"Cannot add new employee {name} (aka <@{id}>) because they already exist in the database.")
             print(f"Cannot add new employee {name} (aka <@{id}>) because they already exist in the database.")
         if valid:
-            value = [(id, name, phonenumber, addressline1, addressline2, city, state, zip)]
+            value = [(id, name, phonenumber, addressline1, addressline2, city, state, zip, payrate, employeetype)]
             try:
-                cursor.executemany('INSERT INTO employee (id, name, phoneNumber, addressLine1, addressLine2, addressCity, addressState, addressZip) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', value)
+                cursor.executemany('INSERT INTO employee (id, name, phoneNumber, addressLine1, addressLine2, addressCity, addressState, addressZip, payrate, employeeTypeID) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', value)
                 conn.commit()
                 conn.close()
                 await ctx.respond(f"Added new employee {value[0][1]} (aka <@{value[0][0]}>)")
@@ -800,16 +875,20 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
             #sets up employee type table
             cursor.execute('''
                 CREATE TABLE employee_type (
-	                id             INTEGER            PRIMARY KEY,
+	                id             INTEGER            PRIMARY KEY AUTOINCREMENT,
 	                name           TEXT               NOT NULL,
-	                rate           DECIMAL(10,5)      NOT NULL
+	                rate           DECIMAL(10,5)      NOT NULL,
+                    construction   BOOLEAN            NOT NULL DEFAULT "TRUE",
+                    service        BOOLEAN            NOT NULL DEFAULT "TRUE", 
+                    office         BOOLEAN            NOT NULL DEFAULT "FALSE"
                 )
             ''')
             employeeTypesDefaultData = [
-                ('Clerical', 1.5),
-                ('Construction', 1.7)
+                ('Clerical', 1.5, False, False, True),
+                ('Construction', 1.7, True, True, False),
+                ('Salaried', 0.0, True, True, True)
             ]
-            cursor.executemany('INSERT INTO employee_type (name, rate) VALUES (?, ?)', employeeTypesDefaultData)
+            cursor.executemany('INSERT INTO employee_type (name, rate, construction, service, office) VALUES (?, ?, ?, ?, ?)', employeeTypesDefaultData)
             #sets up employee table
             cursor.execute('''
                 CREATE TABLE employee (
@@ -823,6 +902,7 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
                     addressZip     TEXT                NOT NULL,
 	                payrate        DECIMAL(10,2)       NOT NULL DEFAULT 16.00,
 	                employeeTypeID INTEGER             NOT NULL DEFAULT 2,
+	                lunchSkipable  BOOLEAN             NOT NULL DEFAULT "FALSE",
                     clockChannelId UNSIGNED BIG INT    NULL DEFAULT NULL,
                     clockMessageId UNSIGNED BIG INT    NULL DEFAULT NULL,
                     FOREIGN KEY (employeeTypeID) REFERENCES employee_type(id)
@@ -837,6 +917,7 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
                     punchInApproval  BOOLEAN             NOT NULL DEFAULT "TRUE",
                     punchOutTime     DATETIME            NULL DEFAULT NULL,
                     punchOutApproval BOOLEAN             NOT NULL DEFAULT "TRUE",
+                    ignoreLunchBreak BOOLEAN             NOT NULL DEFAULT "FALSE",
                     checkChannelId   UNSIGNED BIG INT    NULL DEFAULT NULL,
                     checkMessageId   UNSIGNED BIG INT    NULL DEFAULT NULL,
                     FOREIGN KEY (employeeID) REFERENCES employee(id)
@@ -849,22 +930,50 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
                     name        TEXT             NOT NULL
                 )
             ''')
+            #adds the default data for customer
             customerDefaultData = [
-                ("Bond, James",),
-                ("Holmes, Sherlock",)
+                (0, os.getenv('COMPANY_NAME'),)
             ]
-            cursor.executemany('INSERT INTO customer (name) VALUES (?)', customerDefaultData)
+            cursor.executemany('INSERT INTO customer (id, name) VALUES (?, ?)', customerDefaultData)
+            # adds fake customers to the table for testing purposes
+            if(os.getenv('COMPANY_NAME')):
+                customerDefaultData = [
+                    ("Bond, James",),
+                    ("Holmes, Sherlock",)
+                ]
+                cursor.executemany('INSERT INTO customer (name) VALUES (?)', customerDefaultData)
             #sets up work time table
             cursor.execute('''
                 CREATE TABLE work_time (
                     id          UNSIGNED BIG INT                                                             PRIMARY KEY,
                     punchID     UNSIGNED BIG INT                                                             NOT NULL,
-                    customerID  INT                                                                          NOT NULL,
-                    punchType   TEXT CHECK( punchType IN ('Construction','Service') )                        NOT NULL,
+                    customerID  INT                                                                          NOT NULL DEFAULT 0,
+                    punchType   TEXT CHECK( punchType IN ('Construction','Service', 'Office') )              NOT NULL,
                     timeSpent   INTEGER CHECK( timeSpent >= 0 AND timeSpent <= 1440 AND timeSpent % 15 = 0)  NOT NULL DEFAULT 0,
                     timeStarted DATETIME                                                                     NOT NULL,
                     FOREIGN KEY (punchID) REFERENCES punch_clock(id),
                     FOREIGN KEY (customerID) REFERENCES customer(id)
+                )
+            ''')
+            #sets up employee groups table
+            cursor.execute('''
+                CREATE TABLE employee_group (
+                    id          INTEGER          PRIMARY KEY AUTOINCREMENT,
+                    name        TEXT             NOT NULL
+                )
+            ''')
+            #adds the default data for employee_group
+            employeeGroupDefaultData = [
+                (0, f"{str(os.getenv('COMPANY_NAME'))} Employee")
+            ]
+            cursor.executemany('INSERT INTO employee_group (id, name) VALUES (?, ?)', employeeGroupDefaultData)
+            #sets up employee and employee groups LINK table
+            cursor.execute('''
+                CREATE TABLE group_member (
+                    employeeID     UNSIGNED BIG INT    NOT NULL,
+                    groupID        INTEGER             NOT NULL,
+                    FOREIGN KEY (employeeID) REFERENCES employee(id),
+                    FOREIGN KEY (groupID) REFERENCES employee_group(id)
                 )
             ''')
             conn.commit()
