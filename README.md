@@ -1,0 +1,9 @@
+# Twitch TikTok Discord Queue Bot
+
+There are three aspects to this bot, Discord, Tik Tok and Twitch all of which will require a decent amount of configuring to work together but the hope is that the tik tok and twitch side of things can be turned on and off as needed. So you dont have to run both if you don't want to. At the heart of this project it is primarily a discord bot where users will be able to join a queue but what if someone in the chat wants to join the queue but not the discord server? That is where these twitch and tik tok bots come into play as they will be looking for the custom commands and sending it to the discord bot to add the user to the queue.
+
+## Behind the scenes
+
+To handle the discord side of things we are using the fork of the discord-py library by the same people who made carlbot called [py-cord](https://github.com/botlabs-gg/pycord) {see documentation [here](https://guide.pycord.dev/category/getting-started)}; for further help regarding how I'm modeling the discord bot in the code see [pixegami on Youtube](https://www.youtube.com/watch?v=2k9x0s3awss). Then to handle tik tok events and chats coming inbound we will be using the [TikTokLive](https://github.com/isaackogan/TikTokLive) API wrapper by [isaackogan](https://github.com/isaackogan). Since that API doesn't support posting any chats to the Live, I am going to be using [selenium](https://selenium-python.readthedocs.io/getting-started.html#simple-usage) to open the livestream from a browser tab and send the message in the chat using a tik tok account's credentials. Last but most certainly not least, to handle the twitch side of things, I plan to use the twitchio python library which supports twitch events and sending messages into the channel which you can see demonstrated in [Ian Rufus's video](https://www.youtube.com/watch?v=JhdSVdvtQss) and related project [twitch-chatbot](https://github.com/ianrufus/youtube/tree/main/twitch-chatbot) here on github.
+
+
