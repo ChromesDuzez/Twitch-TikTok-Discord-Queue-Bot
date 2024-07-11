@@ -176,7 +176,6 @@ async def reloadClockView(user: discord.User, message: discord.Message, bot: dis
     new_view = Clock(user=user, message=message, bot=bot, db=db, value=value, currpunch=currpunch)
     await message.edit(view=new_view)
 
-
 class Clock(discord.ui.View):
     def __init__(self, user: discord.User, message: discord.Message, bot: discord.Bot, db:str, value:bool = False, currpunch: int = None):
         super().__init__(timeout=None)
@@ -522,6 +521,64 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
     #edit type(id, name="", rate="") -  admin command
     #remove type(id) - admin command
 
+    
+    @discord.slash_command(name="addcustomer", description="Add a new Customer to the customer table.")
+    @commands.has_permissions(administrator=True)
+    async def addcustomer(self,
+                          ctx: discord.ApplicationContext,
+                          name: discord.Option(str, description="Full Name of Customer")   # type: ignore
+                          ):
+        conn = sqlite3.connect(self.db)
+        cursor = conn.cursor()
+        cursor.execute(f"SELECT * FROM customer WHERE name = '{name}'")
+        customers = cursor.fetchall()
+        if not customers:
+            print(f"EXECUTING COMMAND:\nINSERT INTO customer (name) VALUES ({name})")
+            cursor.executemany(f'INSERT INTO customer (name) VALUES (?)',[(name,)])
+            await ctx.respond(f"Successfully inserted {name} into customer table", ephemeral=True)
+        else:
+            await ctx.respond(f"Could not insert {name} into customer table because it already exists at:\n{customers}", ephemeral=True)
+        conn.commit()
+        conn.close()
+
+    @discord.slash_command(name="editcustomer", description="Edit an existing Customer in the customer table.")
+    @commands.has_permissions(administrator=True)
+    async def editcustomer(self,
+                          ctx: discord.ApplicationContext,
+                          newname: discord.Option(str, description="New name for Customer"),   # type: ignore
+                          id: discord.Option(int, default=None, description="Id of Customer"),   # type: ignore
+                          name: discord.Option(str, default=None, description="Name of Customer")   # type: ignore
+                          ):
+        conn = sqlite3.connect(self.db)
+        cursor = conn.cursor()
+        if id is None and name is None:
+            await ctx.respond(f"Can't have both id and name parameter be empty must use one... \nIf you put both in, it will prioritize id over name.", ephemeral=True)
+        elif id:
+            try:
+                cursor.execute(f"SELECT * FROM customer WHERE id = {id}")
+                customers = cursor.fetchall()
+                if not customers:
+                    await ctx.respond(f"Could not find customer: {name}", ephemeral=True)
+                else:
+                    print(f"EXECUTING COMMAND:\nUPDATE customer SET name = {newname} WHERE id = {customers[0][0]}")
+                    cursor.executemany(f'UPDATE customer SET name = ? WHERE id = ?',[(newname, customers[0][0]),])
+                    await ctx.respond(f"Successfully updated {customers[0][0]}, {customers[0][1]} in the customer table to {newname}", ephemeral=True)
+            except:
+                await ctx.respond(f"Invalid ID paramter", ephemeral=True)
+        else:
+            try:
+                cursor.execute(f"SELECT * FROM customer WHERE name = '{name}'")
+                customers = cursor.fetchall()
+                if not customers or (len(customers) > 1):
+                    await ctx.respond(f"Could not get customer to: {name} because the search returned:\n{customers}", ephemeral=True)
+                else:
+                    print(f"EXECUTING COMMAND:\nUPDATE customer SET name = {newname} WHERE id = {customers[0][0]}")
+                    cursor.executemany(f'UPDATE customer SET name = ? WHERE id = ?',[(newname, customers[0][0]),])
+                    await ctx.respond(f"Successfully updated {customers[0][0]}, {customers[0][1]} in the customer table to {newname}", ephemeral=True)
+            except:
+                await ctx.respond(f"Invalid name paramter", ephemeral=True)
+        conn.commit()
+        conn.close()
 
                     ## Employee Methods
     # add employee(name, phonenumber, addressline1, city, state, zip, addressline2="",user="") - admin command   *updating needed
