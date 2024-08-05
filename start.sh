@@ -3,6 +3,8 @@ echo "pip install py-cord"
 pip install py-cord
 echo "pip install xlsxwriter"
 pip install xlsxwriter
+echo "pip install xlwings"
+pip install xlwings
 echo "pip install openpyxl"
 pip install openpyxl
 echo "pip install python-dotenv"
