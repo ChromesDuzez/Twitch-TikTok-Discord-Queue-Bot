@@ -781,7 +781,10 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
         channelObj = ctx.channel
         if channel is not None:
             channelObj = self.bot.get_channel(int(channel[2:-1:]))
-        userObj = ctx.guild.get_member(int(user[2:-1:]))
+        userObj = await self.bot.fetch_user(int(user[2:-1:]))
+        if not userObj:
+            await ctx.respond("Failed to find member?!", ephemeral=True)
+            return
         ##create the embed
         embed = discord.Embed(
             title="You are currently NOT clocked in.",
@@ -854,7 +857,7 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
             print(f"Failed to delete message: {e}")
             successful = False
         if ctxInitiated and successful:
-            ctx.respond(f"Clock deleted successfully for user: {user}!")
+            await ctx.respond(f"Clock deleted successfully for user: {user}!")
 
 
         ### Less important methods ###
