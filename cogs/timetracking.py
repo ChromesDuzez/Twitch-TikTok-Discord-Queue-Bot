@@ -263,7 +263,7 @@ class Clock(discord.ui.View):
             return result + 1
     
     async def obtain_message(self, bot: discord.bot, channel_id: int, message_id: int):
-        cnl = bot.get_channel(channel_id)
+        cnl = await bot.get_channel(channel_id)
         if cnl is None:
             # Fetch the channel if not found in cache
             cnl = await bot.fetch_channel(channel_id)
@@ -553,7 +553,7 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
             print(f"Employee: {user_data}")
             userObj = await self.bot.fetch_user(user_data[0])
             msg: discord.Message = None
-            chnl = self.bot.get_channel(user_data[1])
+            chnl = await self.bot.get_channel(user_data[1])
             if chnl is not None:
                 msg = await chnl.fetch_message(user_data[2])
             else:
@@ -574,7 +574,7 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
         for punch_data in cursor.fetchall():
             print(f"Punch: {punch_data}")
             msg: discord.Message = None
-            chnl = self.bot.get_channel(punch_data[1])
+            chnl = await self.bot.get_channel(punch_data[1])
             if chnl is not None:
                 msg = await chnl.fetch_message(punch_data[2])
             else:
@@ -780,8 +780,8 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
         ## go to channel and send the message
         channelObj = ctx.channel
         if channel is not None:
-            channelObj = self.bot.get_channel(int(channel[2:-1:]))
-        userObj = ctx.guild.get_member(int(user[2:-1:]))
+            channelObj = await self.bot.get_channel(int(channel[2:-1:]))
+        userObj = await ctx.guild.get_member(int(user[2:-1:]))
         ##create the embed
         embed = discord.Embed(
             title="You are currently NOT clocked in.",
@@ -836,7 +836,7 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
             oldChannelID = employees[0][0]
         try:
             # Fetch the channel by ID
-            delchannel = self.bot.get_channel(oldChannelID)
+            delchannel = await self.bot.get_channel(oldChannelID)
             if delchannel is not None:
                 message = await delchannel.fetch_message(oldMessageID)
                 # Delete the message
@@ -1176,7 +1176,7 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
             
             # Send the Excel file to the specified reports channel
             reports_channel_id = int(os.getenv('TIMECARD_REPORTS_CHANNEL_ID'))
-            reports_channel = self.bot.get_channel(reports_channel_id)
+            reports_channel = await self.bot.get_channel(reports_channel_id)
             if reports_channel:
                 await reports_channel.send(file=discord.File(file_path))
                 await ctx.respond(f"Weekly report for the week ending on {week_end_date} has been generated and sent to the reports channel.", ephemeral=True)
