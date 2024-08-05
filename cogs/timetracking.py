@@ -2,6 +2,11 @@ import discord
 from discord.ext import commands
 from datetime import datetime, timedelta
 import sqlite3
+import xlwings as xw
+import openpyxl
+from openpyxl import load_workbook, Workbook
+from openpyxl.utils import get_column_letter
+from openpyxl.styles import NamedStyle, Font, Border, Side, PatternFill, Alignment, Protection
 import os
 
 def canPressButton(interaction: discord.Interaction, intended_user: discord.User) -> bool:
@@ -646,6 +651,7 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
         conn.commit()
         conn.close()
 
+    #
                     ## Employee Methods
     async def employee_type_autocomplete(ctx: discord.AutocompleteContext):
         conn = sqlite3.connect(os.getcwd() + "\\timetracker.db")
@@ -654,6 +660,8 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
         types = cursor.fetchall()
         conn.close()
         return [discord.OptionChoice(name=type[1], value=type[0]) for type in types]
+    
+
     # add employee(name, phonenumber, addressline1, city, state, zip, addressline2="",user="") - admin command   *updating needed
     @discord.slash_command(name="addemployee", description="Add a new Employee to from discord to the system.")
     @commands.has_permissions(administrator=True)
@@ -864,6 +872,327 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
     #edit work time(id, punchid=-1, customer="", punchtype="", timespent=0) - admin perms to edit someone else's - trigger via button?
     #remove work time(id) - admin command? - trigger via button?
 
+                ## Reports
+    async def employee_group_autocomplete(self, ctx: discord.AutocompleteContext):
+        conn = sqlite3.connect(self.db)
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM employee_group")
+        groups = cursor.fetchall()
+        conn.close()
+        return [group[0] for group in groups if ctx.value.lower() in group[0].lower()]
+
+    def round_to_quarter_hour(self, minutes):
+        return round(minutes / 15) * 15
+
+    def convert_minutes_to_hours(self, minutes):
+        return minutes / 60
+
+    def is_saturday(self, date_str):
+        # Parse the date string into a datetime object
+        date_obj = datetime.strptime(date_str, '%Y-%m-%d')
+        # Check if the day of the week is Saturday (5)
+        return date_obj.weekday() == 5
+    
+    def get_day_of_week(self, date_str):
+        # Parse the date string into a datetime object
+        date_obj = datetime.strptime(date_str, '%Y-%m-%d')
+        
+        # Get the day of the week as a full name (e.g., "Monday", "Tuesday")
+        day_of_week = date_obj.strftime('%A')
+        
+        return day_of_week
+
+    def setCell(self, cell, newValue, newFont, newNumberFormat, newBorder, newAlignment):
+        cell.value = newValue
+        cell.font = newFont
+        cell.number_format = newNumberFormat
+        cell.border = newBorder
+        cell.alignment = newAlignment
+
+    def getKey(self, e):
+        dat1, dat2 = e
+        return datetime.strptime(dat1[2], "%Y-%m-%d %H:%M:%S")
+
+    def createReportWorkbook(self, new_wb, template_sheet_name):
+        # Load the existing workbook
+        template_path = 'templates/Template Sheets.xlsx'
+        # Copy the template sheet to the new workbook
+        try:
+            excel_app = xw.App(visible=False)
+            wb = excel_app.books.open(template_path)
+            for sheet in wb.sheets:
+                if sheet.name == template_sheet_name:
+                    sheet.api.Copy()
+                    wb_new = xw.books.active
+                    wb_new.save(new_wb)
+                    wb_new.close()
+        finally:
+            excel_app.quit()
+
+    # This method takes the punch data for one employee and formats the given openpyxl sheet with the data
+    def reportTimecardData(
+        self,
+        sheet: openpyxl.worksheet,
+        data: list
+    ):
+        #last row used so that we can set the print_area correctly and will be returned at the end of the method
+        lastRow = 4
+        #sort the data in order by punch_in datetime (chronilogical order) then store it in a dictionary
+        data.sort(key=self.getKey)
+        databyDate = {}
+        for tup in data:
+            dataDate = datetime.strptime(tup[0][2], '%Y-%m-%d %H:%M:%S').date()
+            if dataDate not in databyDate.keys():
+                databyDate[dataDate] = [tup]
+            else:
+                dateLst = databyDate[dataDate]
+                dateLst.append(tup)
+                databyDate[dataDate] = dateLst
+        #totals
+        TotalConstructionTime = TotalServiceTime = 0
+        ##all of my default styling with fonts, number formats, borders, and alignment
+        normal_font, bold_font = Font(name='Arial', size=10, bold=False), Font(name='Arial', size=10, bold=True)
+        date_number_format, hrs_number_format, time_duration_format, time_format = 'mm-dd-yy', '0.00 "hrs"', 'h:mm:ss', 'hh:mm AM/PM'
+        workTime_border = Border( top=Side(border_style='thin', color='00000000'), bottom=Side(border_style='thin', color='00000000') )
+        rightAlign, centerAlign, leftAlign = Alignment(horizontal='right'), Alignment(horizontal='center'), Alignment(horizontal='left')
+        #time to get data onto the page
+        for date in databyDate.keys():
+            TotalingRow = lastRow
+            TotalTime = TotOfficeTime = TotShopTime = TotLunchTime = 0
+            allPunchesOnDate = databyDate[date]
+            for punch, work in allPunchesOnDate:
+                punch_in = datetime.strptime(punch[2], '%Y-%m-%d %H:%M:%S')
+                punch_out = datetime.strptime(punch[3], '%Y-%m-%d %H:%M:%S') if punch[3] else datetime.now()
+                shift_duration = self.convert_minutes_to_hours(self.round_to_quarter_hour((punch_out - punch_in).total_seconds() / 60))
+                lunch = 0.5 if not punch[6] and shift_duration >= 6.0 else 0
+                constructionLst = []
+                serviceLst = []
+                TotConst = TotSer = TotOfc = 0
+                if work:
+                    for worktype, cust, time in work:
+                        hrs = time / 60
+                        if worktype == "Office":
+                            TotOfc = TotOfc + hrs
+                            TotOfficeTime = TotOfficeTime + hrs
+                        elif worktype == "Service":
+                            TotSer = TotSer + hrs
+                            serviceLst.append((cust, hrs))
+                        else:
+                            TotConst = TotConst + hrs
+                            constructionLst.append((cust, hrs))
+                #start inserting punch data into sheet
+                lastRow = lastRow + 1
+                self.setCell(sheet[f"I{lastRow}"], "Clock-In", bold_font, 'General', Border(), Alignment())
+                self.setCell(sheet[f"J{lastRow}"], punch_in.time(), normal_font, time_format, Border(), leftAlign)
+                if len(constructionLst) > 0:
+                    lastRow = lastRow + 1
+                    self.setCell(sheet[f"J{lastRow}"], "Construction", bold_font, 'General', workTime_border, rightAlign)
+                    self.setCell(sheet[f"K{lastRow}"], TotConst, normal_font, hrs_number_format, workTime_border, Alignment())
+                    TotalConstructionTime = TotalConstructionTime + TotConst
+                    for name, hrs in constructionLst:
+                        lastRow = lastRow + 1
+                        self.setCell(sheet[f"J{lastRow}"], name, normal_font, 'General', Border(), rightAlign)
+                        self.setCell(sheet[f"K{lastRow}"], hrs, normal_font, hrs_number_format, Border(), Alignment())
+                if len(serviceLst) > 0:
+                    lastRow = lastRow + 1
+                    self.setCell(sheet[f"J{lastRow}"], "Service", bold_font, 'General', workTime_border, rightAlign)
+                    self.setCell(sheet[f"K{lastRow}"], TotSer, normal_font, hrs_number_format, workTime_border, Alignment())
+                    TotalServiceTime = TotalServiceTime + TotSer
+                    for name, hrs in serviceLst:
+                        lastRow = lastRow + 1
+                        self.setCell(sheet[f"J{lastRow}"], name, normal_font, 'General', Border(), rightAlign)
+                        self.setCell(sheet[f"K{lastRow}"], hrs, normal_font, hrs_number_format, Border(), Alignment())
+                lastRow = lastRow + 1
+                self.setCell(sheet[f"I{lastRow}"], "Clock-Out", bold_font, 'General', Border(), Alignment())
+                self.setCell(sheet[f"J{lastRow}"], punch_out.time(), normal_font, time_format, Border(), leftAlign)
+                lastRow = lastRow + 1
+                self.setCell(sheet[f"K{lastRow}"], "Elapsed Time:", bold_font, 'General', Border(), rightAlign)
+                self.setCell(sheet[f"L{lastRow}"], shift_duration, normal_font, hrs_number_format, Border(), leftAlign)
+                TotShopTime = TotShopTime + (shift_duration - lunch - TotConst - TotSer - TotOfc)
+                TotalTime = TotalTime + shift_duration
+                TotLunchTime = TotLunchTime + lunch
+            #total all of the punches on the day
+            self.setCell(sheet[f"H{TotalingRow}"], date.strftime('%A'), bold_font, 'General', Border(), Alignment())
+            self.setCell(sheet[f"I{TotalingRow}"], date, normal_font, date_number_format, Border(), Alignment())
+            self.setCell(sheet[f"J{TotalingRow}"], "Total:", bold_font, 'General', Border(), rightAlign)
+            self.setCell(sheet[f"K{TotalingRow}"], TotalTime, normal_font, hrs_number_format, Border(), Alignment())
+            self.setCell(sheet[f"L{TotalingRow}"], "Shop:", bold_font, 'General', Border(), rightAlign)
+            self.setCell(sheet[f"M{TotalingRow}"], TotShopTime, normal_font, hrs_number_format, Border(), Alignment())
+            self.setCell(sheet[f"N{TotalingRow}"], "Lunch:", bold_font, 'General', Border(), rightAlign)
+            self.setCell(sheet[f"O{TotalingRow}"], TotLunchTime, normal_font, hrs_number_format, Border(), Alignment())
+            self.setCell(sheet[f"P{TotalingRow}"], "Office:", bold_font, 'General', Border(), rightAlign)
+            self.setCell(sheet[f"Q{TotalingRow}"], TotOfficeTime, normal_font, hrs_number_format, Border(), Alignment())
+            self.setCell(sheet[f"R{TotalingRow}"], "Paid Hrs:", bold_font, 'General', Border(), rightAlign)
+            self.setCell(sheet[f"S{TotalingRow}"], f"=K{TotalingRow}-O{TotalingRow}", normal_font, hrs_number_format, Border(), Alignment())
+            lastRow = lastRow + 2
+        sheet["C5"].value = TotalConstructionTime
+        sheet["D5"].value = TotalServiceTime
+        return lastRow
+
+    @discord.slash_command(name="weeklyreport", description="Generate a report of all time punches for the previous week given an end date.")
+    @commands.has_permissions(administrator=True)
+    async def weekly_report(
+        self,
+        ctx: discord.ApplicationContext,
+        week_end_date: discord.Option(str, description="End of Week Date in YYYY-MM-DD format [Must be a SATURDAY]"), # type: ignore
+        employee_group: discord.Option(str, description="Employee group to include in the report", autocomplete=employee_group_autocomplete)  # type: ignore
+    ):
+        try:
+            # Parse the provided date
+            EOW = datetime.strptime(week_end_date, "%Y-%m-%d")
+            week_start = EOW - timedelta(days=6)
+            if not self.is_saturday(week_end_date):
+                ctx.respond(f"{week_end_date} is not a saturday it is a: {self.get_day_of_week(week_end_date)}")
+                return
+            week_end = EOW + timedelta(days=1)
+
+            # Connect to the database
+            conn = sqlite3.connect(self.db)
+            cursor = conn.cursor()
+
+            # Fetch the group ID from the employee_group table
+            cursor.execute("SELECT id FROM employee_group WHERE name = ?", (employee_group,))
+            group_id = cursor.fetchone()
+            if not group_id:
+                await ctx.respond(f"Employee group '{employee_group}' not found.")
+                return
+            group_id = group_id[0]
+
+            # Fetch the employee IDs for the selected group
+            cursor.execute("SELECT employeeID FROM group_member WHERE groupID = ?", (group_id,))
+            employee_ids = [row[0] for row in cursor.fetchall()]
+
+            if not employee_ids:
+                await ctx.respond(f"No employees found in group '{employee_group}'.")
+                return
+
+            # Prepare SQL query to fetch all punches for the previous week for the employees in the group
+            placeholders = ",".join("?" for _ in employee_ids)
+            sql_query = f"""
+                SELECT 
+                    e.id,
+                    e.name,
+                    pc.id,
+                    pc.punchInTime,
+                    pc.punchOutTime,
+                    pc.punchInApproval,
+                    pc.punchOutApproval,
+                    pc.ignoreLunchBreak
+                FROM punch_clock pc
+                JOIN employee e ON pc.employeeID = e.id
+                WHERE pc.punchInTime BETWEEN ? AND ? AND e.id IN ({placeholders})
+                ORDER BY e.name, pc.punchInTime
+            """
+
+            params = [week_start, week_end] + employee_ids
+
+            # Execute the query
+            cursor.execute(sql_query, params)
+            punches = cursor.fetchall()
+
+            # Prepare to fetch work punches
+            punch_data = {}
+            employee_data = {}
+            for punch in punches:
+                employeeID, name, punch_id, punch_in, punch_out, in_approval, out_approval, ignore_lunch = punch
+                punch = (name, punch_id, punch_in, punch_out, in_approval, out_approval, ignore_lunch)
+                #Fetch work punches for each punch clock entry
+                cursor.execute("""
+                    SELECT
+                        wt.punchType,
+                        c.name,
+                        wt.timeSpent
+                    FROM work_time wt
+                    JOIN customer c ON wt.customerID = c.id
+                    WHERE wt.punchID = ?
+                    ORDER BY wt.timeStarted
+                """, (punch_id,))
+                work_punches = cursor.fetchall()
+                
+                if name not in punch_data:
+                    punch_data[name] = []
+                    cursor.execute("""
+                        SELECT
+                            name,
+                            addressLine1,
+                            addressLine2,
+                            addressCity,
+                            addressState,
+                            addressZip,
+                            phoneNumber
+                        FROM employee
+                        WHERE id = ?
+                    """, (employeeID,))
+                    employee = cursor.fetchall()
+                    employee_data[name] = employee[0]
+                punch_data[name].append((punch, work_punches))
+
+            conn.close()
+
+            #if debugging print out the timeclock data
+            if os.getenv('DEBUGGING'):
+                print("DEBUGGING TIMECARD DATA:")
+                for key, data in punch_data.items():
+                    print(f"=-=-=-=-=-=-\n{key}")
+                    for dat1, dat2 in data:
+                        print(f"    {dat1}")
+                        print(f"        {dat2}")
+                print("End of DEBUGGING TIMECARD DATA")
+                
+            
+            if not punches:
+                print(f"No punches found for the week ending on {week_end_date}.")
+                return
+
+            # Create an Excel file
+            file_path = f"reports/Weekly_Report_{week_end_date}.xlsx"
+            self.createReportWorkbook(file_path, "Timecard")
+            # Edit Excel File
+            employees = [key for key in punch_data.keys()]
+            # Create all the worksheets
+            wb = load_workbook(file_path)
+            ws = wb["Timecard"]
+            ws.title = employees[0]
+            # Create several copies of the template sheet within the new workbook
+            for e in employees[1::]:
+                # Copy the contentwb from the original new sheet to the new copy
+                source = wb.active
+                target = wb.copy_worksheet(source)
+                target.title = e
+            for e in employees:
+                sheet = wb[e]
+                sheet["D8"].value = week_end_date
+                sheet["D11"].value = f"{employee_data[e][0]}"
+                sheet["D14"].value = f"{employee_data[e][1]} {employee_data[e][2]}"
+                sheet["D15"].value = f"{employee_data[e][3]}, {employee_data[e][4]} {employee_data[e][5]}"
+                sheet["D18"].value = f"{employee_data[e][6]}"
+                lastRow = self.reportTimecardData(sheet, punch_data[e])
+                if lastRow < 1:
+                    print(f"A critical error/bug occured in reportTimecardData on {e} because offset returned was {lastRow}!")
+                else:
+                    sheet.print_area = f"A1:G21 H1:S{lastRow}"
+            wb.save(file_path)
+            
+            
+            # Send the Excel file to the specified reports channel
+            reports_channel_id = int(os.getenv('TIMECARD_REPORTS_CHANNEL_ID'))
+            reports_channel = self.bot.get_channel(reports_channel_id)
+            if reports_channel:
+                await reports_channel.send(file=discord.File(file_path))
+                await ctx.respond(f"Weekly report for the week ending on {week_end_date} has been generated and sent to the reports channel.", ephemeral=True)
+                print(f"Weekly report for the week ending on {week_end_date} has been generated and sent to the reports channel.")
+            else:
+                print("Reports channel not found.")
+        except ValueError as e:
+            print(e)
+            await ctx.respond("Invalid date format. Please use YYYY-MM-DD.")
+        except Exception as e:
+            print(e)
+            await ctx.respond(f"An error occurred: {e}") 
+        
+
+
+
 
     ## Database setup if it doesn't already exist
     def dbSetup(self, db):
@@ -936,7 +1265,7 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
             ]
             cursor.executemany('INSERT INTO customer (id, name) VALUES (?, ?)', customerDefaultData)
             # adds fake customers to the table for testing purposes
-            if(os.getenv('COMPANY_NAME')):
+            if os.getenv('DEBUGGING'):
                 customerDefaultData = [
                     ("Bond, James",),
                     ("Holmes, Sherlock",)
@@ -947,7 +1276,7 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
                 CREATE TABLE work_time (
                     id          UNSIGNED BIG INT                                                             PRIMARY KEY,
                     punchID     UNSIGNED BIG INT                                                             NOT NULL,
-                    customerID  INT                                                                          NOT NULL DEFAULT 0,
+                    customerID  INTEGER                                                                      NOT NULL DEFAULT 0,
                     punchType   TEXT CHECK( punchType IN ('Construction','Service', 'Office') )              NOT NULL,
                     timeSpent   INTEGER CHECK( timeSpent >= 0 AND timeSpent <= 1440 AND timeSpent % 15 = 0)  NOT NULL DEFAULT 0,
                     timeStarted DATETIME                                                                     NOT NULL,
