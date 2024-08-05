@@ -55,7 +55,7 @@ CREATE TABLE customer (
 CREATE TABLE work_time (
 	id          UNSIGNED BIG INT                                                             PRIMARY KEY,
     punchID     UNSIGNED BIG INT                                                             NOT NULL,
-    customerID  INT                                                                          NOT NULL,
+    customerID  INTEGER                                                                      NOT NULL,
     punchType   TEXT CHECK( punchType IN ('Construction','Service', 'Office') )              NOT NULL,
     timeSpent   INTEGER CHECK( timeSpent >= 0 AND timeSpent <= 1440 AND timeSpent % 15 = 0)  NOT NULL DEFAULT 0,
     timeStarted DATETIME                                                                     NOT NULL,
