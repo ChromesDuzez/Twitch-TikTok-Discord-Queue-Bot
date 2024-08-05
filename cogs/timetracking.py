@@ -887,13 +887,13 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
     def convert_minutes_to_hours(self, minutes):
         return minutes / 60
 
-    def is_saturday(date_str):
+    def is_saturday(self, date_str):
         # Parse the date string into a datetime object
         date_obj = datetime.strptime(date_str, '%Y-%m-%d')
         # Check if the day of the week is Saturday (5)
         return date_obj.weekday() == 5
     
-    def get_day_of_week(date_str):
+    def get_day_of_week(self, date_str):
         # Parse the date string into a datetime object
         date_obj = datetime.strptime(date_str, '%Y-%m-%d')
         
@@ -902,18 +902,18 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
         
         return day_of_week
 
-    def setCell(cell, newValue, newFont, newNumberFormat, newBorder, newAlignment):
+    def setCell(self, cell, newValue, newFont, newNumberFormat, newBorder, newAlignment):
         cell.value = newValue
         cell.font = newFont
         cell.number_format = newNumberFormat
         cell.border = newBorder
         cell.alignment = newAlignment
 
-    def getKey(e):
+    def getKey(self, e):
         dat1, dat2 = e
         return datetime.strptime(dat1[2], "%Y-%m-%d %H:%M:%S")
 
-    def createReportWorkbook(new_wb, template_sheet_name):
+    def createReportWorkbook(self, new_wb, template_sheet_name):
         # Load the existing workbook
         template_path = 'templates/Template Sheets.xlsx'
         # Copy the template sheet to the new workbook
@@ -1070,6 +1070,7 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
             placeholders = ",".join("?" for _ in employee_ids)
             sql_query = f"""
                 SELECT 
+                    e.id,
                     e.name,
                     pc.id,
                     pc.punchInTime,
@@ -1178,14 +1179,17 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
             reports_channel = self.bot.get_channel(reports_channel_id)
             if reports_channel:
                 await reports_channel.send(file=discord.File(file_path))
+                await ctx.respond(f"Weekly report for the week ending on {week_end_date} has been generated and sent to the reports channel.", ephemeral=True)
                 print(f"Weekly report for the week ending on {week_end_date} has been generated and sent to the reports channel.")
             else:
                 print("Reports channel not found.")
-            
-        except ValueError:
+        except ValueError as e:
+            print(e)
             await ctx.respond("Invalid date format. Please use YYYY-MM-DD.")
         except Exception as e:
-            await ctx.respond(f"An error occurred: {e}")
+            print(e)
+            await ctx.respond(f"An error occurred: {e}") 
+        
 
 
 
