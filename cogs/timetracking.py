@@ -2,11 +2,12 @@ import discord
 from discord.ext import commands
 from datetime import datetime, timedelta
 import sqlite3
-import xlwings as xw
+import xlsxwriter as xwriter
 import openpyxl
 from openpyxl import load_workbook, Workbook
 from openpyxl.utils import get_column_letter
 from openpyxl.styles import NamedStyle, Font, Border, Side, PatternFill, Alignment, Protection
+from copy import copy
 import os
 
 def canPressButton(interaction: discord.Interaction, intended_user: discord.User) -> bool:
@@ -919,18 +920,20 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
     def createReportWorkbook(self, new_wb, template_sheet_name):
         # Load the existing workbook
         template_path = 'templates/Template Sheets.xlsx'
+        newWorkbook = xwriter.Workbook(new_wb)
+        newWorkbook.add_worksheet(template_sheet_name)
+        newWorkbook.close()
         # Copy the template sheet to the new workbook
-        try:
-            excel_app = xw.App(visible=False)
-            wb = excel_app.books.open(template_path)
-            for sheet in wb.sheets:
-                if sheet.name == template_sheet_name:
-                    sheet.api.Copy()
-                    wb_new = xw.books.active
-                    wb_new.save(new_wb)
-                    wb_new.close()
-        finally:
-            excel_app.quit()
+        tpwb = load_workbook(template_path)
+        newWbObj = load_workbook(new_wb)
+        tpws = tpwb[template_sheet_name]
+        newWsObj =newWbObj[template_sheet_name]
+        for column in tpws.iter_cols(min_row=1, min_col=1, max_col=tpws.max_column, max_row=tpws.max_row):
+            for cell in column:
+                self.setCell(newWsObj[f"{cell.coordinate}"], cell.value, copy(cell.font), copy(cell.number_format), copy(cell.border), copy(cell.alignment))
+        newWbObj.save(new_wb)
+
+            
 
     # This method takes the punch data for one employee and formats the given openpyxl sheet with the data
     def reportTimecardData(
