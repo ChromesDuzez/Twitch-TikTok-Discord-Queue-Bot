@@ -10,10 +10,9 @@ from openpyxl.styles import NamedStyle, Font, Border, Side, PatternFill, Alignme
 from copy import copy
 import os
 
-def canPressButton(interaction: discord.Interaction, intended_user: discord.User) -> bool:
+def canPressButton(interaction: discord.Interaction, intended_user: discord.User, accepted_roles: list = ['TIMECARD_ADMIN_ROLE']) -> bool:
     admin_role_id = int(os.getenv('TIMECARD_ADMIN_ROLE'))
     user = interaction.user
-    guild = interaction.guild
 
     if user.id == intended_user.id:
         return True
@@ -21,8 +20,16 @@ def canPressButton(interaction: discord.Interaction, intended_user: discord.User
     if any(role.permissions.administrator for role in user.roles):
         return True
 
-    if discord.utils.get(user.roles, id=admin_role_id):
-        return True
+    for role in accepted_roles:
+        role_id = None
+        if type(role) == type(109):
+            role_id = role
+        elif type(role) == type("str"):
+            role_id = int(os.getenv(role))
+        
+        if role_id:
+            if discord.utils.get(user.roles, id=role_id):
+                return True
 
     return False
 
@@ -224,7 +231,13 @@ class Clock(discord.ui.View):
             
             # Fetch ignoreLunchBreak value
             cursor.execute(f"SELECT ignoreLunchBreak FROM punch_clock WHERE id = {currpunch}")
-            self.ignoreLunchBreak = cursor.fetchone()[0]
+            lunchBool = cursor.fetchone()[0]
+            if lunchBool == "FALSE":
+                self.ignoreLunchBreak = False
+            elif lunchBool == "TRUE":
+                self.ignoreLunchBreak = True
+            else:
+                self.ignoreLunchBreak = bool(lunchBool)
 
         # Fetch employee type and allowed work types
         cursor.execute(f"""
@@ -281,7 +294,7 @@ class Clock(discord.ui.View):
             passedChecks = True
             if os.getenv('TIMECARD_TIMECLOCK_ROLE_ID'):
                 role = discord.utils.get(user.roles, id=int(os.getenv('TIMECARD_TIMECLOCK_ROLE_ID')))
-            if interaction.user != self.view.user:
+            if interaction.user != self.view.user and not canPressButton(interaction, self.view.user, ['TIMECARD_ADMIN_ROLE', 'TIMECARD_TIMECLOCK_ROLE_ID']):
                 await interaction.response.send_message("This is not for you!", ephemeral=True)
                 passedChecks = False
             if self.view.value == True:
@@ -320,8 +333,13 @@ class Clock(discord.ui.View):
                 embeds[0].set_footer(text = str(nextid))
                 self.view.currentpunch = nextid
                 await self.view.message.edit(embeds=embeds)
-                print(f"{self.view.user} just clocked in.")
-                await interaction.response.send_message("You clocked in.", ephemeral=True)
+                userStr = ""
+                if interaction.user.id != self.view.user.id:
+                    userStr = f" by {interaction.user}"
+                print(f"{self.view.user} just clocked in{userStr}.")
+                if interaction.user.id != self.view.user.id:
+                    userStr = f" {self.view.user}"
+                await interaction.response.send_message(f"You clocked in{userStr}.", ephemeral=True)
                 await reloadClockView(user=self.view.user, message=self.view.message, bot=self.view.bot, db=self.view.db, value=self.view.value, currpunch=self.view.currentpunch, ignoreLunchBreak=self.view.ignoreLunchBreak)
 
     # start work punch
@@ -332,7 +350,7 @@ class Clock(discord.ui.View):
         
         async def callback(self, interaction: discord.Interaction):
             passedChecks = True
-            if interaction.user != self.view.user:
+            if interaction.user != self.view.user and not canPressButton(interaction, self.view.user, ['TIMECARD_ADMIN_ROLE', 'TIMECARD_TIMECLOCK_ROLE_ID']): 
                 await interaction.response.send_message("This is not for you!", ephemeral=True)
                 passedChecks = False
             if self.view.value == False:
@@ -391,33 +409,36 @@ class Clock(discord.ui.View):
             super().__init__(label=f"End {type} Work {txt}", style=stl)
         
         async def callback(self, interaction: discord.Interaction):
-            if self.custom:
-                modal = GetTimeSpent(button=self)
-                await interaction.response.send_modal(modal)
+            if interaction.user != self.view.user and not canPressButton(interaction, self.view.user, ['TIMECARD_ADMIN_ROLE', 'TIMECARD_TIMECLOCK_ROLE_ID']): 
+                await interaction.response.send_message("This is not for you!", ephemeral=True)
             else:
-                conn = sqlite3.connect(self.view.db)
-                cursor = conn.cursor()
-                cursor.execute(f"SELECT timeStarted FROM work_time WHERE id = {self.view.workpunch}")
-                result = cursor.fetchone()
-                conn.commit()
-                conn.close()
-                if result:
-                    time_started = datetime.fromisoformat(result[0])
-                    time_now = datetime.now()
-                    time_difference = time_now - time_started
-                    
-                    # Convert the time difference to hours
-                    hours_spent = time_difference.total_seconds() / 3600
-                    
-                    # Round to the nearest quarter hour
-                    nearest_quarter_hour = round(hours_spent * 4) / 4
-                    if nearest_quarter_hour == 0:
-                        nearest_quarter_hour = 0.25
-                    print(f"Time spent: {nearest_quarter_hour} hours.")
-                    self.timeSpent = nearest_quarter_hour
-                    await self.completeCallbackMethod(interaction=interaction)
+                if self.custom:
+                    modal = GetTimeSpent(button=self)
+                    await interaction.response.send_modal(modal)
                 else:
-                    await interaction.response.send_message("Start time not found.", ephemeral=True)
+                    conn = sqlite3.connect(self.view.db)
+                    cursor = conn.cursor()
+                    cursor.execute(f"SELECT timeStarted FROM work_time WHERE id = {self.view.workpunch}")
+                    result = cursor.fetchone()
+                    conn.commit()
+                    conn.close()
+                    if result:
+                        time_started = datetime.fromisoformat(result[0])
+                        time_now = datetime.now()
+                        time_difference = time_now - time_started
+                        
+                        # Convert the time difference to hours
+                        hours_spent = time_difference.total_seconds() / 3600
+                        
+                        # Round to the nearest quarter hour
+                        nearest_quarter_hour = round(hours_spent * 4) / 4
+                        if nearest_quarter_hour == 0:
+                            nearest_quarter_hour = 0.25
+                        print(f"Time spent: {nearest_quarter_hour} hours.")
+                        self.timeSpent = nearest_quarter_hour
+                        await self.completeCallbackMethod(interaction=interaction)
+                    else:
+                        await interaction.response.send_message("Start time not found.", ephemeral=True)
             
         async def completeCallbackMethod(self, interaction: discord.Interaction):
             conn = sqlite3.connect(self.view.db)
@@ -447,7 +468,7 @@ class Clock(discord.ui.View):
             passedChecks = True
             if os.getenv('TIMECARD_TIMECLOCK_ROLE_ID'):
                 role = discord.utils.get(user.roles, id=int(os.getenv('TIMECARD_TIMECLOCK_ROLE_ID')))
-            if interaction.user != self.view.user:
+            if interaction.user != self.view.user and not canPressButton(interaction, self.view.user, ['TIMECARD_ADMIN_ROLE', 'TIMECARD_TIMECLOCK_ROLE_ID']): 
                 await interaction.response.send_message("This is not for you!", ephemeral=True)
                 passedChecks = False
             if self.view.value == False:
@@ -461,8 +482,12 @@ class Clock(discord.ui.View):
                 #connect to the db
                 conn = sqlite3.connect(self.view.db)
                 cursor = conn.cursor()
-                cursor.execute(f'SELECT MAX(id) FROM punch_clock WHERE employeeID = {self.view.user.id} AND punchOutTime is NULL ')
-                currPunch = cursor.fetchone()[0]
+                currPunch = None
+                if self.view.currentpunch:
+                    currPunch = self.view.currentpunch
+                else:
+                    cursor.execute(f'SELECT MAX(id) FROM punch_clock WHERE employeeID = {self.view.user.id} AND punchOutTime is NULL ')
+                    currPunch = cursor.fetchone()[0]
                 if currPunch is None:
                     print("Critical error: I dont think we shouldve been able to clock out if the employee was never clocked in!")
                 cursor.execute(f'SELECT checkChannelId, checkMessageId FROM punch_clock WHERE id = {currPunch}')
@@ -506,19 +531,24 @@ class Clock(discord.ui.View):
                 embeds[0].set_footer(text = f"User: {self.view.user.name}")
                 self.view.currentpunch = None
                 await self.view.message.edit(embeds=embeds)
-                print(f"{self.view.user} just clocked out.")
-                await interaction.response.send_message("You clocked out.", ephemeral=True)
+                userStr = ""
+                if interaction.user.id != self.view.user.id:
+                    userStr = f" by {interaction.user}"
+                print(f"{self.view.user} just clocked out{userStr}.")
+                if interaction.user.id != self.view.user.id:
+                    userStr = f" {self.view.user}"
+                await interaction.response.send_message(f"You clocked out{userStr}.", ephemeral=True)
                 await reloadClockView(user=self.view.user, message=self.view.message, bot=self.view.bot, db=self.view.db, value=self.view.value, currpunch=self.view.currentpunch, ignoreLunchBreak=self.view.ignoreLunchBreak)
     
     # toggle whether to ignore lunch break or not
     class IgnoreLunchBreakButton(discord.ui.Button):
         def __init__(self, ignoreLunchBreak):
-            label = "Ignore Lunch Break"
+            label = "Ignoring Lunch Break" if ignoreLunchBreak else "NOT Ignoring Lunch Break"
             style = discord.ButtonStyle.success if ignoreLunchBreak else discord.ButtonStyle.danger
             super().__init__(label=label, style=style)
         
         async def callback(self, interaction: discord.Interaction):
-            if not canPressButton(interaction, self.view.user):
+            if not canPressButton(interaction, self.view.user, ['TIMECARD_ADMIN_ROLE', 'TIMECARD_TIMECLOCK_ROLE_ID']):
                 await interaction.response.send_message("You don't have permission to use this button.", ephemeral=True)
                 return
             conn = sqlite3.connect(self.view.db)
@@ -530,6 +560,7 @@ class Clock(discord.ui.View):
             
             self.view.ignoreLunchBreak = new_value
             self.style = discord.ButtonStyle.success if new_value else discord.ButtonStyle.danger
+            self.label = "Ignoring Lunch Break" if new_value else "NOT Ignoring Lunch Break"
             await interaction.response.edit_message(view=self.view)
 
 
@@ -928,8 +959,12 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
         newWbObj = load_workbook(new_wb)
         tpws = tpwb[template_sheet_name]
         newWsObj =newWbObj[template_sheet_name]
-        for column in tpws.iter_cols(min_row=1, min_col=1, max_col=tpws.max_column, max_row=tpws.max_row):
-            for cell in column:
+        for columns in tpws.iter_cols(min_row=1, min_col=1, max_col=tpws.max_column, max_row=1):
+            for col in columns:
+                col = col.coordinate[:-1:]
+                newWsObj.column_dimensions[col].width = tpws.column_dimensions[col].width
+        for columns in tpws.iter_cols(min_row=1, min_col=1, max_col=tpws.max_column, max_row=tpws.max_row):
+            for cell in columns:
                 self.setCell(newWsObj[f"{cell.coordinate}"], cell.value, copy(cell.font), copy(cell.number_format), copy(cell.border), copy(cell.alignment))
         newWbObj.save(new_wb)
 
@@ -956,6 +991,7 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
                 databyDate[dataDate] = dateLst
         #totals
         TotalConstructionTime = TotalServiceTime = 0
+        anyUnapprovedPunches = False
         ##all of my default styling with fonts, number formats, borders, and alignment
         normal_font, bold_font = Font(name='Arial', size=10, bold=False), Font(name='Arial', size=10, bold=True)
         date_number_format, hrs_number_format, time_duration_format, time_format = 'mm-dd-yy', '0.00 "hrs"', 'h:mm:ss', 'hh:mm AM/PM'
@@ -990,6 +1026,9 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
                 lastRow = lastRow + 1
                 self.setCell(sheet[f"I{lastRow}"], "Clock-In", bold_font, 'General', Border(), Alignment())
                 self.setCell(sheet[f"J{lastRow}"], punch_in.time(), normal_font, time_format, Border(), leftAlign)
+                if punch[4]:
+                    self.setCell(sheet[f"K{lastRow}"], "<- Unapproved Punch", normal_font, 'General', Border(), leftAlign)
+                    anyUnapprovedPunches = True
                 if len(constructionLst) > 0:
                     lastRow = lastRow + 1
                     self.setCell(sheet[f"J{lastRow}"], "Construction", bold_font, 'General', workTime_border, rightAlign)
@@ -1011,6 +1050,9 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
                 lastRow = lastRow + 1
                 self.setCell(sheet[f"I{lastRow}"], "Clock-Out", bold_font, 'General', Border(), Alignment())
                 self.setCell(sheet[f"J{lastRow}"], punch_out.time(), normal_font, time_format, Border(), leftAlign)
+                if punch[5]:
+                    self.setCell(sheet[f"K{lastRow}"], "<- Unapproved Punch", normal_font, 'General', Border(), leftAlign)
+                    anyUnapprovedPunches = True
                 lastRow = lastRow + 1
                 self.setCell(sheet[f"K{lastRow}"], "Elapsed Time:", bold_font, 'General', Border(), rightAlign)
                 self.setCell(sheet[f"L{lastRow}"], shift_duration, normal_font, hrs_number_format, Border(), leftAlign)
@@ -1033,11 +1075,13 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
             lastRow = lastRow + 2
         sheet["C5"].value = TotalConstructionTime
         sheet["D5"].value = TotalServiceTime
+        if anyUnapprovedPunches:
+            self.setCell(sheet["A1"], "Notice there ARE unapproved Punches on this timecard", bold_font, 'General', Border(), leftAlign)
         return lastRow
 
-    @discord.slash_command(name="weeklyreport", description="Generate a report of all time punches for the previous week given an end date.")
+    @discord.slash_command(name="timecardreport", description="Generate a report of all time punches for the previous week given an end date.")
     @commands.has_permissions(administrator=True)
-    async def weekly_report(
+    async def timecard_report(
         self,
         ctx: discord.ApplicationContext,
         week_end_date: discord.Option(str, description="End of Week Date in YYYY-MM-DD format [Must be a SATURDAY]"), # type: ignore
