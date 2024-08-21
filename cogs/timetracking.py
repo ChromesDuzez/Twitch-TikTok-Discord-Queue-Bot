@@ -569,7 +569,7 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
 
     def __init__(self, bot): # this is a special method that is called when the cog is loaded
         self.cwd = os.getcwd()
-        self.db = self.cwd + "\\timetracker.db"
+        self.db = self.cwd + "/timetracker.db"
         self.dbSetup(self.db)
         self.bot = bot
 
@@ -686,7 +686,7 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
     #
                     ## Employee Methods
     async def employee_type_autocomplete(ctx: discord.AutocompleteContext):
-        conn = sqlite3.connect(os.getcwd() + "\\timetracker.db")
+        conn = sqlite3.connect(os.getcwd() + "/timetracker.db")
         cursor = conn.cursor()
         cursor.execute("SELECT id, name FROM employee_type")
         types = cursor.fetchall()
