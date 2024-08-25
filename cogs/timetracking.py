@@ -908,6 +908,63 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
     #remove work time(id) - admin command? - trigger via button?
 
                 ## Reports
+    ##This autocomeplete needs work cause it will return saturdays that are in the future and i want it to autocomplete no matter where they are in typing the date
+    async def week_ending_autocomplete(self, ctx: discord.AutocompleteContext):
+        user_input = ctx.value.lower()
+        
+        # Attempt to autofill the date based on the user's incomplete input
+        date_object = self.autofill_incomplete_date(user_input)
+        
+        # If the input is still invalid or cannot be autofilled, return no suggestions
+        if not date_object:
+            return []
+        
+        # Get the closest Saturdays based on the parsed date
+        saturdays = self.get_closest_saturdays(date_object)
+        
+        # Filter Saturdays based on what the user is typing
+        filtered_saturdays = [date for date in saturdays if user_input in date]
+
+        # Limit the number of suggestions to prevent spam
+        return [discord.OptionChoice(date, value=date) for date in filtered_saturdays[:25]]
+    
+    def get_closest_saturdays(self, date_object):
+        saturdays = []
+
+        # Find the closest Saturday to the provided date
+        days_until_saturday = (5 - date_object.weekday()) % 7
+        closest_saturday = date_object + timedelta(days=days_until_saturday)
+
+        # Generate 15 Saturdays that are at most 1 Saturday in the future
+        for i in range(-14, 2):  # We allow up to 14 past Saturdays and 1 future Saturday
+            saturdays.append(closest_saturday + timedelta(weeks=i))
+        
+        # Filter to include only Saturdays that are not more than 1 Saturday in the future
+        saturdays = [saturday for saturday in saturdays if saturday <= closest_saturday + timedelta(weeks=1)]
+        
+        return [saturday.strftime('%Y-%m-%d') for saturday in saturdays] 
+
+    def autofill_incomplete_date(self, user_input):
+        today = datetime.today()
+        try:
+            # If input is a valid date, return it
+            date_object = datetime.strptime(user_input, '%Y-%m-%d')
+        except ValueError:
+            # Handle incomplete input
+            if len(user_input) == 5:  # "YYYY-"
+                user_input += f"{today.month:02d}-{today.day:02d}"
+            elif len(user_input) == 8:  # "YYYY-MM-"
+                user_input += f"{today.day:02d}"
+            else:
+                return None
+
+            try:
+                date_object = datetime.strptime(user_input, '%Y-%m-%d')
+            except ValueError:
+                return None
+
+        return date_object
+
     async def employee_group_autocomplete(self, ctx: discord.AutocompleteContext):
         conn = sqlite3.connect(self.db)
         cursor = conn.cursor()
@@ -967,8 +1024,6 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
             for cell in columns:
                 self.setCell(newWsObj[f"{cell.coordinate}"], cell.value, copy(cell.font), copy(cell.number_format), copy(cell.border), copy(cell.alignment))
         newWbObj.save(new_wb)
-
-            
 
     # This method takes the punch data for one employee and formats the given openpyxl sheet with the data
     def reportTimecardData(
@@ -1081,10 +1136,10 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
 
     @discord.slash_command(name="timecardreport", description="Generate a report of all time punches for the previous week given an end date.")
     @commands.has_permissions(administrator=True)
-    async def timecard_report(
+    async def timecardreport(
         self,
         ctx: discord.ApplicationContext,
-        week_end_date: discord.Option(str, description="End of Week Date in YYYY-MM-DD format [Must be a SATURDAY]"), # type: ignore
+        week_end_date: discord.Option(str, description="End of Week Date in YYYY-MM-DD format [Must be a SATURDAY]", autocomplete=week_ending_autocomplete),    # type: ignore
         employee_group: discord.Option(str, description="Employee group to include in the report", autocomplete=employee_group_autocomplete)  # type: ignore
     ):
         try:
@@ -1195,7 +1250,9 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
                 return
 
             # Create an Excel file
-            file_path = f"reports/Weekly_Report_{week_end_date}.xlsx"
+            file_path = f"reports/{employee_group.strip().replace(" ","_")}_Weekly_Report_{week_end_date}.xlsx"
+            if os.path.exists(file_path):
+                print("It already Exists!")
             self.createReportWorkbook(file_path, "Timecard")
             # Edit Excel File
             employees = [key for key in punch_data.keys()]
@@ -1239,10 +1296,7 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
         except Exception as e:
             print(e)
             await ctx.respond(f"An error occurred: {e}") 
-        
-
-
-
+    
 
     ## Database setup if it doesn't already exist
     def dbSetup(self, db):
@@ -1343,7 +1397,8 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
             ''')
             #adds the default data for employee_group
             employeeGroupDefaultData = [
-                (0, f"{str(os.getenv('COMPANY_NAME'))} Employee")
+                (0, f"Active Employees"),
+                (1, f"{str(os.getenv('COMPANY_NAME'))}")
             ]
             cursor.executemany('INSERT INTO employee_group (id, name) VALUES (?, ?)', employeeGroupDefaultData)
             #sets up employee and employee groups LINK table
