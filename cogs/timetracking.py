@@ -914,7 +914,7 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
         
         # Attempt to autofill the date based on the user's incomplete input
         date_object = self.autofill_incomplete_date(user_input)
-        
+
         # If the input is still invalid or cannot be autofilled, return no suggestions
         if not date_object:
             return []
@@ -946,18 +946,45 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
 
     def autofill_incomplete_date(self, user_input):
         today = datetime.today()
+        ogInput = user_input
+        if user_input == "":
+            return today
         try:
             # If input is a valid date, return it
             date_object = datetime.strptime(user_input, '%Y-%m-%d')
         except ValueError:
+            user_input = "".join(c for c in user_input if c.isnumeric() or c == "-")
+            user_input = user_input if (user_input[0] != "-") else user_input[1::]
+            dateBreakdown = user_input.split("-")
             # Handle incomplete input
-            if len(user_input) == 5:  # "YYYY-"
-                user_input += f"{today.month:02d}-{today.day:02d}"
-            elif len(user_input) == 8:  # "YYYY-MM-"
-                user_input += f"{today.day:02d}"
+            if dateBreakdown[-1] == "":
+                print(f"Checkpoint 1 w/ {ogInput}")
+                if len(dateBreakdown) == 1:
+                    return today
+                elif len(dateBreakdown) == 2:  # "YYYY-"
+                    user_input += f"{today.month:02d}-{today.day:02d}"
+                elif len(dateBreakdown) == 3:  # "YYYY-MM-"
+                    user_input += f"{today.day:02d}"
             else:
-                return None
-
+                if len(dateBreakdown) > 3 or len(dateBreakdown) < 1:
+                    return None
+                elif len(dateBreakdown) == 1:
+                    if len(str(dateBreakdown[0])) < len(str(today.year)): 
+                        user_input += f"{str(today.year)[len(str(dateBreakdown[0]))::]}-{today.month:02d}-{today.day:02d}"
+                    else:
+                        user_input += f"-{today.month:02d}-{today.day:02d}"
+                elif len(dateBreakdown) == 2:
+                    mnth = f"{today.month:02d}"
+                    if len(str(dateBreakdown[1])) < len(mnth): 
+                        user_input += f"{mnth[len(str(dateBreakdown[1]))::]}-{today.day:02d}"
+                    else:
+                        user_input += f"-{mnth}-{today.day:02d}"
+                else:
+                    dy = f"{today.day:02d}"
+                    if len(str(dateBreakdown[2])) < len(dy): 
+                        user_input += f"{dy[len(str(dateBreakdown[2]))::]}"
+                    else:
+                        user_input += f"-{dy}"
             try:
                 date_object = datetime.strptime(user_input, '%Y-%m-%d')
             except ValueError:
