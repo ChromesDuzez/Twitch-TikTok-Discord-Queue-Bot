@@ -1280,7 +1280,9 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
                 return
 
             # Create an Excel file
-            file_path = f"reports/{employee_group.strip().replace(" ","_")}_Weekly_Report_{week_end_date}.xlsx"
+            eGroup = employee_group.strip()
+            eGroup = eGroup.replace(" ","_")
+            file_path = f"reports/{eGroup}_Weekly_Report_{week_end_date}.xlsx"
             if os.path.exists(file_path):
                 print("It already Exists!")
             self.createReportWorkbook(file_path, "Timecard")
