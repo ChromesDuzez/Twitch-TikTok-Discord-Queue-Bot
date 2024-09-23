@@ -1219,6 +1219,8 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
             params = [week_start, week_end] + employee_ids
 
             # Execute the query
+            if os.getenv('DEBUGGING'):
+                print(f"EXECUTING QUERY:\n{sql_query} + {params}")
             cursor.execute(sql_query, params)
             punches = cursor.fetchall()
 
@@ -1273,7 +1275,8 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
                 
             
             if not punches:
-                print(f"No punches found for the week ending on {week_end_date}.")
+                print(f"No punches found for the week ending on {week_end_date} for employee group {employee_group}.")
+                await ctx.respond(f"No punches found for the week ending on {week_end_date} for employee group {employee_group}.")
                 return
 
             # Create an Excel file
