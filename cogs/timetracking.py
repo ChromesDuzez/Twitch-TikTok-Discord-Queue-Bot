@@ -10,12 +10,18 @@ from openpyxl.styles import NamedStyle, Font, Border, Side, PatternFill, Alignme
 from copy import copy
 import os
 
-def canPressButton(interaction: discord.Interaction, intended_user: discord.User, accepted_roles: list = ['TIMECARD_ADMIN_ROLE']) -> bool:
+def hasPerms(interaction: discord.Interaction, intended_user: discord.User, context: discord.ApplicationContext = None, accepted_roles: list = ['TIMECARD_ADMIN_ROLE']) -> bool:
     admin_role_id = int(os.getenv('TIMECARD_ADMIN_ROLE'))
-    user = interaction.user
+    if interaction:
+        user = interaction.user
+    elif context:
+        user = context.author
+    else:
+        return False
 
-    if user.id == intended_user.id:
-        return True
+    if intended_user:
+        if user.id == intended_user.id:
+            return True
 
     if any(role.permissions.administrator for role in user.roles):
         return True
@@ -294,7 +300,7 @@ class Clock(discord.ui.View):
             passedChecks = True
             if os.getenv('TIMECARD_TIMECLOCK_ROLE_ID'):
                 role = discord.utils.get(user.roles, id=int(os.getenv('TIMECARD_TIMECLOCK_ROLE_ID')))
-            if interaction.user != self.view.user and not canPressButton(interaction, self.view.user, ['TIMECARD_ADMIN_ROLE', 'TIMECARD_TIMECLOCK_ROLE_ID']):
+            if interaction.user != self.view.user and not hasPerms(interaction, self.view.user, accepted_roles=['TIMECARD_ADMIN_ROLE', 'TIMECARD_TIMECLOCK_ROLE_ID']):
                 await interaction.response.send_message("This is not for you!", ephemeral=True)
                 passedChecks = False
             if self.view.value == True:
@@ -350,7 +356,7 @@ class Clock(discord.ui.View):
         
         async def callback(self, interaction: discord.Interaction):
             passedChecks = True
-            if interaction.user != self.view.user and not canPressButton(interaction, self.view.user, ['TIMECARD_ADMIN_ROLE', 'TIMECARD_TIMECLOCK_ROLE_ID']): 
+            if interaction.user != self.view.user and not hasPerms(interaction, self.view.user, accepted_roles=['TIMECARD_ADMIN_ROLE', 'TIMECARD_TIMECLOCK_ROLE_ID']): 
                 await interaction.response.send_message("This is not for you!", ephemeral=True)
                 passedChecks = False
             if self.view.value == False:
@@ -409,7 +415,7 @@ class Clock(discord.ui.View):
             super().__init__(label=f"End {type} Work {txt}", style=stl)
         
         async def callback(self, interaction: discord.Interaction):
-            if interaction.user != self.view.user and not canPressButton(interaction, self.view.user, ['TIMECARD_ADMIN_ROLE', 'TIMECARD_TIMECLOCK_ROLE_ID']): 
+            if interaction.user != self.view.user and not hasPerms(interaction, self.view.user, accepted_roles=['TIMECARD_ADMIN_ROLE', 'TIMECARD_TIMECLOCK_ROLE_ID']): 
                 await interaction.response.send_message("This is not for you!", ephemeral=True)
             else:
                 if self.custom:
@@ -468,7 +474,7 @@ class Clock(discord.ui.View):
             passedChecks = True
             if os.getenv('TIMECARD_TIMECLOCK_ROLE_ID'):
                 role = discord.utils.get(user.roles, id=int(os.getenv('TIMECARD_TIMECLOCK_ROLE_ID')))
-            if interaction.user != self.view.user and not canPressButton(interaction, self.view.user, ['TIMECARD_ADMIN_ROLE', 'TIMECARD_TIMECLOCK_ROLE_ID']): 
+            if interaction.user != self.view.user and not hasPerms(interaction, self.view.user, accepted_roles=['TIMECARD_ADMIN_ROLE', 'TIMECARD_TIMECLOCK_ROLE_ID']): 
                 await interaction.response.send_message("This is not for you!", ephemeral=True)
                 passedChecks = False
             if self.view.value == False:
@@ -548,7 +554,7 @@ class Clock(discord.ui.View):
             super().__init__(label=label, style=style)
         
         async def callback(self, interaction: discord.Interaction):
-            if not canPressButton(interaction, self.view.user, ['TIMECARD_ADMIN_ROLE', 'TIMECARD_TIMECLOCK_ROLE_ID']):
+            if not hasPerms(interaction, self.view.user, accepted_roles=['TIMECARD_ADMIN_ROLE', 'TIMECARD_TIMECLOCK_ROLE_ID']):
                 await interaction.response.send_message("You don't have permission to use this button.", ephemeral=True)
                 return
             conn = sqlite3.connect(self.view.db)
@@ -1324,11 +1330,25 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
                 print("Reports channel not found.")
         except ValueError as e:
             print(e)
-            await ctx.respond("Invalid date format. Please use YYYY-MM-DD.")
+            await ctx.respond("Invalid date format. Please use YYYY-MM-DD.", ephemeral=True)
         except Exception as e:
             print(e)
-            await ctx.respond(f"An error occurred: {e}") 
+            await ctx.respond(f"An error occurred: {e}", ephemeral=True) 
     
+    #DB export via discord cmd
+    @discord.slash_command(name="timecardexportdb", description="Send the timecard db file in chat.")
+    async def timecardexportdb(
+            self,
+            ctx: discord.ApplicationContext
+        ):
+        if not hasPerms(None, None, context=ctx, accepted_roles=['TIMECARD_ADMIN_ROLE']):
+            print(f"{ctx.author} tried exporting the timecard db file to discord channel {ctx.channel} but DOES NOT HAVE PERMISSION TO DO SO")
+            await ctx.respond("You do not have permission to run this command.", ephemeral=True)
+            return
+        print(f"{ctx.author} exported the timecard db file to discord channel {ctx.channel}")
+        await ctx.respond("Here you go!", file=discord.File(self.db), ephemeral=True)
+        
+
 
     ## Database setup if it doesn't already exist
     def dbSetup(self, db):
