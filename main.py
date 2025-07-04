@@ -8,11 +8,15 @@ from dotenv import load_dotenv
 load_dotenv() 
 
 cogs_list = [
-    'functionality',
-    'fun',
-    'timetracking',
     'moderation'
 ]
+
+if os.getenv("ENABLE_TIMETRACKING", "false").lower() == "true":
+    cogs_list.insert(0, "timetracking")
+if os.getenv("ENABLE_FUN", "false").lower() == "true":
+    cogs_list.insert(0, "fun")
+if os.getenv("ENABLE_FUNCTIONALITY", "false").lower() == "true":
+    cogs_list.insert(0, "functionality")
 
 #Starting the discord bot
 bot = discord.Bot(command_prefix="$", help_command=commands.DefaultHelpCommand())

@@ -1078,7 +1078,7 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
                 dateLst.append(tup)
                 databyDate[dataDate] = dateLst
         #totals
-        TotalConstructionTime = TotalServiceTime = 0
+        ##TotalConstructionTime = TotalServiceTime = 0   #THINK I FOUND A WAY TO CONVERT THESE TO EXCEL FORMULAS
         anyUnapprovedPunches = False
         ##all of my default styling with fonts, number formats, borders, and alignment
         normal_font, bold_font = Font(name='Arial', size=10, bold=False), Font(name='Arial', size=10, bold=True)
@@ -1114,14 +1114,14 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
                 lastRow = lastRow + 1
                 self.setCell(sheet[f"I{lastRow}"], "Clock-In", bold_font, 'General', Border(), Alignment())
                 self.setCell(sheet[f"J{lastRow}"], punch_in.time(), normal_font, time_format, Border(), leftAlign)
-                if punch[4]:
+                if not(bool(punch[4])): #if the punch-in is unapproved
                     self.setCell(sheet[f"K{lastRow}"], "<- Unapproved Punch", normal_font, 'General', Border(), leftAlign)
                     anyUnapprovedPunches = True
                 if len(constructionLst) > 0:
                     lastRow = lastRow + 1
                     self.setCell(sheet[f"J{lastRow}"], "Construction", bold_font, 'General', workTime_border, rightAlign)
                     self.setCell(sheet[f"K{lastRow}"], TotConst, normal_font, hrs_number_format, workTime_border, Alignment())
-                    TotalConstructionTime = TotalConstructionTime + TotConst
+                    #TotalConstructionTime = TotalConstructionTime + TotConst  #TODELETE THIS LINE IF I CAN CONVERT TO EXCEL FORMULA
                     for name, hrs in constructionLst:
                         lastRow = lastRow + 1
                         self.setCell(sheet[f"J{lastRow}"], name, normal_font, 'General', Border(), rightAlign)
@@ -1130,7 +1130,7 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
                     lastRow = lastRow + 1
                     self.setCell(sheet[f"J{lastRow}"], "Service", bold_font, 'General', workTime_border, rightAlign)
                     self.setCell(sheet[f"K{lastRow}"], TotSer, normal_font, hrs_number_format, workTime_border, Alignment())
-                    TotalServiceTime = TotalServiceTime + TotSer
+                    #TotalServiceTime = TotalServiceTime + TotSer #TODELETE THIS LINE IF I CAN CONVERT TO EXCEL FORMULA
                     for name, hrs in serviceLst:
                         lastRow = lastRow + 1
                         self.setCell(sheet[f"J{lastRow}"], name, normal_font, 'General', Border(), rightAlign)
@@ -1138,7 +1138,7 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
                 lastRow = lastRow + 1
                 self.setCell(sheet[f"I{lastRow}"], "Clock-Out", bold_font, 'General', Border(), Alignment())
                 self.setCell(sheet[f"J{lastRow}"], punch_out.time(), normal_font, time_format, Border(), leftAlign)
-                if punch[5]:
+                if not(bool(punch[5])):  #if the punch-out is unapproved
                     self.setCell(sheet[f"K{lastRow}"], "<- Unapproved Punch", normal_font, 'General', Border(), leftAlign)
                     anyUnapprovedPunches = True
                 lastRow = lastRow + 1
@@ -1148,21 +1148,21 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
                 TotalTime = TotalTime + shift_duration
                 TotLunchTime = TotLunchTime + lunch
             #total all of the punches on the day
-            self.setCell(sheet[f"H{TotalingRow}"], date.strftime('%A'), bold_font, 'General', Border(), Alignment())
-            self.setCell(sheet[f"I{TotalingRow}"], date, normal_font, date_number_format, Border(), Alignment())
-            self.setCell(sheet[f"J{TotalingRow}"], "Total:", bold_font, 'General', Border(), rightAlign)
-            self.setCell(sheet[f"K{TotalingRow}"], TotalTime, normal_font, hrs_number_format, Border(), Alignment())
-            self.setCell(sheet[f"L{TotalingRow}"], "Shop:", bold_font, 'General', Border(), rightAlign)
-            self.setCell(sheet[f"M{TotalingRow}"], TotShopTime, normal_font, hrs_number_format, Border(), Alignment())
-            self.setCell(sheet[f"N{TotalingRow}"], "Lunch:", bold_font, 'General', Border(), rightAlign)
-            self.setCell(sheet[f"O{TotalingRow}"], TotLunchTime, normal_font, hrs_number_format, Border(), Alignment())
-            self.setCell(sheet[f"P{TotalingRow}"], "Office:", bold_font, 'General', Border(), rightAlign)
-            self.setCell(sheet[f"Q{TotalingRow}"], TotOfficeTime, normal_font, hrs_number_format, Border(), Alignment())
-            self.setCell(sheet[f"R{TotalingRow}"], "Paid Hrs:", bold_font, 'General', Border(), rightAlign)
-            self.setCell(sheet[f"S{TotalingRow}"], f"=K{TotalingRow}-O{TotalingRow}", normal_font, hrs_number_format, Border(), Alignment())
+            self.setCell(sheet[f"H{TotalingRow}"], date.strftime('%A'), bold_font, 'General', Border(), Alignment()) #day of the week
+            self.setCell(sheet[f"I{TotalingRow}"], date, normal_font, date_number_format, Border(), Alignment()) #date of the punch
+            self.setCell(sheet[f"J{TotalingRow}"], "Total:", bold_font, 'General', Border(), rightAlign) #label for total time
+            self.setCell(sheet[f"K{TotalingRow}"], TotalTime, normal_font, hrs_number_format, Border(), Alignment()) #total time for the day
+            self.setCell(sheet[f"L{TotalingRow}"], "Shop:", bold_font, 'General', Border(), rightAlign) #label for shop time
+            self.setCell(sheet[f"M{TotalingRow}"], TotShopTime, normal_font, hrs_number_format, Border(), Alignment()) #total shop time which is total hrs minus office, service, construction time, and lunch (aka paid hours minus office, service, and construction)
+            self.setCell(sheet[f"N{TotalingRow}"], "Lunch:", bold_font, 'General', Border(), rightAlign) #label for lunch time
+            self.setCell(sheet[f"O{TotalingRow}"], TotLunchTime, normal_font, hrs_number_format, Border(), Alignment()) #total lunch time
+            self.setCell(sheet[f"M{TotalingRow + 1}"], "Office:", bold_font, 'General', Border(), rightAlign) #label for office work
+            self.setCell(sheet[f"N{TotalingRow + 1}"], TotOfficeTime, normal_font, hrs_number_format, Border(), Alignment()) #total worktime spent on the company as office work
+            self.setCell(sheet[f"O{TotalingRow + 1}"], "Paid Hrs:", bold_font, 'General', Border(), rightAlign) #label for paid hours which is total hrs minus lunch time
+            self.setCell(sheet[f"P{TotalingRow + 1}"], f"=K{TotalingRow}-O{TotalingRow}", normal_font, hrs_number_format, Border(), Alignment()) #subtracting the total hrs minus the lunch time
             lastRow = lastRow + 2
-        sheet["C5"].value = TotalConstructionTime
-        sheet["D5"].value = TotalServiceTime
+        #sheet["C5"].value = TotalConstructionTime  #TODELETE THIS LINE IF I CAN CONVERT TO EXCEL FORMULA
+        #sheet["D5"].value = TotalServiceTime #TODELETE THIS LINE IF I CAN CONVERT TO EXCEL FORMULA
         if anyUnapprovedPunches:
             self.setCell(sheet["A1"], "Notice there ARE unapproved Punches on this timecard", bold_font, 'General', Border(), leftAlign)
         return lastRow
@@ -1179,6 +1179,7 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
             # Parse the provided date
             EOW = datetime.strptime(week_end_date, "%Y-%m-%d")
             week_start = EOW - timedelta(days=6)
+            #check to make sure the week_end_date is a saturday
             if not self.is_saturday(week_end_date):
                 ctx.respond(f"{week_end_date} is not a saturday it is a: {self.get_day_of_week(week_end_date)}")
                 return
@@ -1199,7 +1200,7 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
             # Fetch the employee IDs for the selected group
             cursor.execute("SELECT employeeID FROM group_member WHERE groupID = ?", (group_id,))
             employee_ids = [row[0] for row in cursor.fetchall()]
-
+            # If no employees are found in the group, respond accordingly
             if not employee_ids:
                 await ctx.respond(f"No employees found in group '{employee_group}'.")
                 return
@@ -1227,16 +1228,23 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
             # Execute the query
             if os.getenv('DEBUGGING'):
                 print(f"EXECUTING QUERY:\n{sql_query} + {params}")
+            # the query returns a list of [ employeeID, name, punch_id, punch_in, punch_out, in_approval, out_approval, ignore_lunch ]
+            # this does not yet have the shift data in it
             cursor.execute(sql_query, params)
             punches = cursor.fetchall()
-
+            
             # Prepare to fetch work punches
+            # We will store the punch data in a dictionary where the key is the employee name
+            # and the value is a list of tuples containing the punch data and work punches
             punch_data = {}
+            # we will store the employee information in a separate dictionary
             employee_data = {}
+            
+            #iterate over the punches and store them in the punch_data dict
             for punch in punches:
                 employeeID, name, punch_id, punch_in, punch_out, in_approval, out_approval, ignore_lunch = punch
                 punch = (name, punch_id, punch_in, punch_out, in_approval, out_approval, ignore_lunch)
-                #Fetch work punches for each punch clock entry
+                #Fetch work punches for the current punch clock entry
                 cursor.execute("""
                     SELECT
                         wt.punchType,
@@ -1247,8 +1255,10 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
                     WHERE wt.punchID = ?
                     ORDER BY wt.timeStarted
                 """, (punch_id,))
+                #this returns the worktime punch type, customer name, and time spent
                 work_punches = cursor.fetchall()
                 
+                #if the employee is not already in the punch_data dict, add them
                 if name not in punch_data:
                     punch_data[name] = []
                     cursor.execute("""
@@ -1263,8 +1273,11 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
                         FROM employee
                         WHERE id = ?
                     """, (employeeID,))
+                    #this returns the employee information to put on the timecard
                     employee = cursor.fetchall()
+                    #the employee data is a tuple with the employee's name, address (line 1, line 2, city, state, zip), and phone number
                     employee_data[name] = employee[0]
+                # once the employee is in the punch_data dict, append the punch and the punch's respective work_punches to their list
                 punch_data[name].append((punch, work_punches))
 
             conn.close()
@@ -1279,7 +1292,7 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
                         print(f"        {dat2}")
                 print("End of DEBUGGING TIMECARD DATA")
                 
-            
+            # Check if there are any punches for the week
             if not punches:
                 print(f"No punches found for the week ending on {week_end_date} for employee group {employee_group}.")
                 await ctx.respond(f"No punches found for the week ending on {week_end_date} for employee group {employee_group}.")
@@ -1304,13 +1317,15 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
                 source = wb.active
                 target = wb.copy_worksheet(source)
                 target.title = e
+            #the employee dictionary data is a tuple with the employee's name, address (line 1, line 2, city, state, zip), and phone number
             for e in employees:
                 sheet = wb[e]
                 sheet["D8"].value = week_end_date
-                sheet["D11"].value = f"{employee_data[e][0]}"
-                sheet["D14"].value = f"{employee_data[e][1]} {employee_data[e][2]}"
-                sheet["D15"].value = f"{employee_data[e][3]}, {employee_data[e][4]} {employee_data[e][5]}"
-                sheet["D18"].value = f"{employee_data[e][6]}"
+                sheet["D11"].value = f"{employee_data[e][0]}" # employee name
+                sheet["D14"].value = f"{employee_data[e][1]} {employee_data[e][2]}" # employee address line 1 and 2
+                sheet["D15"].value = f"{employee_data[e][3]}, {employee_data[e][4]} {employee_data[e][5]}" # employee address city, state, zip
+                sheet["D18"].value = f"{employee_data[e][6]}" # employee phone number
+                #ship the data and sheet to reportTimecardData for formatting the data in the excel sheet
                 lastRow = self.reportTimecardData(sheet, punch_data[e])
                 if lastRow < 1:
                     print(f"A critical error/bug occured in reportTimecardData on {e} because offset returned was {lastRow}!")
@@ -1342,7 +1357,7 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
             ctx: discord.ApplicationContext
         ):
         if not hasPerms(None, None, context=ctx, accepted_roles=['TIMECARD_ADMIN_ROLE']):
-            print(f"{ctx.author} tried exporting the timecard db file to discord channel {ctx.channel} but DOES NOT HAVE PERMISSION TO DO SO")
+            print(f"{ctx.author} tried exporting the timecard db file to discord channel {ctx.channel} but DOES NOT HAVE PERMISSION TO DO SO.")
             await ctx.respond("You do not have permission to run this command.", ephemeral=True)
             return
         print(f"{ctx.author} exported the timecard db file to discord channel {ctx.channel}")
