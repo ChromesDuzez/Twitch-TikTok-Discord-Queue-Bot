@@ -1330,7 +1330,18 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
                 if lastRow < 1:
                     print(f"A critical error/bug occured in reportTimecardData on {e} because offset returned was {lastRow}!")
                 else:
-                    sheet.print_area = f"A1:G21 H1:S{lastRow}"
+                    sheet.print_area = f"A1:G21 H1:P{lastRow}"
+                    # Set the print settings for the sheet
+                    sheet.page_margins.left = 0.25
+                    sheet.page_margins.right = 0.25
+                    sheet.page_margins.top = 0.75
+                    sheet.page_margins.bottom = 0.75
+                    sheet.page_margins.header = 0.3
+                    sheet.page_margins.footer = 0.3
+                    sheet.page_setup.orientation = sheet.ORIENTATION_PORTRAIT
+                    sheet.sheet_properties.pageSetUpPr.fitToPage = True
+                    sheet.page_setup.fitToHeight = False
+            # Save the workbook
             wb.save(file_path)
             
             
