@@ -1,7 +1,7 @@
 Write-Host "Setting up the virtual environment..."
-py -3.12 -m venv .venv
+py -3.12 -m venv discord-bot-venv
 Write-Host "Virtual environment created. Starting virtual environment..."
-.venv\Scripts\activate
+.\discord-bot-venv\Scripts\activate
 Write-Host "Installing required packages..."
 pip install -r requirements.txt
 Write-Host "Packages installed. Upgrading pip..."

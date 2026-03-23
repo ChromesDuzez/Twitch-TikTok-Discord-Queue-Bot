@@ -1,8 +1,8 @@
 #!/bin/sh
 echo "Setting up the virtual environment..."
-python3.12 -m venv .venv
+python3.12 -m venv discord-bot-venv
 echo "Virtual environment created. Starting virtual environment..."
-source .venv/bin/activate
+source ./discord-bot-venv/bin/activate
 echo "Installing required packages..."
 pip install -r requirements.txt
 echo "Packages installed. Upgrading pip..."
