@@ -2,7 +2,7 @@ import datetime
 import os
 from dotenv import load_dotenv
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta,date
 import pytz
 import json
 
@@ -46,7 +46,7 @@ def UseAPI(endpoint,data):
             response.raise_for_status()
             return response.json()
 
-
+## Customer/Partner/Employee (Contact) Functions ##
 
 def SearchPartnersbyId(customer_id):
     returnedData = UseAPI("/res.partner/search_read",{
@@ -82,33 +82,28 @@ def CreatePartner(newPartner, blockDuplicate=True):
         })
     return returnedData
 
-def AttendanceRead(employee_name, limit=20):
-    returnedData = UseAPI("/hr.attendance/search_read",{
-            "domain": [ ["employee_id.name", "ilike", employee_name] ],
-            "fields": [ "id", "display_name", "employee_id", "check_in", "check_out", "worked_hours" ],
-            "order": "check_in desc",
-            "limit": limit,
+def getEmployeeByID(employee_id):
+    returnedData = UseAPI("/hr.employee/search_read",{
+            "domain": [ ["active", "=", True], ["id", "=", employee_id] ],
+            "fields": [ "id", "display_name" ]
+        })
+    if len(returnedData) == 1:
+        return returnedData[0]
+    elif len(returnedData) > 1:
+        raise ValueError(f"Multiple employees found with ID {employee_id}.")
+    else:        
+        raise ValueError(f"No employee found with ID {employee_id}.")
+
+def getEmployeeList():
+    returnedData = UseAPI("/hr.employee/search_read",{
+            "domain": [ ["active", "=", True] ],
+            "fields": [ "id", "display_name" ],
+            "order": "id asc"
         })
     return returnedData
 
-def ClockOut(employee_name, check_out_time=None):
-    mostRecentAttendance = AttendanceRead(employee_name, 1)
-    if mostRecentAttendance:
-        if mostRecentAttendance[0]["check_out"] is not False:
-            raise ValueError(f"Employee {employee_name} is not currently clocked in.")
-    else:
-        raise ValueError(f"No attendance records found for employee: {employee_name}.")
-    attendance_id = mostRecentAttendance[0]["id"]
-    if not check_out_time:
-        local_timezone = pytz.timezone("America/Chicago") # Replace with your server/user timezone
-        now_local = datetime.now(local_timezone)
-        now_utc = now_local.astimezone(pytz.utc)
-        check_out_time = now_utc.strftime("%Y-%m-%d %H:%M:%S")
-    returnedData = UseAPI("/hr.attendance/write",{
-            "ids": [ attendance_id ],
-            "vals": { "check_out": check_out_time }
-        })
-    return returnedData
+
+### Work Time Functions ###
 
 def GetFieldServiceTasksByCustomer(project_id=2, name_filter="a%"):
     returnedData = UseAPI("/project.task/search_read",{
@@ -141,7 +136,6 @@ def GetProjects():
         })
     return returnedData
 
-
 def GetTimeEntriesForTask(task_id):
     returnedData = UseAPI("/project.task/search_read",{
             "domain": [ ["id", "=", task_id] ],
@@ -159,15 +153,6 @@ def GetTimeEntryDetails(timesheet_id):
             "domain": [ ["id", "=", timesheet_id] ],
             "fields": [ "id", "name", "display_name", "employee_id", "parent_task_id", "project_id", 
                         "task_id", "date", "unit_amount", "product_uom_id", "amount", "company_id", "validated_status" ]
-        })
-    return returnedData
-
-
-def getEmployeeList():
-    returnedData = UseAPI("/hr.employee/search_read",{
-            "domain": [ ["active", "=", True] ],
-            "fields": [ "id", "display_name" ],
-            "order": "id asc"
         })
     return returnedData
 
@@ -190,6 +175,55 @@ def addWorkTimeOnTask(task_id, date, employee_id, description, quantity: float=N
             }]
         })
     return returnedData
+
+
+### Attendance Functions ###
+
+def AttendanceRead(employee_name, limit=20):
+    returnedData = UseAPI("/hr.attendance/search_read",{
+            "domain": [ ["employee_id.name", "ilike", employee_name] ],
+            "fields": [ "id", "display_name", "employee_id", "check_in", "check_out", "worked_hours" ],
+            "order": "check_in desc",
+            "limit": limit,
+        })
+    return returnedData
+
+def ClockOut(employee_name, check_out_time=None):
+    mostRecentAttendance = AttendanceRead(employee_name, 1)
+    if mostRecentAttendance:
+        if mostRecentAttendance[0]["check_out"] is not False:
+            raise ValueError(f"Employee {employee_name} is not currently clocked in.")
+    else:
+        raise ValueError(f"No attendance records found for employee: {employee_name}.")
+    attendance_id = mostRecentAttendance[0]["id"]
+    if not check_out_time:
+        local_timezone = pytz.timezone("America/Chicago") # Replace with your server/user timezone
+        now_local = datetime.now(local_timezone)
+        now_utc = now_local.astimezone(pytz.utc)
+        check_out_time = now_utc.strftime("%Y-%m-%d %H:%M:%S")
+    returnedData = UseAPI("/hr.attendance/write",{
+            "ids": [ attendance_id ],
+            "vals": { "check_out": check_out_time }
+        })
+    return returnedData
+
+def mostRecentClock(employee_id):
+    returnedData = UseAPI("/hr.attendance/search_read",{
+            "domain": [ ["employee_id", "=", employee_id] ],
+            "fields": [ "id", "date", "check_in", "check_out" ],
+            "order": "check_in desc",
+            "limit": 1
+        })
+    return returnedData
+
+def getCurrentClockedStatus(employee_id):
+    if mostRecentClock(employee_id)[0]["check_out"] is False:
+        print(f"{getEmployeeByID(employee_id)['display_name']} is currently clocked in.")
+        return "in"
+    else:
+        print(f"{getEmployeeByID(employee_id)['display_name']} is currently clocked out.")
+        return "out"
+
 
 # print(SearchPartnersbyId(3))
 # print(SearchPartnersbyId(999999)) # Non-existent ID
@@ -231,4 +265,9 @@ print(f"Available timesheets for task {task}: {len(data['timesheet_ids'])} \nDat
 for record in data["timesheet_ids"]:
     print(GetTimeEntryDetails(record))
 print("-=-Adding Time Entry-=-")
-print(addWorkTimeOnTask(task, "2026-03-24", 1.00, "Test API Entry", quantity=1))
+print("It works! Check Odoo to see the new timesheet entry. Remember it will be in draft status so it won't affect reports until validated.")
+#print(addWorkTimeOnTask(task, "2026-03-24", 1.00, "Test API Entry", quantity=1))
+
+
+print("-=-Clock In/Out-=-")
+status = getCurrentClockedStatus(1) # Zach Wilson
