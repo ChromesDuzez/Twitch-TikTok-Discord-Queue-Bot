@@ -4,6 +4,7 @@ from dotenv import load_dotenv
 import requests
 from datetime import datetime
 import pytz
+import json
 
 load_dotenv() 
 
@@ -30,8 +31,20 @@ def UseAPI(endpoint,data):
             },
             json=data
         )
-        response.raise_for_status()
-        return response.json()
+        if response.status_code == 500:
+            try:
+                error_data = response.json()
+                print("Odoo API Error Details:")
+                for key, value in error_data.items():
+                    print(f"-=-=-=-{key}-=-=-=-")
+                    print(f"{value}")
+                # You can specifically look for error_data['error']['data']['message'] or the full traceback
+            except json.JSONDecodeError:
+                print(f"Response not in JSON format. Raw response: {response.text}")
+            raise Exception(f"Odoo API request failed with status code {response.status_code}.")
+        else:
+            response.raise_for_status()
+            return response.json()
 
 
 
@@ -49,11 +62,11 @@ def SearchPartnersbyId(customer_id):
         print(f"No partner found with ID {customer_id}.")
         return None
     
-def SearchPartnersbyName(customer_name):
+def SearchPartnersbyName(customer_name, limit=10):
     returnedData = UseAPI("/res.partner/search_read",{
             "domain": [ ["display_name", "ilike", customer_name] ],
             "fields": [ "id", "company_type", "display_name" ],
-            "limit": 10
+            "limit": limit
         })
     return returnedData
         
@@ -97,6 +110,86 @@ def ClockOut(employee_name, check_out_time=None):
         })
     return returnedData
 
+def GetFieldServiceTasksByCustomer(project_id=2, name_filter="a%"):
+    returnedData = UseAPI("/project.task/search_read",{
+            "domain": [ [ "partner_id.display_name", "ilike", name_filter ], ["project_id", "=", project_id],
+                        ["is_closed", "=", False] ],
+            "fields": [ "display_name", "partner_id", "project_id", "is_closed", "date_deadline", "date_end" ],
+            "limit": 5
+        })
+    return returnedData
+
+def GetFieldServiceTasksByID(task_id):
+    returnedData = UseAPI("/project.task/search_read",{
+            "domain": [ ["id", "=", task_id] ],
+            "fields": [ "display_name", "partner_id", "project_id", "company_id", "is_closed", "date_deadline", 
+                       "date_end", "parent_id" ],
+            "limit": 5
+        })
+    if len(returnedData) == 1:
+        return returnedData[0]
+    elif len(returnedData) > 1:
+        raise ValueError(f"Task with ID {task_id} has multiple entries.")
+    else:
+        raise ValueError(f"No task found with ID {task_id}.")
+
+def GetProjects():
+    returnedData = UseAPI("/project.project/search_read",{
+            "domain": [ "|", ["active", "=", True], ["active", "=", False] ],
+            "fields": [ "display_name" ],
+            "order": "id asc"
+        })
+    return returnedData
+
+
+def GetTimeEntriesForTask(task_id):
+    returnedData = UseAPI("/project.task/search_read",{
+            "domain": [ ["id", "=", task_id] ],
+            "fields": [ "timesheet_ids" ]
+        })
+    if len(returnedData) == 1:
+        return returnedData[0]
+    elif len(returnedData) > 1:
+        raise ValueError(f"Task with ID {task_id} has multiple entries.")
+    else:
+        raise ValueError(f"No task found with ID {task_id}.")
+
+def GetTimeEntryDetails(timesheet_id):
+    returnedData = UseAPI("/account.analytic.line/search_read",{
+            "domain": [ ["id", "=", timesheet_id] ],
+            "fields": [ "id", "name", "display_name", "employee_id", "parent_task_id", "project_id", 
+                        "task_id", "date", "unit_amount", "product_uom_id", "amount", "company_id", "validated_status" ]
+        })
+    return returnedData
+
+
+def getEmployeeList():
+    returnedData = UseAPI("/hr.employee/search_read",{
+            "domain": [ ["active", "=", True] ],
+            "fields": [ "id", "display_name" ],
+            "order": "id asc"
+        })
+    return returnedData
+
+#Required Fields: amount (Monetary), company_id (many2one), date (date), name (char)
+def addWorkTimeOnTask(task_id, date, employee_id, description, quantity: float=None, amount=0):
+    task = GetFieldServiceTasksByID(task_id)
+    returnedData = UseAPI("/account.analytic.line/create",{
+            "vals_list": [ {
+                "name": description, # Description of the timesheet entry
+                "date": date, # Date of the work (can be a string in 'YYYY-MM-DD' format)
+                "unit_amount": quantity, # Hours worked
+                "product_uom_id": 4, # Hours
+                "amount": amount, # Cost amount for the timesheet entry (can be 0 if not tracking costs)
+                "employee_id": employee_id, # Many2one to hr.employee
+                "company_id": task["company_id"], # Many2one to res.company (Swim Shack, Inc. is Default probably can tie it to the company on the task/project)
+                "validated_status": "draft", # Set to 'validated' if you want to auto-validate the timesheet entry
+                "task_id": task_id, # Many2one to project.task
+                "project_id": task["project_id"][0], # Many2one to project.project (Field Service)
+                "parent_task_id": task["parent_id"] # Many2one to project.task (Parent Task if this is a subtask)
+            }]
+        })
+    return returnedData
 
 # print(SearchPartnersbyId(3))
 # print(SearchPartnersbyId(999999)) # Non-existent ID
@@ -104,9 +197,38 @@ def ClockOut(employee_name, check_out_time=None):
 # print(CreatePartner("Test Partner from API"))
 # print(SearchPartnersbyName("Test"))
 
-ClockOut("Zach Wilson")
+#ClockOut("Zach Wilson")
+
+
+print("-=-=-=-=-Employees-=-=-=-=-=-")
+data = getEmployeeList()
+print(f"Total Employees: {len(data)}")
+for record in data:
+    print(record)
 
 data = AttendanceRead("Zach Wilson", 1)
 for record in data:
     print(f"Shift ID: {record['id']}, Employee: {record['employee_id']}, Shift Description: {record['display_name']}, Check-in: {record['check_in']}, Check-out: {record['check_out']}, Worked Hours: {round(record['worked_hours'] * 4) / 4}")
 
+print(SearchPartnersbyName("Jason & Jen Morris"))
+
+print("-=-=-=-=-Projects-=-=-=-=-=-")
+data = GetProjects()
+print(len(data))
+for record in data:
+    print(record)
+
+print("-=-=-=-=-Project Tasks-=-=-=-=-=-")
+data = GetFieldServiceTasksByCustomer(2, "Morris")
+for record in data:
+    print(record)
+
+#task id: 2988
+print("-=-=-=-=-Project Tasks Timesheets-=-=-=-=-=-")
+task = 2988
+data = GetTimeEntriesForTask(task)
+print(f"Available timesheets for task {task}: {len(data['timesheet_ids'])} \nData: {data}")
+for record in data["timesheet_ids"]:
+    print(GetTimeEntryDetails(record))
+print("-=-Adding Time Entry-=-")
+print(addWorkTimeOnTask(task, "2026-03-24", 1.00, "Test API Entry", quantity=1))
