@@ -296,11 +296,12 @@ class Clock(discord.ui.View):
         
         async def callback(self, interaction: discord.Interaction):
             user = interaction.user
+            timeclockUser = self.view.user
             role = None
             passedChecks = True
             if os.getenv('TIMECARD_TIMECLOCK_ROLE_ID'):
                 role = discord.utils.get(user.roles, id=int(os.getenv('TIMECARD_TIMECLOCK_ROLE_ID')))
-            if interaction.user != self.view.user and not hasPerms(interaction, self.view.user, accepted_roles=['TIMECARD_ADMIN_ROLE', 'TIMECARD_TIMECLOCK_ROLE_ID']):
+            if user != timeclockUser and not hasPerms(interaction, self.view.user, accepted_roles=['TIMECARD_ADMIN_ROLE', 'TIMECARD_TIMECLOCK_ROLE_ID']):
                 await interaction.response.send_message("This is not for you!", ephemeral=True)
                 passedChecks = False
             if self.view.value == True:
@@ -317,12 +318,12 @@ class Clock(discord.ui.View):
                 punchInApproval = True
                 approvalMessage: discord.Message = None
                 nextid = self.view.get_next_id(cursor)
-                values = (nextid, user.id, now_str, punchInApproval, None, None)
+                values = (nextid, timeclockUser.id, now_str, punchInApproval, None, None)
                 if role is None:
                     punchInApproval = False
                     approvalMessage = await self.view.bot.get_channel(int(os.getenv('TIMECARD_ADMIN_CHANNEL_ID'))).send(f"<@{self.view.user.id}> attempted to login today at {now_str} in a non-standard way.\nDo you approve of this login attempt?")
                     #values = (id, employeeID, punchInTime, punchInApproval, checkChannelId, checkMessageId) for reference
-                    values = (nextid,user.id, now_str, punchInApproval, approvalMessage.channel.id, approvalMessage.id)
+                    values = (nextid, timeclockUser.id, now_str, punchInApproval, approvalMessage.channel.id, approvalMessage.id)
                 ## store the clock-in in the db
                 cursor.execute(f'INSERT INTO punch_clock (id, employeeID, punchInTime, punchInApproval, checkChannelId, checkMessageId) VALUES (?, ?, ?, ?, ?, ?)', values)
                 ## wrap it all up with a nice clean bow
@@ -1389,9 +1390,9 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
 	                id             INTEGER            PRIMARY KEY AUTOINCREMENT,
 	                name           TEXT               NOT NULL,
 	                rate           DECIMAL(10,5)      NOT NULL,
-                    construction   BOOLEAN            NOT NULL DEFAULT "TRUE",
-                    service        BOOLEAN            NOT NULL DEFAULT "TRUE", 
-                    office         BOOLEAN            NOT NULL DEFAULT "FALSE"
+                    construction   BOOLEAN            NOT NULL DEFAULT 1,
+                    service        BOOLEAN            NOT NULL DEFAULT 1, 
+                    office         BOOLEAN            NOT NULL DEFAULT 0
                 )
             ''')
             employeeTypesDefaultData = [
@@ -1413,7 +1414,7 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
                     addressZip     TEXT                NOT NULL,
 	                payrate        DECIMAL(10,2)       NOT NULL DEFAULT 16.00,
 	                employeeTypeID INTEGER             NOT NULL DEFAULT 2,
-	                lunchSkipable  BOOLEAN             NOT NULL DEFAULT "FALSE",
+	                lunchSkipable  BOOLEAN             NOT NULL DEFAULT 0,
                     clockChannelId UNSIGNED BIG INT    NULL DEFAULT NULL,
                     clockMessageId UNSIGNED BIG INT    NULL DEFAULT NULL,
                     FOREIGN KEY (employeeTypeID) REFERENCES employee_type(id)
@@ -1425,10 +1426,10 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
                     id               UNSIGNED BIG INT    PRIMARY KEY,
                     employeeID       UNSIGNED BIG INT    NOT NULL,
                     punchInTime      DATETIME            NULL DEFAULT NULL,
-                    punchInApproval  BOOLEAN             NOT NULL DEFAULT "TRUE",
+                    punchInApproval  BOOLEAN             NOT NULL DEFAULT 1,
                     punchOutTime     DATETIME            NULL DEFAULT NULL,
-                    punchOutApproval BOOLEAN             NOT NULL DEFAULT "TRUE",
-                    ignoreLunchBreak BOOLEAN             NOT NULL DEFAULT "FALSE",
+                    punchOutApproval BOOLEAN             NOT NULL DEFAULT 1,
+                    ignoreLunchBreak BOOLEAN             NOT NULL DEFAULT 0,
                     checkChannelId   UNSIGNED BIG INT    NULL DEFAULT NULL,
                     checkMessageId   UNSIGNED BIG INT    NULL DEFAULT NULL,
                     FOREIGN KEY (employeeID) REFERENCES employee(id)
