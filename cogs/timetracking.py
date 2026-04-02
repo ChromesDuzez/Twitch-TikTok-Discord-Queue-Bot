@@ -1059,6 +1059,10 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
                 self.setCell(newWsObj[f"{cell.coordinate}"], cell.value, copy(cell.font), copy(cell.number_format), copy(cell.border), copy(cell.alignment))
         newWbObj.save(new_wb)
 
+    async def logData(self, data):
+        channel = self.bot.get_channel(os.getenv("TIMECARD_LOG_ID"))
+        message = await channel.send(data)
+
     # This method takes the punch data for one employee and formats the given openpyxl sheet with the data
     def reportTimecardData(
         self,
