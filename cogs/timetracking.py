@@ -9,6 +9,35 @@ from openpyxl.utils import get_column_letter
 from openpyxl.styles import NamedStyle, Font, Border, Side, PatternFill, Alignment, Protection
 from copy import copy
 import os
+import requests
+import pytz
+import json
+
+def UseAPI(bot, endpoint, data):
+    if bot.OdooLoaded:
+        data["context"] = {"lang": "en_US"}
+        response = requests.post(
+            f"{bot.OdooURL}{endpoint}",
+            headers={
+                "Authorization": f"Bearer {bot.OdooKEY}",
+                "X-Odoo-Database": f"{bot.OdooDB}"
+            },
+            json=data
+        )
+        if response.status_code == 500:
+            try:
+                error_data = response.json()
+                print("Odoo API Error Details:")
+                for key, value in error_data.items():
+                    print(f"-=-=-=-{key}-=-=-=-")
+                    print(f"{value}")
+                # You can specifically look for error_data['error']['data']['message'] or the full traceback
+            except json.JSONDecodeError:
+                print(f"Response not in JSON format. Raw response: {response.text}")
+            raise Exception(f"Odoo API request failed with status code {response.status_code}.")
+        else:
+            response.raise_for_status()
+            return response.json()
 
 def hasPerms(interaction: discord.Interaction, intended_user: discord.User, context: discord.ApplicationContext = None, accepted_roles: list = ['TIMECARD_ADMIN_ROLE']) -> bool:
     admin_role_id = int(os.getenv('TIMECARD_ADMIN_ROLE'))
@@ -1421,6 +1450,7 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
 	                lunchSkipable  BOOLEAN             NOT NULL DEFAULT 0,
                     clockChannelId UNSIGNED BIG INT    NULL DEFAULT NULL,
                     clockMessageId UNSIGNED BIG INT    NULL DEFAULT NULL,
+                    odooId         UNSIGNED BIG INT    NULL DEFAULT NULL,
                     FOREIGN KEY (employeeTypeID) REFERENCES employee_type(id)
                 )
             ''')
@@ -1436,14 +1466,16 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
                     ignoreLunchBreak BOOLEAN             NOT NULL DEFAULT 0,
                     checkChannelId   UNSIGNED BIG INT    NULL DEFAULT NULL,
                     checkMessageId   UNSIGNED BIG INT    NULL DEFAULT NULL,
+                    odooId           UNSIGNED BIG INT    NULL DEFAULT NULL,
                     FOREIGN KEY (employeeID) REFERENCES employee(id)
                 )
             ''')
             #sets up the customer table
             cursor.execute('''
                 CREATE TABLE customer (
-                    id          INTEGER          PRIMARY KEY AUTOINCREMENT,
-                    name        TEXT             NOT NULL
+                    id          INTEGER             PRIMARY KEY AUTOINCREMENT,
+                    name        TEXT                NOT NULL,
+                    odooId      UNSIGNED BIG INT    NULL DEFAULT NULL
                 )
             ''')
             #adds the default data for customer
@@ -1467,6 +1499,7 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
                     punchType   TEXT CHECK( punchType IN ('Construction','Service', 'Office') )              NOT NULL,
                     timeSpent   INTEGER CHECK( timeSpent >= 0 AND timeSpent <= 1440 AND timeSpent % 15 = 0)  NOT NULL DEFAULT 0,
                     timeStarted DATETIME                                                                     NOT NULL,
+                    odooId      UNSIGNED BIG INT                                                             NULL DEFAULT NULL,
                     FOREIGN KEY (punchID) REFERENCES punch_clock(id),
                     FOREIGN KEY (customerID) REFERENCES customer(id)
                 )

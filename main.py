@@ -7,6 +7,22 @@ from dotenv import load_dotenv
 import argparse, asyncio
 from prompt_toolkit import PromptSession
 
+class ChromesBot(discord.Bot):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.cli_session = None  # Will be set after bot is ready
+        self.OdooLoaded = False
+        self.OdooURL = os.getenv("ODOO_URL", None)
+        self.OdooDB = os.getenv("ODOO_DB", None)
+        self.OdooUSERNAME = os.getenv("ODOO_USERNAME", None)
+        self.OdooKEY = os.getenv("ODOO_API_KEY", None)
+        if not all([self.OdooURL, self.OdooDB, self.OdooUSERNAME, self.OdooKEY]):
+            print("Odoo configuration is incomplete. Please check your .env file if you wish to use the Odoo integration.")
+        else:
+            self.OdooLoaded = True
+            print("Odoo configuration loaded successfully.")
+
+
 load_dotenv()
 
 cogs_list = [
@@ -19,6 +35,7 @@ if os.getenv("ENABLE_FUN", "false").lower() == "true":
     cogs_list.insert(0, "fun")
 if os.getenv("ENABLE_FUNCTIONALITY", "false").lower() == "true":
     cogs_list.insert(0, "functionality")
+
 
 bot = None
 bot_ready_event = asyncio.Event()
@@ -47,7 +64,7 @@ async def shutdown(ctx):
 
 async def setup_bot():
     global bot
-    bot = discord.Bot(command_prefix="$", help_command=commands.DefaultHelpCommand())
+    bot = ChromesBot(command_prefix="$", help_command=commands.DefaultHelpCommand())
     bot.cli_session = None  # Will be set after bot is ready
 
     for cog in cogs_list:
