@@ -606,7 +606,7 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
     def __init__(self, bot): # this is a special method that is called when the cog is loaded
         self.cwd = os.getcwd()
         self.db = self.cwd + "/timetracker.db"
-        self.dbSetup(self.db)
+        self.dbSetup(self.db, bot)
         self.bot = bot
 
     # Gets all of the view buttons working again after a bot restart
@@ -1411,8 +1411,9 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
 
 
     ## Database setup if it doesn't already exist
-    def dbSetup(self, db):
+    def dbSetup(self, db, bot):
         if not os.path.exists(db):
+            print("Timecard database not found, creating new database...")
             f = open(db, "w")
             f.close()
             conn = sqlite3.connect(db)
@@ -1482,6 +1483,8 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
             customerDefaultData = [
                 (0, os.getenv('COMPANY_NAME'),)
             ]
+            if bot.OdooLoaded:
+                print("Odoo is loaded, attempting to pull customers from Odoo to add to the customer table in the timecard db...")
             cursor.executemany('INSERT INTO customer (id, name) VALUES (?, ?)', customerDefaultData)
             # adds fake customers to the table for testing purposes
             if os.getenv('DEBUGGING'):
@@ -1528,6 +1531,112 @@ class TimeTracking(commands.Cog): # create a class for our cog that inherits fro
             ''')
             conn.commit()
             conn.close()
+
+    async def handle_odoo_webhook(self, payload):
+        """
+        Handle incoming webhook payloads from Odoo.
+        
+        Expected payload format:
+        {
+            "channel_id": int,           # Discord channel ID
+            "message_id": int,           # Discord message ID
+            "punch_id": int,            # Punch clock ID from database
+            "action": "update",         # Action type
+            "content": "str",           # Optional: new message content
+            "data": {...}              # Optional: additional data
+        }
+        """
+        try:
+            # Extract required fields
+            channel_id = payload.get('channel_id')
+            message_id = payload.get('message_id')
+            punch_id = payload.get('punch_id')
+            action = payload.get('action', 'update')
+            content = payload.get('content')
+            data = payload.get('data', {})
+            
+            if not all([channel_id, message_id]):
+                print(f"[Webhook] Missing required fields: channel_id={channel_id}, message_id={message_id}")
+                return
+            
+            # Fetch the Discord message
+            try:
+                channel = self.bot.get_channel(int(channel_id))
+                if channel is None:
+                    channel = await self.bot.fetch_channel(int(channel_id))
+                message = await channel.fetch_message(int(message_id))
+            except discord.NotFound:
+                print(f"[Webhook] Message {message_id} not found in channel {channel_id}")
+                return
+            except Exception as e:
+                print(f"[Webhook] Error fetching message: {e}")
+                return
+            
+            # Handle the action
+            if action == 'update_content':
+                # Update message content
+                if content:
+                    await message.edit(content=content)
+                    print(f"[Webhook] Updated message {message_id} content")
+            
+            elif action == 'approve_punch':
+                # Approve a punch (remove approval buttons)
+                punch_approval_status = data.get('punch_approval_status', {})
+                in_approval = punch_approval_status.get('punchInApproval', True)
+                out_approval = punch_approval_status.get('punchOutApproval', True)
+                
+                # If both approved, remove the view
+                if in_approval and out_approval:
+                    await message.edit(view=None)
+                    print(f"[Webhook] Punch {punch_id} fully approved, removed approval buttons")
+                else:
+                    # Update with new approval view
+                    new_view = ApprovePunch(punch=punch_id, message=message, bot=self.bot, db=self.db)
+                    await message.edit(view=new_view)
+                    print(f"[Webhook] Updated approval view for punch {punch_id}")
+            
+            elif action == 'update_clock_view':
+                # Update the time clock view for an employee
+                employee_id = data.get('employee_id')
+                is_clocked_in = data.get('is_clocked_in', False)
+                current_punch = data.get('current_punch')
+                
+                if employee_id:
+                    try:
+                        user = await self.bot.fetch_user(int(employee_id))
+                        new_view = Clock(user=user, message=message, bot=self.bot, db=self.db, 
+                                       value=is_clocked_in, currpunch=current_punch)
+                        await message.edit(view=new_view)
+                        print(f"[Webhook] Updated clock view for employee {employee_id}")
+                    except Exception as e:
+                        print(f"[Webhook] Error updating clock view: {e}")
+            
+            elif action == 'sync_database':
+                # Sync the database and update the message view
+                if punch_id:
+                    conn = sqlite3.connect(self.db)
+                    cursor = conn.cursor()
+                    cursor.execute('SELECT punchInApproval, punchOutApproval FROM punch_clock WHERE id = ?', (punch_id,))
+                    result = cursor.fetchone()
+                    conn.close()
+                    
+                    if result:
+                        in_approval, out_approval = result
+                        if in_approval and out_approval:
+                            await message.edit(view=None)
+                            print(f"[Webhook] Synced and removed view for punch {punch_id}")
+                        else:
+                            new_view = ApprovePunch(punch=punch_id, message=message, bot=self.bot, db=self.db)
+                            await message.edit(view=new_view)
+                            print(f"[Webhook] Synced punch view for punch {punch_id}")
+            
+            else:
+                print(f"[Webhook] Unknown action: {action}")
+                
+        except Exception as e:
+            print(f"[Webhook] Error handling payload: {e}")
+            import traceback
+            traceback.print_exc()
 
 
 def setup(bot): # this is called by Pycord to setup the cog

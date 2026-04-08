@@ -227,7 +227,7 @@ def getCurrentClockedStatus(employee_id):
 
 # print(SearchPartnersbyId(3))
 # print(SearchPartnersbyId(999999)) # Non-existent ID
-# print(SearchPartnersbyName("Test Partner from API"))
+print(SearchPartnersbyName("Hayden"))
 # print(CreatePartner("Test Partner from API"))
 # print(SearchPartnersbyName("Test"))
 
