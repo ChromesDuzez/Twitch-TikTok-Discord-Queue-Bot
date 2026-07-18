@@ -20,18 +20,19 @@ else:
     OdooLoaded = True
     print("Odoo configuration loaded successfully.")
 
+#Generic UseAPI function to handle requests to Odoo's external API
 def UseAPI(endpoint,data):
-    if OdooLoaded:
-        data["context"] = {"lang": "en_US"}
+    if OdooLoaded: #first check if our Odoo configuration is loaded properly first
+        data["context"] = {"lang": "en_US"} #some parameters that are required for Odoo API requests but didnt want to repeat in every call
         response = requests.post(
-            f"{OdooURL}{endpoint}",
+            f"{OdooURL}{endpoint}", #this is a concatenation of the db URL and the endpoint we want to hit
             headers={
-                "Authorization": f"Bearer {OdooKEY}",
-                "X-Odoo-Database": f"{OdooDB}"
+                "Authorization": f"Bearer {OdooKEY}", #this is the API key for authentication
+                "X-Odoo-Database": f"{OdooDB}" #this is the database name for the Odoo instance
             },
-            json=data
+            json=data #add the data to the request as JSON
         )
-        if response.status_code == 500:
+        if response.status_code == 500: #if the response is a 500 error, we want to print out the error details for debugging
             try:
                 error_data = response.json()
                 print("Odoo API Error Details:")
@@ -43,8 +44,8 @@ def UseAPI(endpoint,data):
                 print(f"Response not in JSON format. Raw response: {response.text}")
             raise Exception(f"Odoo API request failed with status code {response.status_code}.")
         else:
-            response.raise_for_status()
-            return response.json()
+            response.raise_for_status() #this will raise an exception for any other HTTP errors (like 400, 401, etc.)
+            return response.json() #this returns the response data as a JSON object for further processing
 
 ## Customer/Partner/Employee (Contact) Functions ##
 
@@ -225,6 +226,7 @@ def getCurrentClockedStatus(employee_id):
         return "out"
 
 
+###TESTING AND DEBUGGING AREA DO NOT ENTER lol###
 # print(SearchPartnersbyId(3))
 # print(SearchPartnersbyId(999999)) # Non-existent ID
 print(SearchPartnersbyName("Hayden"))

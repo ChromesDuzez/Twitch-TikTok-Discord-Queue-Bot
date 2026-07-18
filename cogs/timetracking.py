@@ -1,3 +1,4 @@
+#Imports
 import discord
 from discord.ext import commands
 from datetime import datetime, timedelta
@@ -13,6 +14,7 @@ import requests
 import pytz
 import json
 
+#Use Odoo API
 def UseAPI(bot, endpoint, data):
     if bot.OdooLoaded:
         data["context"] = {"lang": "en_US"}

@@ -24,13 +24,13 @@ class ChromesBot(discord.Bot):
             self.OdooLoaded = True
             print("Odoo configuration loaded successfully.")
 
-
+#load environment variables from .env file and other configurations
 load_dotenv()
 
 cogs_list = [
     'moderation'
 ]
-
+# enabling and disabling cogs based on environment variables
 if os.getenv("ENABLE_TIMETRACKING", "false").lower() == "true":
     cogs_list.insert(0, "timetracking")
 if os.getenv("ENABLE_FUN", "false").lower() == "true":
@@ -38,7 +38,7 @@ if os.getenv("ENABLE_FUN", "false").lower() == "true":
 if os.getenv("ENABLE_FUNCTIONALITY", "false").lower() == "true":
     cogs_list.insert(0, "functionality")
 
-
+# Global variables
 bot = None
 bot_ready_event = asyncio.Event()
 session = None
