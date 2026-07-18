@@ -151,3 +151,6 @@ config.properties
 *.db
 test env/dbTestData.sql
 *.xlsx
+
+# Local virtualenv
+discord-bot-venv/
