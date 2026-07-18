@@ -154,3 +154,6 @@ test env/dbTestData.sql
 
 # Local virtualenv
 discord-bot-venv/
+
+# Log files (rotating)
+logs/

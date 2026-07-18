@@ -1,117 +1,113 @@
-"""Inbound webhook server for Odoo -> Discord updates.
+"""Inbound webhook server for Odoo -> Discord updates (pull-based).
 
-This replaces the previous "verify Odoo connectivity" gate, which was not real
-authentication: it only proved that *the bot* could reach Odoo, not that the
-*request* came from Odoo, so anyone able to reach the port could drive message
-edits.
+Odoo notifies the bot that a record changed; the bot then **pulls that record
+from Odoo** and reconciles it into its authoritative SQLite store. Because the
+payload is only a pointer, this endpoint's job is narrow and its trust surface
+is tiny:
 
-Instead we require an **HMAC-SHA256 signature** over the raw request body using
-a shared secret (``ODOO_WEBHOOK_SECRET``), plus a timestamp to bound replay.
-Odoo signs the payload with the same secret when it POSTs. Requests without a
-valid signature are rejected with 401.
-
-Payload validation is limited to types/shape (SQL is fully parameterized in the
-cog, so the old character whitelist -- which rejected legitimate names with
-apostrophes, etc. -- is gone).
+* **The model comes from the URL, not the payload.** There is one route per
+  supported model (``/webhook/odoo/<model>``), so the only thing read from the
+  body is an integer ``_id``. A malicious/garbage ``_model`` field is impossible
+  to exploit because it is never used.
+* **Auth is a shared token**, checked in constant time. Odoo's native webhook
+  automation (Enterprise 17+) posts to a URL with no custom code, so the token
+  travels in the URL query (``?token=...``) or the ``X-Webhook-Token`` header.
+  HMAC signing was dropped: it protected payload integrity, which is moot when
+  the payload is a pointer the bot re-fetches authoritatively.
+* **Optional IP allowlist** (off by default) acts as a cheap pre-filter, using
+  the real client IP behind Cloudflare. It's refreshed from the Odoo host on
+  each outbound call — see ``config.record_odoo_ips``.
 """
 
 from __future__ import annotations
 
-import hashlib
 import hmac
 import json
-import os
-import time
 
 from aiohttp import web
 
-# Reject requests whose timestamp is older/newer than this (seconds).
-REPLAY_WINDOW = 300
+import config
+from botlog import log
+
+# One route per model; the route determines the model, so the body only needs _id.
+SUPPORTED_MODELS = ("res.partner", "hr.attendance", "account.analytic.line")
 
 
-def _valid_signature(secret: str, timestamp: str, raw_body: bytes, provided: str) -> bool:
-    """Constant-time check of ``HMAC(secret, "<timestamp>.<body>")``."""
-    if not provided:
-        return False
-    signed = f"{timestamp}.".encode() + raw_body
-    expected = hmac.new(secret.encode(), signed, hashlib.sha256).hexdigest()
-    # Accept an optional "sha256=" prefix for convenience.
-    provided = provided.split("=", 1)[1] if provided.startswith("sha256=") else provided
-    return hmac.compare_digest(expected, provided)
-
-
-def _validate_payload(payload: dict) -> dict:
-    if not isinstance(payload, dict):
-        raise ValueError("Payload must be a JSON object")
-    channel_id = payload.get("channel_id")
-    message_id = payload.get("message_id")
-    if channel_id is None or message_id is None:
-        raise ValueError("Missing required fields: channel_id, message_id")
-    int(channel_id)  # type checks
-    int(message_id)
-    action = payload.get("action", "sync_database")
-    allowed = {"update_content", "approve_punch", "update_clock_view", "sync_database"}
-    if action not in allowed:
-        raise ValueError(f"Unknown action: {action}")
-    if payload.get("punch_id") is not None:
-        int(payload["punch_id"])
-    if payload.get("data") is not None and not isinstance(payload["data"], dict):
-        raise ValueError("'data' must be an object")
-    return payload
+def _real_client_ip(request: web.Request) -> str | None:
+    """Real origin IP, accounting for Cloudflare / reverse proxies."""
+    cf = request.headers.get("CF-Connecting-IP")
+    if cf:
+        return cf.strip()
+    xff = request.headers.get("X-Forwarded-For")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.remote
 
 
 def make_app(bot) -> web.Application:
-    secret = os.getenv("ODOO_WEBHOOK_SECRET")
+    def make_handler(model: str):
+        async def handle(request: web.Request):
+            ip = _real_client_ip(request)
 
-    async def handle_webhook(request: web.Request):
-        client_ip = request.remote
-        raw = await request.read()
+            # 1. Optional IP allowlist pre-filter (cheap load-shedding).
+            if config.ip_allowlist_enabled():
+                allow = config.get_ip_allowlist()
+                if allow and ip not in allow:
+                    log.warning("[Webhook] Rejected %s: IP not in allowlist.", ip)
+                    return web.Response(status=403, text="Forbidden")
 
-        # --- authentication ---
-        if not secret:
-            print("[Webhook] Rejected: ODOO_WEBHOOK_SECRET is not set on the bot.")
-            return web.Response(status=503, text="Webhook not configured")
-        timestamp = request.headers.get("X-Odoo-Timestamp", "")
-        signature = request.headers.get("X-Odoo-Signature", "")
-        if not timestamp.isdigit() or abs(time.time() - int(timestamp)) > REPLAY_WINDOW:
-            print(f"[Webhook] Rejected: bad/stale timestamp from {client_ip}")
-            return web.Response(status=401, text="Invalid or expired timestamp")
-        if not _valid_signature(secret, timestamp, raw, signature):
-            print(f"[Webhook] Rejected: bad signature from {client_ip}")
-            return web.Response(status=401, text="Invalid signature")
+            # 2. Shared-token auth (constant-time).
+            token = config.get_webhook_token()
+            if not token:
+                log.warning("[Webhook] Rejected: WEBHOOK_TOKEN not configured.")
+                return web.Response(status=503, text="Webhook not configured")
+            provided = request.query.get("token") or request.headers.get("X-Webhook-Token", "")
+            if not provided or not hmac.compare_digest(provided, token):
+                log.warning("[Webhook] Rejected %s: bad/missing token.", ip)
+                return web.Response(status=401, text="Invalid token")
 
-        # --- content type + parse ---
-        if "application/json" not in request.headers.get("Content-Type", ""):
-            return web.Response(status=400, text="Content-Type must be application/json")
-        try:
-            payload = _validate_payload(json.loads(raw.decode() or "{}"))
-        except json.JSONDecodeError:
-            return web.Response(status=400, text="Invalid JSON")
-        except ValueError as e:
-            return web.Response(status=400, text=f"Validation error: {e}")
+            # 3. Parse the pointer. The ONLY thing we trust from the body is an int id.
+            if "application/json" not in request.headers.get("Content-Type", ""):
+                return web.Response(status=400, text="Content-Type must be application/json")
+            raw = (await request.read()).decode() or "{}"
+            try:
+                body = json.loads(raw)
+                record_id = int(body.get("_id", body.get("id")))
+            except (json.JSONDecodeError, TypeError, ValueError):
+                log.warning("[Webhook] Rejected %s: missing/invalid integer _id.", ip)
+                return web.Response(status=400, text="Missing or invalid integer _id")
+            action = body.get("_action")
+            write_uid = body.get("write_uid")
+            write_uid = int(write_uid) if isinstance(write_uid, int) else None
 
-        cog = bot.get_cog("TimeTracking")
-        if cog is None:
-            return web.Response(status=503, text="TimeTracking cog not loaded")
-        try:
-            await cog.handle_odoo_webhook(payload)
-        except Exception as e:  # noqa: BLE001
-            print(f"[Webhook] Handler error from {client_ip}: {e}")
-            return web.Response(status=500, text="Internal server error")
-        return web.Response(status=200, text="ok")
+            # 4. Enqueue the pull for this route's (trusted) model. Return fast.
+            cog = bot.get_cog("TimeTracking")
+            if cog is None:
+                return web.Response(status=503, text="TimeTracking cog not loaded")
+            try:
+                await cog.enqueue_inbound(model, record_id, action, write_uid)
+            except Exception as e:  # noqa: BLE001
+                log.exception("[Webhook] Handler error from %s: %s", ip, e)
+                return web.Response(status=500, text="Internal server error")
+            return web.Response(status=200, text="ok")
+
+        return handle
 
     app = web.Application()
-    app.router.add_post("/webhook/odoo-timetracking", handle_webhook)
-    app.router.add_post("/webhook/timetracking", handle_webhook)
+    for model in SUPPORTED_MODELS:
+        app.router.add_post(f"/webhook/odoo/{model}", make_handler(model))
     return app
 
 
 async def run_webserver(bot):
     """Start the aiohttp webhook server."""
+    import os
+
     app = make_app(bot)
     runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.getenv("WEBHOOK_PORT", "8080"))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    print(f"Webhook server started on port {port}")
+    log.info("[Webhook] Server started on port %s. Routes: %s",
+             port, ", ".join(f"/webhook/odoo/{m}" for m in SUPPORTED_MODELS))

@@ -1,4 +1,4 @@
--- Reference schema for the timetracking database (schema version 3).
+-- Reference schema for the timetracking database (schema version 4).
 -- The bot creates/migrates this automatically at startup via cogs/timetracking/db.py;
 -- this file is documentation only.
 
@@ -95,6 +95,21 @@ CREATE TABLE odoo_outbox (
     op          TEXT    NOT NULL,      -- 'in' | 'out' | 'create'
     payload     TEXT    NOT NULL DEFAULT '{}',
     status      TEXT    NOT NULL DEFAULT 'pending',  -- pending|done|skipped|failed
+    attempts    INTEGER NOT NULL DEFAULT 0,
+    last_error  TEXT    NULL,
+    created_at  DATETIME NOT NULL
+);
+
+-- Inbound Odoo change queue (pull-based reconcile). The webhook enqueues a
+-- pointer {model, odoo_id}; the InboxWorker pulls the record and reconciles it
+-- idempotently into SQLite. De-duped by (model, odoo_id) while pending.
+CREATE TABLE odoo_inbox (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    model       TEXT    NOT NULL,      -- 'res.partner' | 'hr.attendance' | 'account.analytic.line'
+    odoo_id     INTEGER NOT NULL,      -- Odoo record id to pull
+    action      TEXT    NULL,          -- 'create' | 'write' | 'unlink' (informational)
+    write_uid   INTEGER NULL,          -- Odoo user who made the change (echo filter)
+    status      TEXT    NOT NULL DEFAULT 'pending',  -- pending|done|failed
     attempts    INTEGER NOT NULL DEFAULT 0,
     last_error  TEXT    NULL,
     created_at  DATETIME NOT NULL

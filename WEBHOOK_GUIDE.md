@@ -2,137 +2,132 @@
 
 ## Overview
 
-The bot exposes an HTTP endpoint that lets **Odoo push updates into the bot**.
-When something changes in Odoo (e.g. a punch is approved), Odoo POSTs a signed
-JSON payload to the bot, which applies the change to its authoritative SQLite
-store and then re-renders the affected Discord message.
+The bot exposes HTTP endpoints that let **Odoo notify the bot that a record
+changed**. Odoo POSTs a tiny pointer (just the record `_id`); the bot then
+**pulls that record from Odoo** over the authenticated API and reconciles it
+into its authoritative SQLite store, refreshing any affected Discord message.
 
-SQLite remains the source of truth — the webhook is how Odoo-originated changes
-flow *back* into the bot. Outbound sync (bot → Odoo) is handled separately by
-the sync worker and needs no webhook.
+SQLite stays the source of truth. Outbound sync (bot → Odoo) is handled
+separately by the sync worker and needs no webhook.
 
-## Security model (read this first)
+## Why this is safe without HMAC signing
 
-Requests are authenticated with an **HMAC-SHA256 signature**, not by "checking
-that the bot can reach Odoo" (which proved nothing about the request's origin).
+The payload never carries data the bot trusts — it's a pointer the bot
+re-fetches authoritatively. So:
 
-Every request must include two headers:
+- **The model comes from the URL, not the body.** There's one endpoint per
+  model. The only thing read from the payload is an integer `_id`. A
+  malicious/garbage `_model` value can't do anything because it's never used.
+- **A forged request can't inject data** — worst case it makes the bot do a
+  redundant Odoo read that reconciles to truth (a no-op). Replay is harmless for
+  the same reason.
+- The residual risk is just *abuse/DoS*, which a shared **token** handles. HMAC
+  signing (and the Odoo-side code to produce it) is unnecessary here.
 
-| Header | Value |
-| --- | --- |
-| `X-Odoo-Timestamp` | Unix seconds when the request was signed |
-| `X-Odoo-Signature` | `HMAC_SHA256(secret, "<timestamp>.<raw_body>")` as hex (optionally `sha256=` prefixed) |
+## Authentication
 
-The bot:
-1. Rejects requests whose timestamp is missing or more than **5 minutes** off (replay protection).
-2. Recomputes the HMAC over `"<timestamp>.<raw_body>"` using `ODOO_WEBHOOK_SECRET` and compares in constant time.
-3. Only then parses and applies the payload.
+### Token (required)
 
-If `ODOO_WEBHOOK_SECRET` is unset, the endpoint returns `503` and accepts nothing.
+The bot checks a shared secret token, in constant time. Provide it either way:
 
-> SQL is fully parameterized in the bot, so there is **no character whitelist** —
-> legitimate names with apostrophes, ampersands, etc. are accepted normally.
+- URL query: `...?token=<WEBHOOK_TOKEN>`  ← works with Odoo's no-code webhook
+- Header: `X-Webhook-Token: <WEBHOOK_TOKEN>`
 
-## Setup
+`WEBHOOK_TOKEN` is **auto-generated on first startup** and written to `.env` if
+blank — you don't create it by hand. Rotate it anytime with the
+`/regenwebhooktoken` slash command (the new value is **not** shown in Discord;
+read it from the server's `.env`, then update your Odoo URLs).
 
-### 1. Environment variables (`.env`)
+### IP allowlist (optional, off by default)
+
+A coarse pre-filter. When enabled (`/webhookallowlist enable`), the bot only
+accepts webhooks from IPs in `WEBHOOK_IP_ALLOWLIST`, which is auto-refreshed
+with the Odoo host's resolved IP(s) every time the bot calls Odoo. It uses the
+real client IP behind Cloudflare (`CF-Connecting-IP`).
+
+> ⚠️ Caveat: with Cloudflare-fronted Odoo hosting, the IP you *connect to* (the
+> frontend) may differ from the IP Odoo *sends from* (its egress). If enabling
+> the allowlist blocks legit webhooks, that mismatch is why — just disable it
+> (the token is the real auth) or add the egress IP to `WEBHOOK_IP_ALLOWLIST`.
+
+## Endpoints (one per model)
 
 ```
-WEBHOOK_PORT=8080
-ODOO_WEBHOOK_SECRET=<a long random shared secret>
-# Odoo API creds are only needed for OUTBOUND sync, not to accept webhooks:
-ODOO_URL=https://your-odoo-instance.com
-ODOO_DB=your_database_name
-ODOO_USERNAME=your_username
-ODOO_API_KEY=your_api_key
+POST /webhook/odoo/res.partner?token=<TOKEN>
+POST /webhook/odoo/hr.attendance?token=<TOKEN>
+POST /webhook/odoo/account.analytic.line?token=<TOKEN>
 ```
 
-Generate a secret, e.g. `python -c "import secrets; print(secrets.token_hex(32))"`.
-Use the **same** value in Odoo's signing code.
-
-### 2. Exposing the endpoint
-
-- Local testing: `ngrok http 8080`
-- Production: reverse proxy over **HTTPS**. Your URL looks like
-  `https://your-domain.com/webhook/timetracking`.
-
-## Endpoint
-
-`POST /webhook/timetracking` (alias: `/webhook/odoo-timetracking`)
-
-Headers: `Content-Type: application/json`, `X-Odoo-Timestamp`, `X-Odoo-Signature`.
-
-Payload:
+Headers: `Content-Type: application/json`.
+Body (Odoo's native webhook sends exactly this):
 
 ```json
-{
-  "channel_id": 1234567890,
-  "message_id": 9876543210,
-  "punch_id": 5,
-  "action": "approve_punch",
-  "content": "optional message text",
-  "data": {}
-}
+{ "_id": 123 }
 ```
 
-### Supported actions
+`_action` and `write_uid` are accepted if present but optional. The bot returns
+`200` as soon as the pointer is queued; the pull + reconcile happen
+asynchronously (usually within seconds).
 
-| Action | Effect |
-| --- | --- |
-| `update_content` | Edit the target message's text (`content` required) |
-| `approve_punch` | Write approvals from `data.punch_approval_status` to SQLite, then refresh the approval buttons (removes them when fully approved) |
-| `sync_database` | Re-read the punch's approval state from SQLite and refresh the approval message |
-| `update_clock_view` | Re-render an employee's clock message from DB state (`data.employee_id` required) |
+## Exposing the endpoint (Cloudflare Zero Trust tunnel — recommended)
 
-`approve_punch` example `data`:
+You do **not** need to port-forward. Run the bot with a **Cloudflare Zero Trust
+tunnel** (`cloudflared`), which dials out to Cloudflare and publishes a public
+`https://` hostname that forwards to the bot's local `WEBHOOK_PORT`:
 
-```json
-{ "punch_approval_status": { "punchInApproval": true, "punchOutApproval": true } }
-```
+- No inbound ports opened on your network/firewall.
+- **HTTPS is automatic** (Cloudflare terminates TLS), so the `?token=` in the
+  URL is encrypted in transit.
+- Cloudflare sets `CF-Connecting-IP` to the real origin, which is what the IP
+  allowlist checks.
 
-## Signing example (Python)
+Quick setup: in the Cloudflare Zero Trust dashboard, create a **Tunnel**, add a
+**Public Hostname** (e.g. `hooks.yourdomain.com`) with service
+`http://localhost:8080` (your `WEBHOOK_PORT`), and run the provided `cloudflared`
+connector on the bot's host. Your Odoo URLs then look like
+`https://hooks.yourdomain.com/webhook/odoo/hr.attendance?token=<TOKEN>`.
 
-```python
-import hashlib, hmac, json, time, requests
+> The webhook auth still applies end-to-end: the token is required regardless of
+> the tunnel. Optionally, Cloudflare Access policies can add another layer in
+> front of the endpoint.
 
-SECRET = "your_shared_secret"
-url = "https://your-domain.com/webhook/timetracking"
-body = json.dumps({
-    "channel_id": 1234567890,
-    "message_id": 9876543210,
-    "punch_id": 5,
-    "action": "approve_punch",
-    "data": {"punch_approval_status": {"punchInApproval": True, "punchOutApproval": True}},
-}).encode()
+## Setting it up in Odoo (Enterprise 17+, incl. 19.0+e — no code)
 
-ts = str(int(time.time()))
-sig = hmac.new(SECRET.encode(), f"{ts}.".encode() + body, hashlib.sha256).hexdigest()
+Odoo's native webhook automation posts the pointer for you; there is nothing to
+write or maintain on the Odoo side.
 
-r = requests.post(url, data=body, headers={
-    "Content-Type": "application/json",
-    "X-Odoo-Timestamp": ts,
-    "X-Odoo-Signature": sig,
-})
-print(r.status_code, r.text)
-```
+For **each** model (`hr.attendance`, `account.analytic.line`, `res.partner`):
 
-In Odoo, put the equivalent signing logic in the server action that POSTs to the
-webhook (Automation → Automated Actions).
+1. Enable developer mode: **Settings → Developer Tools → Activate the developer mode**.
+2. **Settings → Technical → Automation Rules → New**.
+3. **Model**: e.g. *Attendance*. **Trigger**: *On Save* (or On Creation / On Update).
+4. **Actions To Do** → add **“Send Webhook Notification”**.
+5. **URL**: the matching endpoint above, including `?token=<your WEBHOOK_TOKEN>`.
+6. Save.
+
+That's it — Odoo sends `{"_id": <record id>}` (with `_model`) to that URL on the
+trigger; the bot authenticates the token, pulls the record, and reconciles.
 
 ## Response codes
 
 | Code | Meaning |
 | --- | --- |
-| `200` | Applied successfully |
-| `400` | Invalid JSON, missing `channel_id`/`message_id`, bad types, or unknown action |
-| `401` | Missing/expired timestamp or bad signature |
-| `503` | `ODOO_WEBHOOK_SECRET` not configured, or TimeTracking cog not loaded |
-| `500` | Unexpected handler error (check logs) |
+| `200` | Pointer accepted and queued |
+| `400` | Missing/invalid integer `_id`, or wrong Content-Type |
+| `401` | Missing or wrong token |
+| `403` | IP allowlist enabled and the source IP isn't allowed |
+| `503` | Token not configured, or TimeTracking cog not loaded |
+
+## Testing (curl)
+
+```bash
+curl -X POST "https://your-domain.com/webhook/odoo/hr.attendance?token=YOUR_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"_id": 123}'
+```
 
 ## Logging
 
-Console lines are prefixed `[Webhook]`. Watch for:
-- `Webhook server started on port 8080`
-- `Rejected: bad signature from <ip>` / `Rejected: bad/stale timestamp from <ip>`
-- `Handler error from <ip>: ...`
-```
+Console lines are prefixed `[Webhook]`. Rejections log the source IP and reason
+(bad token, IP not allowed). Successful timecard reconciliation is logged to the
+timecard log channel; webhook/transport issues go to the general log channel.

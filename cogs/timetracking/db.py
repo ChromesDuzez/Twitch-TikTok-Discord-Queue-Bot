@@ -17,8 +17,15 @@ from datetime import datetime
 
 import aiosqlite
 
-# Bump this whenever a new migration is added below.
-TARGET_VERSION = 3
+from botlog import log
+
+# Human-facing release version (bumped on major rewrites or schema epochs).
+RELEASE_VERSION = "2.0"
+
+# Internal schema/migration counter. This is what actually drives upgrades and
+# what the live db filename is stamped with (timetracker.v{N}.db). Bump it
+# whenever a new migration is added below.
+TARGET_VERSION = 4
 
 # Canonical worktime categories the employee can start. NOTE: "Shop" is NOT one
 # of these -- shop time is a calculated remainder in reports, never a punch.
@@ -46,7 +53,7 @@ class Database:
         await self._conn.commit()
 
         if fresh:
-            print("[DB] Timecard database not found, creating a new one...")
+            log.info("[DB] Timecard database not found, creating a new one...")
             await self._create_fresh(company_name, debug)
         await self._run_migrations()
         return self
@@ -166,6 +173,17 @@ class Database:
                 last_error  TEXT    NULL,
                 created_at  DATETIME NOT NULL
             );
+            CREATE TABLE odoo_inbox (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                model       TEXT    NOT NULL,
+                odoo_id     INTEGER NOT NULL,
+                action      TEXT    NULL,
+                write_uid   INTEGER NULL,
+                status      TEXT    NOT NULL DEFAULT 'pending',
+                attempts    INTEGER NOT NULL DEFAULT 0,
+                last_error  TEXT    NULL,
+                created_at  DATETIME NOT NULL
+            );
             """
         )
         await c.executemany(
@@ -212,9 +230,13 @@ class Database:
             await self._migrate_to_v3()
             current = 3
 
+        if current < 4:
+            await self._migrate_to_v4()
+            current = 4
+
         await c.execute("UPDATE schema_version SET version = ?", (current,))
         await c.commit()
-        print(f"[DB] Schema at version {current}.")
+        log.info(f"[DB] Schema at version {current}.")
 
     async def _is_fresh_target(self) -> bool:
         """True when punch_clock already uses an INTEGER rowid PK (fresh create)."""
@@ -231,7 +253,7 @@ class Database:
 
     async def _migrate_to_v2(self):
         """Legacy -> v2: add odooId columns, add outbox, make id columns atomic."""
-        print("[DB] Migrating schema to v2...")
+        log.info("[DB] Migrating schema to v2...")
         c = self._conn
 
         # 1. Ensure odooId columns exist (older schema.sql builds lacked them).
@@ -297,11 +319,11 @@ class Database:
             """,
             "id, punchID, customerID, punchType, timeSpent, timeStarted, odooId",
         )
-        print("[DB] Migration to v2 complete.")
+        log.info("[DB] Migration to v2 complete.")
 
     async def _migrate_to_v3(self):
         """v2 -> v3: link worktime to an Odoo task/project for timesheet sync."""
-        print("[DB] Migrating schema to v3...")
+        log.info("[DB] Migrating schema to v3...")
         c = self._conn
         for column in ("odooTaskId", "odooProjectId"):
             if not await self._column_exists("work_time", column):
@@ -309,7 +331,28 @@ class Database:
                     f"ALTER TABLE work_time ADD COLUMN {column} UNSIGNED BIG INT NULL DEFAULT NULL"
                 )
         await c.commit()
-        print("[DB] Migration to v3 complete.")
+        log.info("[DB] Migration to v3 complete.")
+
+    async def _migrate_to_v4(self):
+        """v3 -> v4: inbound Odoo change queue for pull-based reconciliation."""
+        log.info("[DB] Migrating schema to v4...")
+        await self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS odoo_inbox (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                model       TEXT    NOT NULL,
+                odoo_id     INTEGER NOT NULL,
+                action      TEXT    NULL,
+                write_uid   INTEGER NULL,
+                status      TEXT    NOT NULL DEFAULT 'pending',
+                attempts    INTEGER NOT NULL DEFAULT 0,
+                last_error  TEXT    NULL,
+                created_at  DATETIME NOT NULL
+            )
+            """
+        )
+        await self._conn.commit()
+        log.info("[DB] Migration to v4 complete.")
 
     async def _rebuild_id_as_rowid(self, table: str, create_new_sql: str, columns: str):
         """Rebuild `table` from a `<table>_new` definition, copying all columns.
@@ -351,5 +394,35 @@ def backup_database(path: str) -> str | None:
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     dest = f"{path}.backup_{stamp}"
     shutil.copy2(path, dest)
-    print(f"[DB] Backed up database to {dest}")
+    log.info(f"[DB] Backed up database to {dest}")
     return dest
+
+
+def db_filename(version: int = TARGET_VERSION) -> str:
+    """The live db filename for a given schema version."""
+    return f"timetracker.v{version}.db"
+
+
+def resolve_db_path(base_dir: str) -> tuple[str, str | None]:
+    """Work out which db file to use and whether one needs upgrading.
+
+    The live file is stamped with the current schema version so its version is
+    obvious on disk and the upgrade path is unambiguous. Returns
+    ``(target_path, source_to_upgrade_or_None)``:
+
+    * target already at current version  -> (target, None)
+    * an older ``timetracker.v{k}.db`` or the legacy ``timetracker.db`` exists
+      -> (target, that_older_path)   [caller backs it up + renames to target]
+    * nothing yet                        -> (target, None)   [fresh create]
+    """
+    target = os.path.join(base_dir, db_filename(TARGET_VERSION))
+    if os.path.exists(target):
+        return target, None
+    for k in range(TARGET_VERSION - 1, 0, -1):
+        cand = os.path.join(base_dir, db_filename(k))
+        if os.path.exists(cand):
+            return target, cand
+    legacy = os.path.join(base_dir, "timetracker.db")  # pre-versioning (v1) name
+    if os.path.exists(legacy):
+        return target, legacy
+    return target, None

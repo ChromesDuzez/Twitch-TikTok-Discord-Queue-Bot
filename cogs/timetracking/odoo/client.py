@@ -22,6 +22,9 @@ from datetime import date, timedelta
 
 import requests
 
+import config
+from botlog import log
+
 DEFAULT_TIMEOUT = 15
 
 
@@ -36,6 +39,8 @@ class OdooClient:
     # ---- core --------------------------------------------------------------
 
     def _call_sync(self, endpoint: str, data: dict):
+        # Keep the webhook IP allowlist current with the host we actually reach.
+        config.record_odoo_ips(self.url)
         data = dict(data)
         data["context"] = {"lang": "en_US"}
         response = requests.post(
@@ -50,11 +55,11 @@ class OdooClient:
         if response.status_code == 500:
             try:
                 error_data = response.json()
-                print("[Odoo] API Error Details:")
+                log.error("[Odoo] API Error Details:")
                 for key, value in error_data.items():
-                    print(f"  {key}: {value}")
+                    log.error(f"  {key}: {value}")
             except json.JSONDecodeError:
-                print(f"[Odoo] Response not JSON. Raw: {response.text}")
+                log.error(f"[Odoo] Response not JSON. Raw: {response.text}")
             raise RuntimeError(f"Odoo API request to {endpoint} failed (500).")
         response.raise_for_status()
         return response.json()
@@ -76,8 +81,19 @@ class OdooClient:
             )
             return True
         except Exception as e:  # noqa: BLE001 - best-effort probe
-            print(f"[Odoo] Verification failed: {e}")
+            log.warning(f"[Odoo] Verification failed: {e}")
             return False
+
+    async def read_record(self, model: str, odoo_id: int, fields: list):
+        """Fetch a single record's fields by id (used by inbound reconcile).
+
+        Returns the record dict, or None if it no longer exists (e.g. deleted).
+        """
+        data = await self.call(
+            f"/{model}/search_read",
+            {"domain": [["id", "=", odoo_id]], "fields": fields, "limit": 1},
+        )
+        return data[0] if data else None
 
     # ---- partners / customers ---------------------------------------------
 
@@ -95,7 +111,7 @@ class OdooClient:
         if block_duplicate:
             existing = await self.search_partners_by_name(name)
             if existing:
-                print(f"[Odoo] Partner '{name}' already exists; skipping create.")
+                log.info(f"[Odoo] Partner '{name}' already exists; skipping create.")
                 return existing[0]
         return await self.call("/res.partner/name_create", {"name": name})
 
@@ -129,11 +145,18 @@ class OdooClient:
             return result[0]
         return result
 
-    async def attendance_write(self, attendance_id: int, check_out_utc: str):
-        """Set the check-out time on an existing attendance record."""
+    async def attendance_write(self, attendance_id: int, check_out_utc: str | None = None,
+                               check_in_utc: str | None = None):
+        """Update an existing attendance's check-in and/or check-out time."""
+        vals = {}
+        if check_in_utc is not None:
+            vals["check_in"] = check_in_utc
+        if check_out_utc is not None:
+            vals["check_out"] = check_out_utc
+        if not vals:
+            return None
         return await self.call(
-            "/hr.attendance/write",
-            {"ids": [attendance_id], "vals": {"check_out": check_out_utc}},
+            "/hr.attendance/write", {"ids": [attendance_id], "vals": vals}
         )
 
     # ---- work-item search (task / project) --------------------------------

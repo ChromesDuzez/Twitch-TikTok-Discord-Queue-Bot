@@ -19,6 +19,7 @@ from datetime import datetime
 
 import pytz
 
+from botlog import timecard_log as log  # sync activity -> TIMECARD_LOG_ID
 from ..db import Database
 from .client import OdooClient
 
@@ -40,6 +41,13 @@ def local_str_to_utc_str(local_str: str) -> str:
     naive = datetime.strptime(local_str, "%Y-%m-%d %H:%M:%S")
     localized = _timezone().localize(naive)
     return localized.astimezone(pytz.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def utc_str_to_local_str(utc_str: str) -> str:
+    """Convert an Odoo UTC datetime string to our naive local string format."""
+    naive = datetime.strptime(str(utc_str)[:19], "%Y-%m-%d %H:%M:%S")
+    utc = pytz.utc.localize(naive)
+    return utc.astimezone(_timezone()).strftime("%Y-%m-%d %H:%M:%S")
 
 
 async def enqueue(db: Database, entity_type: str, entity_id: int, op: str, payload: dict | None = None):
@@ -76,7 +84,7 @@ class SyncWorker:
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # noqa: BLE001 - keep the loop alive
-                print(f"[Sync] Drain loop error: {e}")
+                log.error(f"[Sync] Drain loop error: {e}")
             await asyncio.sleep(DRAIN_INTERVAL)
 
     async def drain(self):
@@ -102,7 +110,7 @@ class SyncWorker:
                 "UPDATE odoo_outbox SET attempts = ?, last_error = ?, status = ? WHERE id = ?",
                 (attempts, str(e)[:500], status, row["id"]),
             )
-            print(f"[Sync] Outbox #{row['id']} ({row['entity_type']}/{row['op']}) error: {e}")
+            log.warning(f"[Sync] Outbox #{row['id']} ({row['entity_type']}/{row['op']}) error: {e}")
 
     async def _dispatch(self, entity_type: str, entity_id: int, op: str):
         """Return True (done), False (skip), or 'retry' (dependency pending)."""
@@ -112,9 +120,11 @@ class SyncWorker:
             return await self._sync_punch_in(entity_id)
         if entity_type == "punch" and op == "out":
             return await self._sync_punch_out(entity_id)
+        if entity_type == "punch" and op == "edit":
+            return await self._sync_punch_edit(entity_id)
         if entity_type == "worktime" and op == "create":
             return await self._sync_worktime(entity_id)
-        print(f"[Sync] Unknown outbox job: {entity_type}/{op}")
+        log.warning(f"[Sync] Unknown outbox job: {entity_type}/{op}")
         return False
 
     # ---- handlers ----------------------------------------------------------
@@ -164,6 +174,33 @@ class SyncWorker:
         )
         return True
 
+    async def _sync_punch_edit(self, punch_id: int):
+        """Push an admin time correction to Odoo. Creates the attendance if it
+        wasn't synced yet, otherwise rewrites check-in/check-out."""
+        punch = await self.db.fetchone(
+            "SELECT employeeID, punchInTime, punchOutTime, odooId FROM punch_clock WHERE id = ?",
+            (punch_id,),
+        )
+        if punch is None or not punch["punchInTime"]:
+            return True
+        emp_odoo = await self._employee_odoo_id(punch["employeeID"])
+        if not emp_odoo:
+            return "retry"
+        check_in = local_str_to_utc_str(punch["punchInTime"])
+        check_out = local_str_to_utc_str(punch["punchOutTime"]) if punch["punchOutTime"] else None
+        if punch["odooId"] is None:
+            att_id = await self.client.attendance_create(emp_odoo, check_in)
+            if not att_id:
+                return "retry"
+            await self.db.execute("UPDATE punch_clock SET odooId = ? WHERE id = ?", (att_id, punch_id))
+            if check_out:
+                await self.client.attendance_write(att_id, check_out_utc=check_out)
+        else:
+            await self.client.attendance_write(
+                punch["odooId"], check_out_utc=check_out, check_in_utc=check_in
+            )
+        return True
+
     async def _sync_worktime(self, worktime_id: int):
         wt = await self.db.fetchone(
             "SELECT punchID, punchType, timeSpent, timeStarted, odooId, odooTaskId, odooProjectId "
@@ -200,13 +237,3 @@ class SyncWorker:
         if line_id:
             await self.db.execute("UPDATE work_time SET odooId = ? WHERE id = ?", (line_id, worktime_id))
         return True
-
-
-# ---- inbound (Odoo -> SQLite) ---------------------------------------------
-
-async def apply_punch_approval(db: Database, punch_id: int, in_approval: bool, out_approval: bool):
-    """Apply an approval decision that originated in Odoo to the local DB."""
-    await db.execute(
-        "UPDATE punch_clock SET punchInApproval = ?, punchOutApproval = ? WHERE id = ?",
-        (1 if in_approval else 0, 1 if out_approval else 0, punch_id),
-    )

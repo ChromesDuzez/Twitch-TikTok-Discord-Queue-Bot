@@ -14,8 +14,9 @@ from datetime import datetime
 
 import discord
 
+from botlog import timecard_log
 from .db import Database
-from .modals import CustomerInputModal, CustomerSelectMenu, GetTimeSpent
+from .modals import CustomerInputModal, CustomerSelectMenu, EditPunchTimeModal, GetTimeSpent
 from .perms import CLOCK_ROLES, has_perms
 from .odoo import sync
 from .state import ClockState, _as_bool, load_state
@@ -171,6 +172,10 @@ class ClockInButton(discord.ui.Button):
 
         await sync.enqueue(db, "punch", punch_id, "in")
         await render_clock(view.cog, view.message, view.employee_id)
+        timecard_log.info(
+            f"[Clock] {interaction.user} clocked IN employee {view.employee_id} "
+            f"(punch {punch_id}, auto-approved={approved})."
+        )
         await interaction.followup.send("You clocked in.", ephemeral=True)
 
 
@@ -230,6 +235,10 @@ class ClockOutButton(discord.ui.Button):
 
         await sync.enqueue(db, "punch", punch_id, "out")
         await render_clock(view.cog, view.message, view.employee_id)
+        timecard_log.info(
+            f"[Clock] {interaction.user} clocked OUT employee {view.employee_id} "
+            f"(punch {punch_id}, auto-approved={approved})."
+        )
         await interaction.followup.send("You clocked out.", ephemeral=True)
 
 
@@ -379,6 +388,10 @@ class StartWorkButton(discord.ui.Button):
         # NOTE: the Odoo timesheet is enqueued at work-END (with final hours),
         # not here, so it is created once with the correct duration.
         await render_clock(view.cog, view.message, view.employee_id)
+        timecard_log.info(
+            f"[Work] {interaction.user} started {self.punch_type} work for '{customer_name}' "
+            f"(punch {state.current_punch}, task={task_id}, project={project_id})."
+        )
         if self.punch_type == "Office":
             await reply("Office work started.")
         else:
@@ -435,6 +448,9 @@ class EndWorkButton(discord.ui.Button):
         # Enqueue the Odoo timesheet now that the final hours are known.
         await sync.enqueue(view.db, "worktime", worktime_id, "create")
         await render_clock(view.cog, view.message, view.employee_id)
+        timecard_log.info(
+            f"[Work] {interaction.user} ended {self.punch_type} worktime {worktime_id} ({hours}h)."
+        )
         text = f"You completed your work at the jobsite in {hours} hour(s)."
         if already_deferred:
             await interaction.followup.send(text, ephemeral=True)
@@ -463,15 +479,21 @@ class IgnoreLunchButton(discord.ui.Button):
         )
         await interaction.response.defer()
         await render_clock(view.cog, view.message, view.employee_id)
+        timecard_log.info(
+            f"[Clock] {interaction.user} set ignore-lunch={new_value} for punch {state.current_punch}."
+        )
 
 
 # ---- approval view ---------------------------------------------------------
 
 class ApprovePunch(discord.ui.View):
-    """Admin approval for non-standard punches.
+    """Admin approval and correction for non-standard punches.
 
-    Note: the old ``EditPunch`` button was removed. It referenced attributes
-    that never existed on this view (``view.user``, ``view.fetch_message``), so
+    Each unapproved direction gets an **Approve** button and an **Edit** button.
+    Edit opens a modal pre-filled with the current time so an admin can correct
+    a clock-in/out time (works with or without Odoo). The old EditPunch button
+    referenced attributes that never existed on this view (``view.user``,
+    ``view.fetch_message``), so
     it raised on every click and had no working behavior to preserve.
     """
 
@@ -484,8 +506,10 @@ class ApprovePunch(discord.ui.View):
         self.message = message
         if not in_approval:
             self.add_item(ApproveButton("clock-in"))
+            self.add_item(EditPunchButton("clock-in"))
         if not out_approval:
             self.add_item(ApproveButton("clock-out"))
+            self.add_item(EditPunchButton("clock-out"))
 
     @classmethod
     async def create(cls, cog, punch_id: int, message: discord.Message):
@@ -530,6 +554,77 @@ class ApproveButton(discord.ui.Button):
             await interaction.message.edit(
                 content=content, view=await ApprovePunch.create(view.cog, view.punch_id, view.message)
             )
+        timecard_log.info(f"[Approval] {interaction.user} approved {self.which} for punch {view.punch_id}.")
         await interaction.response.send_message(
             f"You approved this {self.which} attempt.", ephemeral=True
         )
+
+
+class EditPunchButton(discord.ui.Button):
+    """Admin-only: correct a punch's clock-in/out time via a pre-filled modal."""
+
+    def __init__(self, which: str):
+        self.which = which  # "clock-in" or "clock-out"
+        super().__init__(label=f"Edit {which}", style=discord.ButtonStyle.secondary)
+
+    async def callback(self, interaction: discord.Interaction):
+        view: ApprovePunch = self.view
+        if not has_perms(interaction.user, accepted_roles=("TIMECARD_ADMIN_ROLE",)):
+            await interaction.response.send_message("This is not for you!", ephemeral=True)
+            return
+        column = "punchInTime" if self.which == "clock-in" else "punchOutTime"
+        row = await view.db.fetchone(
+            f"SELECT {column} AS t FROM punch_clock WHERE id = ?", (view.punch_id,)
+        )
+        current = (row["t"] if row else None) or ""
+        await interaction.response.send_modal(
+            EditPunchTimeModal(which=self.which, current=current, on_submit=self._apply)
+        )
+
+    async def _apply(self, interaction: discord.Interaction, new_value: str):
+        view: ApprovePunch = self.view
+        column = "punchInTime" if self.which == "clock-in" else "punchOutTime"
+        old = await view.db.fetchone(
+            f"SELECT {column} AS t FROM punch_clock WHERE id = ?", (view.punch_id,)
+        )
+        old_value = old["t"] if old else None
+        await view.db.execute(
+            f"UPDATE punch_clock SET {column} = ? WHERE id = ?", (new_value, view.punch_id),
+        )
+        # Propagate the correction to Odoo if this punch is linked (best-effort).
+        await sync.enqueue(view.db, "punch", view.punch_id, "edit")
+        content = (
+            view.message.content
+            + f"\n✏️ {interaction.user} changed {self.which} time from "
+            + f"`{old_value or 'unset'}` to `{new_value}`."
+        )
+        await interaction.message.edit(
+            content=content, view=await ApprovePunch.create(view.cog, view.punch_id, view.message)
+        )
+        # Refresh the employee's clock message in case state changed.
+        emp = await view.db.fetchone(
+            "SELECT employeeID FROM punch_clock WHERE id = ?", (view.punch_id,)
+        )
+        if emp:
+            await _refresh_clock_for_employee(view.cog, emp["employeeID"])
+        timecard_log.info(
+            f"[Punch] {interaction.user} edited {self.which} time of punch {view.punch_id}: "
+            f"{old_value or 'unset'} -> {new_value}."
+        )
+        await interaction.response.send_message(
+            f"Updated {self.which} time to `{new_value}`.", ephemeral=True
+        )
+
+
+async def _refresh_clock_for_employee(cog, employee_id: int):
+    """Re-render an employee's clock message if they have one."""
+    row = await cog.db.fetchone(
+        "SELECT clockChannelId, clockMessageId FROM employee WHERE id = ?", (employee_id,)
+    )
+    if not row or not row["clockChannelId"] or not row["clockMessageId"]:
+        return
+    try:
+        msg = await cog.obtain_message(row["clockChannelId"], row["clockMessageId"])
+        await render_clock(cog, msg, employee_id)
+    except Exception as e:  # noqa: BLE001
+        timecard_log.warning(f"[Punch] Could not refresh clock for employee {employee_id}: {e}")

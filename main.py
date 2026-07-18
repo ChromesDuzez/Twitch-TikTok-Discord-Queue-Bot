@@ -7,6 +7,8 @@ from dotenv import load_dotenv
 import argparse, asyncio, json, re, urllib.parse
 from prompt_toolkit import PromptSession
 from services.webhook import run_webserver
+from botlog import log, setup_logging, attach_discord
+import config
 
 class ChromesBot(discord.Bot):
     def __init__(self, *args, **kwargs):
@@ -18,16 +20,23 @@ class ChromesBot(discord.Bot):
         self.OdooUSERNAME = os.getenv("ODOO_USERNAME", None)
         self.OdooKEY = os.getenv("ODOO_API_KEY", None)
         if not all([self.OdooURL, self.OdooDB, self.OdooUSERNAME, self.OdooKEY]):
-            print("Odoo configuration is incomplete. Please check your .env file if you wish to use the Odoo integration.")
+            log.warning("[Bot] Odoo configuration is incomplete; running without the Odoo integration.")
         else:
             self.OdooLoaded = True
-            print("Odoo configuration loaded successfully.")
+            log.info("[Bot] Odoo configuration loaded successfully.")
 
 #load environment variables from .env file and other configurations
+# On first run, create .env from .env.example so the bot can start.
+config.ensure_env_file()
 load_dotenv()
+# Version + upgrade the .env (add new keys, rename/remove old ones), like the DB.
+config.migrate_env()
+# Auto-generate the webhook token if it isn't set yet (stored back to .env).
+config.ensure_webhook_token()
 
 cogs_list = [
-    'moderation'
+    'moderation',
+    'webhookadmin',
 ]
 # enabling and disabling cogs based on environment variables
 if os.getenv("ENABLE_TIMETRACKING", "false").lower() == "true":
@@ -41,18 +50,19 @@ if os.getenv("ENABLE_FUNCTIONALITY", "false").lower() == "true":
 bot = None
 bot_ready_event = asyncio.Event()
 session = None
+bot_task = None  # module-level so cli_shutdown() can cancel it
 
 async def on_ready():
     await synced()
-    print("Hello! Chromes Py-Bot is ready!")
-    channel = bot.get_channel(int(os.getenv('BOT_LOG_ID')))
-    await channel.send("Hello! Chromes Py-Bot is ready!")
+    # Start Discord-channel logging now that the bot (and its channel cache) is up.
+    attach_discord(bot)
+    log.info("[Bot] Hello! Chromes Py-Bot is ready!")
     bot_ready_event.set()
 
 async def synced():
     if bot.auto_sync_commands:
         await bot.sync_commands()
-    print(f"{bot.user.name} connected.")
+    log.info("[Bot] %s connected.", bot.user.name)
 
 async def shutdown(ctx):
     # Fetch app info to ensure owner_id is populated
@@ -69,7 +79,7 @@ async def setup_bot():
     bot.cli_session = None  # Will be set after bot is ready
 
     for cog in cogs_list:
-        print(f"Loading Cog {cog}")
+        log.info("[Bot] Loading cog %s", cog)
         bot.load_extension(f'cogs.{cog}')
 
     bot.add_listener(on_ready, 'on_ready')
@@ -108,6 +118,8 @@ async def cli_input_loop():
             break
 
 async def main():
+    global bot_task
+    setup_logging()
     await setup_bot()
     bot.loop.create_task(run_webserver(bot))
     bot_task = asyncio.create_task(bot.start(os.getenv("BOT_TOKEN")))
@@ -120,9 +132,9 @@ async def main():
             try:
                 await task
             except asyncio.CancelledError:
-                print("[CLI] Bot task was cancelled")
+                log.info("[CLI] Bot task was cancelled")
             except Exception as e:
-                print(f"[CLI] Bot task exception: {e}")
+                log.exception("[CLI] Bot task exception: %s", e)
 
     for task in pending:
         task.cancel()

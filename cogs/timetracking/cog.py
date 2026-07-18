@@ -13,9 +13,10 @@ import os
 import discord
 from discord.ext import commands
 
-from .db import Database, backup_database
+from botlog import log
+from .db import Database, RELEASE_VERSION, TARGET_VERSION, backup_database, resolve_db_path
 from .modals import Confirm
-from .odoo import sync
+from .odoo import inbox, sync
 from .odoo.client import OdooClient
 from .perms import has_perms
 from .reports import (
@@ -31,13 +32,14 @@ from .views import ApprovePunch, render_clock
 class TimeTracking(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        self.db_path = os.path.join(os.getcwd(), "timetracker.db")
+        self.db_path: str | None = None  # resolved (version-stamped) on first use
         self.db: Database | None = None
         self.client = OdooClient(
             os.getenv("ODOO_URL"), os.getenv("ODOO_DB"),
             os.getenv("ODOO_USERNAME"), os.getenv("ODOO_API_KEY"),
         )
         self.sync: sync.SyncWorker | None = None
+        self.inbox: inbox.InboxWorker | None = None
         self._lock = asyncio.Lock()
         self._odoo_employees: list | None = None  # cached hr.employee list for autocomplete
 
@@ -47,14 +49,31 @@ class TimeTracking(commands.Cog):
         """Open + migrate the DB on first use (backs up existing data first)."""
         async with self._lock:
             if self.db is None:
-                backup_database(self.db_path)
-                self.db = await Database(self.db_path).setup(
+                target, source = resolve_db_path(os.getcwd())
+                if source is not None:
+                    # Upgrading an older/legacy db: back it up, then rename it to
+                    # the current version-stamped name so migrations bring it up.
+                    backup_database(source)
+                    log.info(
+                        f"[DB] Upgrading {os.path.basename(source)} -> "
+                        f"{os.path.basename(target)} (schema v{TARGET_VERSION}, release {RELEASE_VERSION})."
+                    )
+                    os.rename(source, target)
+                self.db_path = target
+                self.db = await Database(target).setup(
                     company_name=os.getenv("COMPANY_NAME"),
                     debug=bool(os.getenv("DEBUGGING")),
                 )
                 self.sync = sync.SyncWorker(self.db, self.client)
                 self.sync.start()
+                self.inbox = inbox.InboxWorker(self)
+                self.inbox.start()
         return self.db
+
+    async def enqueue_inbound(self, model: str, odoo_id: int, action=None, write_uid=None):
+        """Entry point for the webhook: queue an inbound Odoo change to reconcile."""
+        await self._ensure_db()
+        await inbox.enqueue_inbound(self.db, model, odoo_id, action, write_uid)
 
     async def obtain_message(self, channel_id: int, message_id: int) -> discord.Message:
         channel = self.bot.get_channel(channel_id) or await self.bot.fetch_channel(channel_id)
@@ -64,7 +83,7 @@ class TimeTracking(commands.Cog):
     async def on_ready(self):
         await self._ensure_db()
         db = self.db
-        print("Re-initializing Clock Views for each Employee...")
+        log.info("[Clock] Re-initializing clock views for each employee...")
         rows = await db.fetchall(
             "SELECT id, clockChannelId, clockMessageId FROM employee "
             "WHERE clockChannelId IS NOT NULL AND clockMessageId IS NOT NULL"
@@ -74,12 +93,12 @@ class TimeTracking(commands.Cog):
                 msg = await self.obtain_message(r["clockChannelId"], r["clockMessageId"])
                 await render_clock(self, msg, r["id"])
             except discord.NotFound:
-                print(f"[Clock] Message for employee {r['id']} not found; skipping.")
+                log.warning(f"[Clock] Message for employee {r['id']} not found; skipping.")
             except Exception as e:  # noqa: BLE001
-                print(f"[Clock] Failed to restore clock for {r['id']}: {e}")
-        print("Finished re-initializing Clock Views.")
+                log.warning(f"[Clock] Failed to restore clock for {r['id']}: {e}")
+        log.info("[Clock] Finished re-initializing clock views.")
 
-        print("Re-initializing Approval Message Views...")
+        log.info("[Approval] Re-initializing approval message views...")
         rows = await db.fetchall(
             "SELECT id, checkChannelId, checkMessageId FROM punch_clock "
             "WHERE checkChannelId IS NOT NULL AND checkMessageId IS NOT NULL"
@@ -89,10 +108,10 @@ class TimeTracking(commands.Cog):
                 msg = await self.obtain_message(r["checkChannelId"], r["checkMessageId"])
                 await msg.edit(view=await ApprovePunch.create(self, r["id"], msg))
             except discord.NotFound:
-                print(f"[Approval] Message for punch {r['id']} not found; skipping.")
+                log.warning(f"[Approval] Message for punch {r['id']} not found; skipping.")
             except Exception as e:  # noqa: BLE001
-                print(f"[Approval] Failed to restore approval for punch {r['id']}: {e}")
-        print("Finished re-initializing Approval Message Views.")
+                log.warning(f"[Approval] Failed to restore approval for punch {r['id']}: {e}")
+        log.info("[Approval] Finished re-initializing approval message views.")
 
     # ---- customer commands -------------------------------------------------
 
@@ -169,7 +188,7 @@ class TimeTracking(commands.Cog):
             try:
                 self._odoo_employees = await self.client.get_employee_list() or []
             except Exception as e:  # noqa: BLE001
-                print(f"[Odoo] employee autocomplete fetch failed: {e}")
+                log.warning(f"[Odoo] employee autocomplete fetch failed: {e}")
                 return []
         term = ctx.value.lower()
         matches = [e for e in self._odoo_employees if term in e["display_name"].lower()]
@@ -315,7 +334,7 @@ class TimeTracking(commands.Cog):
                 msg = await channel.fetch_message(message_id)
                 await msg.delete()
         except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
-            print(f"[Clock] Could not delete old clock message: {e}")
+            log.warning(f"[Clock] Could not delete old clock message: {e}")
 
     @discord.slash_command(name="deleteclock", description="Delete a clock embed for a user.")
     @commands.has_permissions(administrator=True)
@@ -444,7 +463,7 @@ class TimeTracking(commands.Cog):
         except ValueError:
             await ctx.respond("Invalid date format. Please use YYYY-MM-DD.", ephemeral=True)
         except Exception as e:  # noqa: BLE001
-            print(f"[Report] error: {e}")
+            log.exception(f"[Report] error: {e}")
             await ctx.respond(f"An error occurred: {e}", ephemeral=True)
 
     @discord.slash_command(name="timecardexportdb", description="Send the timecard db file in chat.")
@@ -455,61 +474,5 @@ class TimeTracking(commands.Cog):
             return
         await ctx.respond("Here you go!", file=discord.File(self.db_path), ephemeral=True)
 
-    # ---- inbound webhook (Odoo -> SQLite -> Discord) -----------------------
-
-    async def handle_odoo_webhook(self, payload: dict):
-        """Apply an inbound Odoo change: write to SQLite, then re-render Discord.
-
-        Supported actions:
-          - update_content: edit a message's text
-          - approve_punch:  set punch approvals in DB, refresh the approval view
-          - update_clock_view / sync_database: refresh a clock/approval message
-        """
-        db = await self._ensure_db()
-        channel_id = payload.get("channel_id")
-        message_id = payload.get("message_id")
-        punch_id = payload.get("punch_id")
-        action = payload.get("action", "sync_database")
-        content = payload.get("content")
-        data = payload.get("data", {}) or {}
-
-        try:
-            message = await self.obtain_message(int(channel_id), int(message_id))
-        except discord.NotFound:
-            print(f"[Webhook] Message {message_id} not found in channel {channel_id}")
-            return
-        except Exception as e:  # noqa: BLE001
-            print(f"[Webhook] Error fetching message: {e}")
-            return
-
-        if action == "update_content" and content:
-            await message.edit(content=content)
-            return
-
-        if action == "approve_punch" and punch_id is not None:
-            approval = data.get("punch_approval_status", {})
-            await sync.apply_punch_approval(
-                db, int(punch_id),
-                bool(approval.get("punchInApproval", True)),
-                bool(approval.get("punchOutApproval", True)),
-            )
-
-        if action in ("approve_punch", "sync_database") and punch_id is not None:
-            row = await db.fetchone(
-                "SELECT punchInApproval, punchOutApproval FROM punch_clock WHERE id = ?", (int(punch_id),)
-            )
-            from .state import _as_bool
-            if row and _as_bool(row["punchInApproval"]) and _as_bool(row["punchOutApproval"]):
-                await db.execute(
-                    "UPDATE punch_clock SET checkChannelId = NULL, checkMessageId = NULL WHERE id = ?",
-                    (int(punch_id),),
-                )
-                await message.edit(view=None)
-            else:
-                await message.edit(view=await ApprovePunch.create(self, int(punch_id), message))
-            return
-
-        if action == "update_clock_view":
-            employee_id = data.get("employee_id")
-            if employee_id:
-                await render_clock(self, message, int(employee_id))
+    # Inbound Odoo changes are handled by the pull-based inbox worker
+    # (cogs/timetracking/odoo/inbox.py), entered via enqueue_inbound() above.

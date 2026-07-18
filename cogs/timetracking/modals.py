@@ -8,8 +8,11 @@ button/modal classes the way the old file did.
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from datetime import datetime
 
 import discord
+
+PUNCH_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 
 class Confirm(discord.ui.View):
@@ -89,6 +92,48 @@ class CustomerInputModal(discord.ui.Modal):
 
     async def callback(self, interaction: discord.Interaction):
         await self._on_submit(interaction, self.children[0].value)
+
+
+class EditPunchTimeModal(discord.ui.Modal):
+    """Correct a punch's clock-in/out time.
+
+    Shows the current value (a non-editable reference field) alongside an
+    editable field pre-filled with it, so the admin can see both what it *was*
+    and set what it *should be* without losing track.
+    """
+
+    def __init__(self, which: str, current: str,
+                 on_submit: Callable[[discord.Interaction, str], Awaitable[None]]):
+        super().__init__(title=f"Edit {which} time")
+        self._on_submit = on_submit
+        self.add_item(
+            discord.ui.InputText(
+                label="Current time (reference only)",
+                value=current or "unset",
+                required=False,
+                style=discord.InputTextStyle.short,
+            )
+        )
+        self.add_item(
+            discord.ui.InputText(
+                label="New time (YYYY-MM-DD HH:MM:SS)",
+                value=current,
+                placeholder="e.g. 2026-07-18 08:00:00",
+                max_length=19,
+                style=discord.InputTextStyle.short,
+            )
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        raw = (self.children[1].value or "").strip()
+        try:
+            datetime.strptime(raw, PUNCH_TIME_FORMAT)
+        except ValueError:
+            await interaction.response.send_message(
+                f"`{raw}` is not a valid date/time. Use `YYYY-MM-DD HH:MM:SS`.", ephemeral=True
+            )
+            return
+        await self._on_submit(interaction, raw)
 
 
 class CustomerSelectMenu(discord.ui.Select):
