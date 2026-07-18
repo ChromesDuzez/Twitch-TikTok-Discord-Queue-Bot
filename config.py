@@ -39,6 +39,8 @@ ENV_VERSION_KEY = "ENV_VERSION"
 
 # Bump when adding an env migration below. New *additions* are picked up
 # automatically from .env.example; migrations here handle renames/removals.
+# NOTE: kept at 1 for the whole V2.0 release — new keys added during V2 dev (e.g.
+# the TESTING settings) ride along the 0->1 migration via the .env.example sync.
 ENV_TARGET_VERSION = 1
 
 _write_lock = threading.Lock()
@@ -73,7 +75,8 @@ def _rename_env(old: str, new: str):
 # Key ADDITIONS are handled automatically by syncing from .env.example, so they
 # don't need an entry here.
 ENV_MIGRATIONS = {
-    # v1: HMAC signing was replaced by the auto-generated WEBHOOK_TOKEN.
+    # v1: HMAC signing was replaced by the auto-generated WEBHOOK_TOKEN. (Additions
+    # like the TESTING settings come from .env.example automatically.)
     1: [lambda: _remove_env("ODOO_WEBHOOK_SECRET")],
 }
 
@@ -173,6 +176,33 @@ def set_ip_allowlist_enabled(enabled: bool):
 def get_ip_allowlist() -> set[str]:
     raw = os.getenv(ALLOWLIST_KEY, "")
     return {ip.strip() for ip in raw.split(",") if ip.strip()}
+
+
+# ---- testing mode ----------------------------------------------------------
+
+def is_testing() -> bool:
+    return os.getenv("TESTING", "false").strip().lower() in ("1", "true", "yes")
+
+
+def _int_env(key: str) -> int | None:
+    raw = os.getenv(key)
+    try:
+        return int(raw) if raw else None
+    except ValueError:
+        return None
+
+
+def testing_guild_id() -> int | None:
+    return _int_env("TESTING_GUILD_ID")
+
+
+def primary_guild_id() -> int | None:
+    return _int_env("PRIMARY_GUILD_ID")
+
+
+def set_env(key: str, value: str):
+    """Public wrapper so the testing cog can persist discovered channel ids."""
+    _set_env(key, value)
 
 
 def record_odoo_ips(odoo_url: str):

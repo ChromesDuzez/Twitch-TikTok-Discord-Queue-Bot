@@ -13,6 +13,7 @@ import os
 import discord
 from discord.ext import commands
 
+import config
 from botlog import log
 from .db import Database, RELEASE_VERSION, TARGET_VERSION, backup_database, resolve_db_path
 from .modals import Confirm
@@ -49,7 +50,9 @@ class TimeTracking(commands.Cog):
         """Open + migrate the DB on first use (backs up existing data first)."""
         async with self._lock:
             if self.db is None:
-                target, source = resolve_db_path(os.getcwd())
+                # A test bot uses a separate db file so it can never touch prod's.
+                prefix = "timetracker.test" if config.is_testing() else "timetracker"
+                target, source = resolve_db_path(os.getcwd(), prefix)
                 if source is not None:
                     # Upgrading an older/legacy db: back it up, then rename it to
                     # the current version-stamped name so migrations bring it up.
@@ -78,6 +81,59 @@ class TimeTracking(commands.Cog):
     async def obtain_message(self, channel_id: int, message_id: int) -> discord.Message:
         channel = self.bot.get_channel(channel_id) or await self.bot.fetch_channel(channel_id)
         return await channel.fetch_message(message_id)
+
+    async def close_db(self):
+        """Stop the workers and close the db connection (leaves the file)."""
+        async with self._lock:
+            if self.sync is not None:
+                await self.sync.stop()
+                self.sync = None
+            if self.inbox is not None:
+                await self.inbox.stop()
+                self.inbox = None
+            if self.db is not None:
+                await self.db.close()
+            self.db = None
+
+    async def reload_db(self):
+        """Close + reopen the db and restart the workers (after swapping the file)."""
+        await self.close_db()
+        await self._ensure_db()
+
+    async def wipe_db(self):
+        """Delete the current db file and recreate a bare baseline. Test-only."""
+        await self.close_db()
+        if self.db_path and os.path.exists(self.db_path):
+            os.remove(self.db_path)
+        # Also clear WAL sidecar files so nothing stale is reopened.
+        for suffix in ("-wal", "-shm"):
+            side = f"{self.db_path}{suffix}" if self.db_path else None
+            if side and os.path.exists(side):
+                os.remove(side)
+        await self._ensure_db()
+
+    async def make_clock(self, employee_id: int, channel) -> discord.Message:
+        """Create + persist a fresh clock message for an employee in a channel.
+
+        Shared by /createclock and the testing setup so both build clocks the
+        same way. Renders from DB state (clocked-in or not).
+        """
+        db = await self._ensure_db()
+        user_obj = await self.bot.fetch_user(employee_id)
+        embed = discord.Embed(title="You are currently NOT clocked in.", color=discord.Colour.brand_red())
+        embed.add_field(
+            name="Wondering how to clock in?",
+            value="Click the green clock-in button and watch the field turn green. "
+            "To clock out, hit the red clock-out button. Simple as that!",
+        )
+        embed.set_footer(text=f"User: {user_obj.name}")
+        message = await channel.send(embed=embed)
+        await db.execute(
+            "UPDATE employee SET clockChannelId = ?, clockMessageId = ? WHERE id = ?",
+            (message.channel.id, message.id, employee_id),
+        )
+        await render_clock(self, message, employee_id)
+        return message
 
     @commands.Cog.listener()
     async def on_ready(self):
@@ -304,22 +360,7 @@ class TimeTracking(commands.Cog):
                 await ctx.respond(f"'{channel}' is not a valid channel mention.", ephemeral=True)
                 return
 
-        user_obj = await self.bot.fetch_user(employee_id)
-        embed = discord.Embed(title="You are currently NOT clocked in.", color=discord.Colour.brand_red())
-        embed.add_field(
-            name="Wondering how to clock in?",
-            value="Click the green clock-in button and watch the field turn green. "
-            "To clock out, hit the red clock-out button. Simple as that!",
-        )
-        embed.set_footer(text=f"User: {user_obj.name}")
-        message = await channel_obj.send(embed=embed)
-
-        await db.execute(
-            "UPDATE employee SET clockChannelId = ?, clockMessageId = ? WHERE id = ?",
-            (message.channel.id, message.id, employee_id),
-        )
-        # render_clock reads the true state (clocked-in or not) from the DB.
-        await render_clock(self, message, employee_id)
+        await self.make_clock(employee_id, channel_obj)
 
         note = f"Clock created successfully for {user}."
         if responded:

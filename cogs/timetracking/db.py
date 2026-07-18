@@ -398,12 +398,16 @@ def backup_database(path: str) -> str | None:
     return dest
 
 
-def db_filename(version: int = TARGET_VERSION) -> str:
-    """The live db filename for a given schema version."""
-    return f"timetracker.v{version}.db"
+def db_filename(version: int = TARGET_VERSION, prefix: str = "timetracker") -> str:
+    """The live db filename for a given schema version.
+
+    ``prefix`` separates environments: prod uses ``timetracker`` and the test
+    bot uses ``timetracker.test`` so a test run can never open the prod file.
+    """
+    return f"{prefix}.v{version}.db"
 
 
-def resolve_db_path(base_dir: str) -> tuple[str, str | None]:
+def resolve_db_path(base_dir: str, prefix: str = "timetracker") -> tuple[str, str | None]:
     """Work out which db file to use and whether one needs upgrading.
 
     The live file is stamped with the current schema version so its version is
@@ -411,18 +415,18 @@ def resolve_db_path(base_dir: str) -> tuple[str, str | None]:
     ``(target_path, source_to_upgrade_or_None)``:
 
     * target already at current version  -> (target, None)
-    * an older ``timetracker.v{k}.db`` or the legacy ``timetracker.db`` exists
+    * an older ``{prefix}.v{k}.db`` or the legacy ``{prefix}.db`` exists
       -> (target, that_older_path)   [caller backs it up + renames to target]
     * nothing yet                        -> (target, None)   [fresh create]
     """
-    target = os.path.join(base_dir, db_filename(TARGET_VERSION))
+    target = os.path.join(base_dir, db_filename(TARGET_VERSION, prefix))
     if os.path.exists(target):
         return target, None
     for k in range(TARGET_VERSION - 1, 0, -1):
-        cand = os.path.join(base_dir, db_filename(k))
+        cand = os.path.join(base_dir, db_filename(k, prefix))
         if os.path.exists(cand):
             return target, cand
-    legacy = os.path.join(base_dir, "timetracker.db")  # pre-versioning (v1) name
+    legacy = os.path.join(base_dir, f"{prefix}.db")  # pre-versioning (v1) name
     if os.path.exists(legacy):
         return target, legacy
     return target, None

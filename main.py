@@ -31,20 +31,28 @@ config.ensure_env_file()
 load_dotenv()
 # Version + upgrade the .env (add new keys, rename/remove old ones), like the DB.
 config.migrate_env()
-# Auto-generate the webhook token if it isn't set yet (stored back to .env).
-config.ensure_webhook_token()
+
+# The webhook (server, admin cog, token) exists only for the Odoo/timecard
+# integration, so everything webhook-related is gated on timetracking.
+TIMETRACKING_ENABLED = os.getenv("ENABLE_TIMETRACKING", "false").lower() == "true"
+if TIMETRACKING_ENABLED:
+    # Auto-generate the webhook token if it isn't set yet (stored back to .env).
+    config.ensure_webhook_token()
 
 cogs_list = [
     'moderation',
-    'webhookadmin',
 ]
 # enabling and disabling cogs based on environment variables
-if os.getenv("ENABLE_TIMETRACKING", "false").lower() == "true":
+if TIMETRACKING_ENABLED:
     cogs_list.insert(0, "timetracking")
+    cogs_list.insert(0, "webhookadmin")  # webhook admin only when timetracking is on
 if os.getenv("ENABLE_FUN", "false").lower() == "true":
     cogs_list.insert(0, "fun")
 if os.getenv("ENABLE_FUNCTIONALITY", "false").lower() == "true":
     cogs_list.insert(0, "functionality")
+# Test-only helper commands, loaded solely on the test bot.
+if config.is_testing():
+    cogs_list.insert(0, "testing")
 
 # Global variables
 bot = None
@@ -75,7 +83,14 @@ async def shutdown(ctx):
 
 async def setup_bot():
     global bot
-    bot = ChromesBot(command_prefix="$", help_command=commands.DefaultHelpCommand())
+    # In testing, register commands to the test guild for INSTANT sync (global
+    # commands take ~an hour to propagate).
+    debug_guilds = None
+    if config.is_testing() and config.testing_guild_id():
+        debug_guilds = [config.testing_guild_id()]
+        log.info("[Bot] TESTING mode: commands scoped to guild %s for instant sync.", debug_guilds[0])
+    bot = ChromesBot(command_prefix="$", help_command=commands.DefaultHelpCommand(),
+                     debug_guilds=debug_guilds)
     bot.cli_session = None  # Will be set after bot is ready
 
     for cog in cogs_list:
@@ -121,7 +136,11 @@ async def main():
     global bot_task
     setup_logging()
     await setup_bot()
-    bot.loop.create_task(run_webserver(bot))
+    # The webhook server only serves the Odoo/timecard integration.
+    if TIMETRACKING_ENABLED:
+        bot.loop.create_task(run_webserver(bot))
+    else:
+        log.info("[Bot] Timetracking disabled — webhook server not started.")
     bot_task = asyncio.create_task(bot.start(os.getenv("BOT_TOKEN")))
     cli_task = asyncio.create_task(cli_input_loop())
 
