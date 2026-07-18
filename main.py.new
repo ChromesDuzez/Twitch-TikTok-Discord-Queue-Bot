@@ -1,0 +1,557 @@
+## Import statements
+from discord.ext import commands
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+import discord
+import os # default module
+from dotenv import load_dotenv
+import argparse, asyncio, json, re, urllib.parse, socket
+from prompt_toolkit import PromptSession
+from aiohttp import web
+import requests
+
+class ChromesBot(discord.Bot):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.cli_session = None  # Will be set after bot is ready
+        self.OdooLoaded = False
+        self.OdooURL = os.getenv("ODOO_URL", None)
+        self.OdooDB = os.getenv("ODOO_DB", None)
+        self.OdooUSERNAME = os.getenv("ODOO_USERNAME", None)
+        self.OdooKEY = os.getenv("ODOO_API_KEY", None)
+        if not all([self.OdooURL, self.OdooDB, self.OdooUSERNAME, self.OdooKEY]):
+            print("Odoo configuration is incomplete. Please check your .env file if you wish to use the Odoo integration.")
+        else:
+            self.OdooLoaded = True
+            print("Odoo configuration loaded successfully.")
+
+
+load_dotenv()
+
+cogs_list = [
+    'moderation'
+]
+
+if os.getenv("ENABLE_TIMETRACKING", "false").lower() == "true":
+    cogs_list.insert(0, "timetracking")
+if os.getenv("ENABLE_FUN", "false").lower() == "true":
+    cogs_list.insert(0, "fun")
+if os.getenv("ENABLE_FUNCTIONALITY", "false").lower() == "true":
+    cogs_list.insert(0, "functionality")
+
+
+bot = None
+bot_ready_event = asyncio.Event()
+session = None
+bot_task = None  # Global variable for CLI shutdown access
+
+# Webhook loop prevention - track recent Odoo updates
+recent_odoo_updates = []  # List of (model, record_id, timestamp) tuples
+UPDATE_IGNORE_WINDOW = 5  # Seconds to ignore webhooks after our updates
+
+def record_odoo_update(model, record_id):
+    """Record that we just updated a specific Odoo record to prevent webhook loops"""
+    global recent_odoo_updates
+
+    update_time = datetime.now()
+    recent_odoo_updates.append((model, record_id, update_time))
+    print(f"[Webhook] Recorded Odoo update: {model}:{record_id} at {update_time}")
+    cleanup_recent_updates()
+
+
+def cleanup_recent_updates():
+    """Remove expired entries from recent updates list"""
+    global recent_odoo_updates
+
+    now = datetime.now()
+    original_count = len(recent_odoo_updates)
+    recent_odoo_updates[:] = [
+        (model, rec_id, timestamp)
+        for model, rec_id, timestamp in recent_odoo_updates
+        if (now - timestamp).total_seconds() < UPDATE_IGNORE_WINDOW
+    ]
+
+    removed_count = original_count - len(recent_odoo_updates)
+    if removed_count > 0:
+        print(f"[Webhook] Cleaned up {removed_count} expired update entries")
+
+
+async def on_ready():
+    await synced()
+    print("Hello! Chromes Py-Bot is ready!")
+    channel = bot.get_channel(int(os.getenv('BOT_LOG_ID')))
+    await channel.send("Hello! Chromes Py-Bot is ready!")
+    bot_ready_event.set()
+
+async def synced():
+    if bot.auto_sync_commands:
+        await bot.sync_commands()
+    print(f"{bot.user.name} connected.")
+
+async def shutdown(ctx):
+    # Fetch app info to ensure owner_id is populated
+    app_info = await bot.application_info()
+    if ctx.author.id != app_info.owner.id:
+        await ctx.respond("You are not the owner!")
+        return
+    await ctx.respond("Shutting down the bot...")
+    await cli_shutdown()
+
+async def setup_bot():
+    global bot
+    bot = ChromesBot(command_prefix="$", help_command=commands.DefaultHelpCommand())
+    bot.cli_session = None  # Will be set after bot is ready
+    
+    # Add webhook utility functions to bot instance
+    bot.record_odoo_update = record_odoo_update
+
+    for cog in cogs_list:
+        print(f"Loading Cog {cog}")
+        bot.load_extension(f'cogs.{cog}')
+
+    bot.add_listener(on_ready, 'on_ready')
+    bot.slash_command(description="Shutdown the bot. [Only BOT owner can use this command]")(shutdown)
+
+async def cli_shutdown():
+    global bot_task
+    if bot_task and not bot_task.done():
+        bot_task.cancel()
+    if bot and not bot.is_closed():
+        await bot.close()
+
+async def cli_input_loop():
+    global session
+    session = PromptSession()
+    bot.cli_session = session  # Store on bot instance for access by cogs
+    await bot_ready_event.wait()
+    session.output.write("[CLI] running interactive local console. Type 'shutdown' or '/shutdown' to stop the bot.\n")
+    while bot and not bot.is_closed():
+        try:
+            user_input = await session.prompt_async("> ")
+            cmd = user_input.strip().lower()
+            if cmd in ("shutdown", "/shutdown", "exit", "quit"):
+                session.output.write("[CLI] shutting down bot from command line\n")
+                await cli_shutdown()
+                break
+            elif cmd in ("status", "/status"):
+                session.output.write("[CLI] bot is running\n")
+            elif cmd == "":
+                continue
+            else:
+                session.output.write(f"[CLI] unknown command '{user_input}'\n")
+        except EOFError:
+            break
+        except KeyboardInterrupt:
+            break
+
+async def main():
+    global bot_task
+    await setup_bot()
+    bot.loop.create_task(run_webserver())
+    bot_task = asyncio.create_task(bot.start(os.getenv("BOT_TOKEN")))
+    cli_task = asyncio.create_task(cli_input_loop())
+
+    done, pending = await asyncio.wait([bot_task, cli_task], return_when=asyncio.FIRST_COMPLETED)
+
+    for task in done:
+        if task == bot_task:
+            try:
+                await task
+            except asyncio.CancelledError:
+                print("[CLI] Bot task was cancelled")
+            except Exception as e:
+                print(f"[CLI] Bot task exception: {e}")
+
+    for task in pending:
+        task.cancel()
+
+    if bot and not bot.is_closed():
+        await bot.close()
+
+async def run_webserver():
+    """Start the aiohttp web server to listen for webhook events"""
+    
+    # Sanitization and validation utilities
+    class WebhookValidator:
+        """Validates and sanitizes webhook payloads"""
+        
+        @staticmethod
+        def sanitize_string(value, max_length=1000):
+            """Sanitize string input to prevent injection attacks"""
+            if not isinstance(value, str):
+                raise ValueError("Expected string value")
+            
+            # Limit length
+            if len(value) > max_length:
+                raise ValueError(f"String exceeds max length of {max_length}")
+            
+            # Remove null bytes
+            value = value.replace('\x00', '')
+            
+            # Allow only safe characters (alphanumeric, common punctuation, whitespace)
+            if not re.match(r'^[\w\s\-.,()&@#!?]*$', value, re.UNICODE):
+                raise ValueError("String contains unsupported characters")
+            
+            return value.strip()
+        
+        @staticmethod
+        def sanitize_int(value, min_val=0, max_val=9223372036854775807):
+            """Sanitize integer input"""
+            try:
+                int_val = int(value)
+                if int_val < min_val or int_val > max_val:
+                    raise ValueError(f"Integer out of valid range [{min_val}, {max_val}]")
+                return int_val
+            except (TypeError, ValueError):
+                raise ValueError("Expected valid integer")
+        
+        @staticmethod
+        def sanitize_action(action):
+            """Sanitize Odoo action string"""
+            if not isinstance(action, str):
+                raise ValueError("Action must be a string")
+            # For Odoo actions, just sanitize as a string - they can be any format
+            return WebhookValidator.sanitize_string(action, max_length=200)
+        
+        @staticmethod
+        def validate_payload(payload):
+            """Validate and sanitize Odoo webhook payload based on model type"""
+            if not isinstance(payload, dict):
+                raise ValueError("Payload must be a JSON object")
+            
+            # Check for required Odoo fields
+            model = payload.get('_model')
+            record_id = payload.get('_id') or payload.get('id')
+            action = payload.get('_action')
+            
+            if not model:
+                raise ValueError("Missing required field: _model")
+            if not record_id:
+                raise ValueError("Missing required field: _id or id")
+            
+            # Validate model is supported
+            supported_models = [
+                'account.analytic.line',
+                'res.partner', 
+                'hr.attendance'
+            ]
+            if model not in supported_models:
+                raise ValueError(f"Unsupported model: {model}. Supported: {supported_models}")
+            
+            try:
+                # Sanitize basic fields
+                sanitized_model = WebhookValidator.sanitize_string(model, max_length=100)
+                sanitized_record_id = WebhookValidator.sanitize_int(record_id, min_val=1)
+                sanitized_action = WebhookValidator.sanitize_string(action, max_length=200) if action else None
+                
+                # Start building sanitized payload
+                sanitized = {
+                    '_model': sanitized_model,
+                    '_id': sanitized_record_id,
+                    '_action': sanitized_action
+                }
+                
+                # Validate and sanitize model-specific fields
+                if model == 'account.analytic.line':
+                    sanitized.update(WebhookValidator.validate_analytic_line_fields(payload))
+                elif model == 'res.partner':
+                    sanitized.update(WebhookValidator.validate_res_partner_fields(payload))
+                elif model == 'hr.attendance':
+                    sanitized.update(WebhookValidator.validate_hr_attendance_fields(payload))
+                
+                return sanitized
+                
+            except ValueError as e:
+                raise ValueError(f"Validation error: {e}")
+        
+        @staticmethod
+        def validate_analytic_line_fields(payload):
+            """Validate fields specific to account.analytic.line model"""
+            fields = {}
+            
+            # Required fields for analytic_line
+            required_fields = ['id', 'name', 'date', 'employee_id', 'unit_amount']
+            
+            for field in required_fields:
+                if field not in payload:
+                    raise ValueError(f"Missing required field for analytic_line: {field}")
+            
+            # Validate and sanitize each field
+            fields['id'] = WebhookValidator.sanitize_int(payload['id'], min_val=1)
+            fields['name'] = WebhookValidator.sanitize_string(payload['name'], max_length=500)
+            fields['date'] = WebhookValidator.sanitize_string(payload['date'], max_length=50)  # Date string
+            fields['employee_id'] = WebhookValidator.sanitize_int(payload['employee_id'], min_val=1)
+            fields['unit_amount'] = float(payload['unit_amount']) if payload['unit_amount'] is not None else 0.0
+            
+            # Optional fields
+            optional_fields = {
+                'amount': lambda x: float(x) if x is not None else 0.0,
+                'company_id': lambda x: WebhookValidator.sanitize_int(x, min_val=1) if x else None,
+                'product_uom_id': lambda x: WebhookValidator.sanitize_int(x, min_val=1) if x else None,
+                'validated_status': lambda x: WebhookValidator.sanitize_string(x, max_length=50) if x else None,
+                'write_date': lambda x: WebhookValidator.sanitize_string(x, max_length=50) if x else None,
+                'write_uid': lambda x: WebhookValidator.sanitize_int(x, min_val=1) if x else None
+            }
+            
+            for field_name, validator in optional_fields.items():
+                if field_name in payload and payload[field_name] is not None:
+                    try:
+                        fields[field_name] = validator(payload[field_name])
+                    except (ValueError, TypeError):
+                        raise ValueError(f"Invalid value for {field_name}: {payload[field_name]}")
+            
+            return fields
+        
+        @staticmethod
+        def validate_res_partner_fields(payload):
+            """Validate fields specific to res.partner model"""
+            fields = {}
+            
+            # Required fields for res.partner
+            if 'id' not in payload:
+                raise ValueError("Missing required field for res.partner: id")
+            
+            fields['id'] = WebhookValidator.sanitize_int(payload['id'], min_val=1)
+            
+            # Optional fields - we'll add these as we see what Odoo sends
+            optional_fields = {
+                'name': lambda x: WebhookValidator.sanitize_string(x, max_length=500) if x else None,
+                'email': lambda x: WebhookValidator.sanitize_string(x, max_length=500) if x else None,
+                'phone': lambda x: WebhookValidator.sanitize_string(x, max_length=50) if x else None
+            }
+            
+            for field_name, validator in optional_fields.items():
+                if field_name in payload and payload[field_name] is not None:
+                    try:
+                        fields[field_name] = validator(payload[field_name])
+                    except (ValueError, TypeError):
+                        raise ValueError(f"Invalid value for {field_name}: {payload[field_name]}")
+            
+            return fields
+        
+        @staticmethod
+        def validate_hr_attendance_fields(payload):
+            """Validate fields specific to hr.attendance model"""
+            fields = {}
+            
+            # Required fields for hr.attendance
+            if 'id' not in payload:
+                raise ValueError("Missing required field for hr.attendance: id")
+            
+            fields['id'] = WebhookValidator.sanitize_int(payload['id'], min_val=1)
+            
+            # Optional fields - we'll add these as we see what Odoo sends
+            optional_fields = {
+                'employee_id': lambda x: WebhookValidator.sanitize_int(x, min_val=1) if x else None,
+                'check_in': lambda x: WebhookValidator.sanitize_string(x, max_length=50) if x else None,
+                'check_out': lambda x: WebhookValidator.sanitize_string(x, max_length=50) if x else None,
+                'worked_hours': lambda x: float(x) if x is not None else 0.0
+            }
+            
+            for field_name, validator in optional_fields.items():
+                if field_name in payload and payload[field_name] is not None:
+                    try:
+                        fields[field_name] = validator(payload[field_name])
+                    except (ValueError, TypeError):
+                        raise ValueError(f"Invalid value for {field_name}: {payload[field_name]}")
+            
+            return fields
+        
+        @staticmethod
+        def sanitize_data_object(data):
+            """Recursively sanitize data object"""
+            if not isinstance(data, dict):
+                raise ValueError("Data must be a dictionary")
+            
+            sanitized = {}
+            for key, value in data.items():
+                # Validate key is safe
+                if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', key):
+                    raise ValueError(f"Invalid key name: {key}")
+                
+                if isinstance(value, bool):
+                    sanitized[key] = value
+                elif isinstance(value, (int, float)):
+                    sanitized[key] = value
+                elif isinstance(value, str):
+                    sanitized[key] = WebhookValidator.sanitize_string(value, max_length=500)
+                elif isinstance(value, dict):
+                    sanitized[key] = WebhookValidator.sanitize_data_object(value)
+                elif value is None:
+                    sanitized[key] = None
+                else:
+                    raise ValueError(f"Unsupported data type for key '{key}': {type(value)}")
+            
+            return sanitized
+    
+    async def verify_odoo_connection(incomingIP):
+        """Verify connection to Odoo by resolving the URL to an IP address"""
+        try:
+            if not bot.OdooLoaded:
+                print("[Webhook - verify_odoo_connection] Odoo is not configured, skipping IP verification")
+                return False
+            # Parse the Odoo URL to extract hostname
+            parsed_url = urllib.parse.urlparse(bot.OdooURL)
+            hostname = parsed_url.hostname or parsed_url.netloc.split(':')[0]
+            # Resolve hostname to IP address
+            try:
+                odoo_ip = socket.gethostbyname(hostname)
+                print(f"[Webhook - verify_odoo_connection] Odoo URL '{hostname}' resolves to IP: {odoo_ip}")
+                # If we have an incoming IP, verify it matches
+                if incomingIP:
+                    if odoo_ip == incomingIP:
+                        print(f"[Webhook - verify_odoo_connection] Incoming IP {incomingIP} matches Odoo server IP")
+                        return True
+                    else:
+                        print(f"[Webhook - verify_odoo_connection] Incoming IP {incomingIP} does NOT match Odoo IP {odoo_ip}")
+                        return False
+                else:
+                    # No incoming IP to verify against, just resolved successfully
+                    print(f"[Webhook - verify_odoo_connection] Odoo IP resolved successfully, no incoming IP to verify")
+                    return True
+            except socket.gaierror as e:
+                print(f"[Webhook - verify_odoo_connection] Could not resolve hostname '{hostname}': {e}")
+                return False    
+        except Exception as e:
+            print(f"[Webhook - verify_odoo_connection] Odoo verification error: {e}")
+            return False
+    
+    async def should_ignore_webhook(payload):
+        """Check if webhook should be ignored to prevent loops based on recent updates"""
+        global recent_odoo_updates
+        
+        # Clean up expired entries first
+        cleanup_recent_updates()
+        # Check if this webhook matches a recent update
+        model = payload.get('_model')
+        record_id = payload.get('_id') or payload.get('id')
+        # Check model and record_id are present to perform the check - if not, we can't verify so safer to ignore
+        if not model or not record_id:
+            print(f"[Webhook] Missing model {model} or record ID {record_id} in payload, cannot check for echo - safer to ignore")
+            return True  # Can't check without model/id - safer to ignore
+        now = datetime.now()
+        # Look for matching recent update
+        for i, (update_model, update_id, update_time) in enumerate(recent_odoo_updates):
+            if update_model == model and str(update_id) == str(record_id):
+                time_diff = (now - update_time).total_seconds()
+                if time_diff < UPDATE_IGNORE_WINDOW:
+                    print(f"[Webhook] Ignoring webhook - echo from our recent update to {model}:{record_id} ({time_diff:.1f}s ago)")
+                    # Remove this entry since we've handled it
+                    recent_odoo_updates.pop(i)
+                    return True
+        
+        return False
+    
+    def record_odoo_update(model, record_id):
+        """Record that we just updated a specific Odoo record to prevent webhook loops"""
+        global recent_odoo_updates
+        
+        update_time = datetime.now()
+        recent_odoo_updates.append((model, record_id, update_time))
+        print(f"[Webhook] Recorded Odoo update: {model}:{record_id} at {update_time}")
+        
+        # Clean up old entries
+        cleanup_recent_updates()
+    
+    def cleanup_recent_updates():
+        """Remove expired entries from recent updates list"""
+        global recent_odoo_updates
+        
+        now = datetime.now()
+        original_count = len(recent_odoo_updates)
+        recent_odoo_updates[:] = [
+            (model, rec_id, timestamp) 
+            for model, rec_id, timestamp in recent_odoo_updates 
+            if (now - timestamp).total_seconds() < UPDATE_IGNORE_WINDOW
+        ]
+        
+        removed_count = original_count - len(recent_odoo_updates)
+        if removed_count > 0:
+            print(f"[Webhook] Cleaned up {removed_count} expired update entries")
+    
+    async def handle_webhook(request):
+        """Generic webhook handler that validates and routes to appropriate cog"""
+        client_ip = request.remote
+        
+        # Log incoming webhook request
+        print(f"[Webhook - handler] ===== INCOMING REQUEST FROM IP: {client_ip} =====")
+        print(f"[Webhook - handler] Path: {request.path}")
+        print(f"[Webhook - handler] Method: {request.method}")
+        print(f"[Webhook - handler] Headers:")
+        for name, value in request.headers.items():
+            print(f"[Webhook - handler]   {name}: {value}")
+        incomingIP = None
+        if 'Cf-Connecting-IP' in request.headers:
+            print(f"[Webhook - handler] Remote IP: {request.headers['Cf-Connecting-IP']}")
+            incomingIP = request.headers['Cf-Connecting-IP']
+
+        try:
+            # Step 1: Verify Odoo connection for IP validation
+            odoo_verified = await verify_odoo_connection(incomingIP)
+
+            if not odoo_verified:
+                print(f"[Webhook - handler] Rejected request - Odoo verification failed from IP: {client_ip}")
+                return web.Response(status=403, text="Service unavailable")
+            
+            # Step 2: Validate content type
+            content_type = request.headers.get('Content-Type', '')
+            if 'application/json' not in content_type:
+                print(f"[Webhook - handler] Rejected request - Invalid content type from IP: {client_ip}")
+                return web.Response(status=400, text="Content-Type incorrect")
+            
+            # Step 3: Parse and sanitize payload
+            try:
+                payload_raw = await request.json()
+                print(f"[Webhook - handler] Raw JSON received from Odoo:")
+                print(json.dumps(payload_raw, indent=2))
+                payload = WebhookValidator.validate_payload(payload_raw)
+            except json.JSONDecodeError:
+                print(f"[Webhook - handler] Rejected request - Invalid JSON from IP: {client_ip}")
+                return web.Response(status=400, text="Invalid JSON")
+            except ValueError as e:
+                print(f"[Webhook - handler] Rejected request - Validation error from IP {client_ip}: {e}")
+                return web.Response(status=400, text=f"Validation error: {e}")
+            
+            # Step 3.5: Check for webhook loops (echoes from our own Odoo updates)
+            if await should_ignore_webhook(payload_raw):
+                print(f"[Webhook - handler] Ignoring potential echo webhook from IP: {client_ip}")
+                return web.Response(status=200, text="ignored - potential echo")
+            
+            # Step 4: Route to appropriate cog
+            path = request.path.lower()
+            
+            if '/odoo-sync' in path or '/odoo-timetracking' in path or '/timetracking' in path:
+                # Get the timetracking cog and call its webhook handler
+                timetracking_cog = bot.get_cog('TimeTracking')
+                if timetracking_cog:
+                    await timetracking_cog.handle_odoo_webhook(payload)
+                    print(f"[Webhook - handler] Successfully processed webhook from IP: {client_ip}")
+                    return web.Response(status=200, text="ok")
+                else:
+                    print(f"[Webhook - handler] TimeTracking cog not found")
+                    return web.Response(status=500, text="TimeTracking cog not found")
+            else:
+                print(f"[Webhook - handler] Rejected request - Unknown route from IP: {client_ip}")
+                return web.Response(status=404, text="Unknown webhook route")
+                
+        except Exception as e:
+            print(f"[Webhook - handler] Unexpected error from IP {client_ip}: {e}")
+            import traceback
+            traceback.print_exc()
+            return web.Response(status=500, text="Internal server error")
+    
+    # Create the web application
+    app = web.Application()
+    app.router.add_post('/webhook/odoo-sync', handle_webhook)
+    app.router.add_post('/webhook/odoo-timetracking', handle_webhook)
+    app.router.add_post('/webhook/timetracking', handle_webhook)
+    
+    # Run the server
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', int(os.getenv('WEBHOOK_PORT', '8080')))
+    await site.start()
+    print(f"Webhook server started on port {os.getenv('WEBHOOK_PORT', '8080')}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
