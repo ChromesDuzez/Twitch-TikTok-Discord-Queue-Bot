@@ -96,17 +96,43 @@ connector on the bot's host. Your Odoo URLs then look like
 Odoo's native webhook automation posts the pointer for you; there is nothing to
 write or maintain on the Odoo side.
 
-For **each** model (`hr.attendance`, `account.analytic.line`, `res.partner`):
+Create one automation rule per model:
 
 1. Enable developer mode: **Settings → Developer Tools → Activate the developer mode**.
 2. **Settings → Technical → Automation Rules → New**.
-3. **Model**: e.g. *Attendance*. **Trigger**: *On Save* (or On Creation / On Update).
+3. Set **Model**, **Trigger**, and **Watched Fields** per the table below.
 4. **Actions To Do** → add **“Send Webhook Notification”**.
 5. **URL**: the matching endpoint above, including `?token=<your WEBHOOK_TOKEN>`.
 6. Save.
 
-That's it — Odoo sends `{"_id": <record id>}` (with `_model`) to that URL on the
-trigger; the bot authenticates the token, pulls the record, and reconciles.
+Odoo sends `{"_id": <record id>}` (with `_model`) to that URL on the trigger;
+the bot authenticates the token, pulls the record, and reconciles.
+
+### Which models, triggers, and fields
+
+The bot only reads a few fields per model (it re-fetches the record, so the
+payload itself is ignored). Scope each automation's **trigger to just those
+fields** so unrelated edits — especially `res.partner`'s many custom fields —
+don't fire needless webhooks.
+
+| Model | Endpoint (`…/webhook/odoo/…`) | Watched fields (all the bot reads) | Used for |
+| --- | --- | --- | --- |
+| `hr.attendance` | `hr.attendance` | `check_in`, `check_out`, `employee_id` | Punch times → `punch_clock` |
+| `account.analytic.line` | `account.analytic.line` | `unit_amount` | Worktime hours → `work_time` |
+| `res.partner` | `res.partner` | `name` (drives `display_name`) | Customer name → `customer` |
+
+**Recommended trigger: “On Create and edit”, with Watched Fields set to the
+columns above** — fires on creation and when a watched field is edited, nothing
+else. Avoid *after last update*: it fires on **any** field change (a lot of
+needless webhooks for `res.partner`). Because the reconcile is idempotent (an
+unrelated change reconciles to a no-op), field-scoping is purely an efficiency
+win — no correctness risk, and no delay needed. Deletions aren't reconciled
+today, so leave *on deletion* off unless you later want to handle removals.
+
+Odoo 19 groups triggers as: **Timing Conditions** (based on date field / after
+creation / after last update), **Values Updated**, **Custom** (On Create / On
+Create and edit / on deletion / on UI change), **External** (on Webhook — not
+used here).
 
 ## Response codes
 
