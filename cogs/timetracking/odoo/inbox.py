@@ -30,7 +30,7 @@ from ..db import Database
 from . import sync
 from .client import OdooClient, shift_field
 
-SUPPORTED_MODELS = ("res.partner", "hr.attendance", "account.analytic.line")
+SUPPORTED_MODELS = ("res.partner", "hr.attendance", "account.analytic.line", "hr.employee")
 DRAIN_INTERVAL = 5  # seconds; short so Odoo edits reflect in Discord quickly
 MAX_ATTEMPTS = 5
 
@@ -164,6 +164,8 @@ class InboxWorker:
             return await self._reconcile_attendance(odoo_id)
         if model == "account.analytic.line":
             return await self._reconcile_analytic_line(odoo_id)
+        if model == "hr.employee":
+            return await self._reconcile_employee(odoo_id)
         log.warning(f"[Inbox] Unsupported model: {model}")
         return False
 
@@ -243,6 +245,24 @@ class InboxWorker:
         row = await self.db.fetchone("SELECT employeeID FROM punch_clock WHERE id = ?", (punch_id,))
         if row:
             await self._refresh_employee_clock(row["employeeID"])
+
+    async def _reconcile_employee(self, odoo_id: int) -> bool:
+        """Mirror an Odoo hr.employee archive/unarchive onto the local employee.
+
+        Archiving a temp worker in Odoo (active -> False) removes their Discord
+        clock so they can't punch in; unarchiving clears the flag. History is kept
+        either way. Only employees already linked via ``employee.odooId`` are
+        affected; unknown Odoo employees are ignored.
+        """
+        rec = await self.client.read_record("hr.employee", odoo_id, ["id", "active"])
+        if rec is None:
+            return False  # deleted in Odoo; employees are archived, not deleted
+        emp = await self.db.fetchone("SELECT id FROM employee WHERE odooId = ?", (odoo_id,))
+        if emp is None:
+            log.debug(f"[Inbox] hr.employee {odoo_id} not linked locally; skipping.")
+            return False
+        archived = not rec.get("active", True)
+        return await self.cog.set_employee_archived(emp["id"], archived)
 
     async def _reconcile_attendance(self, odoo_id: int) -> bool:
         rec = await self.client.read_record(

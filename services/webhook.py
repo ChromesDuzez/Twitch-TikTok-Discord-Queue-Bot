@@ -30,7 +30,9 @@ import config
 from botlog import log
 
 # One route per model; the route determines the model, so the body only needs _id.
-SUPPORTED_MODELS = ("res.partner", "hr.attendance", "account.analytic.line")
+SUPPORTED_MODELS = ("res.partner", "hr.attendance", "account.analytic.line", "hr.employee")
+# hr.employee is archive-only (active toggle) -- no delete route.
+DELETE_MODELS = ("res.partner", "hr.attendance", "account.analytic.line")
 
 
 def _real_client_ip(request: web.Request) -> str | None:
@@ -103,6 +105,7 @@ def make_app(bot) -> web.Application:
     app = web.Application()
     for model in SUPPORTED_MODELS:
         app.router.add_post(f"/webhook/odoo/{model}", make_handler(model))
+    for model in DELETE_MODELS:
         app.router.add_post(f"/webhook/odoo/{model}/delete", make_handler(model, deleting=True))
     return app
 

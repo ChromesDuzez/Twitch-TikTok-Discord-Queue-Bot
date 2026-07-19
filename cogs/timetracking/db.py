@@ -122,6 +122,7 @@ class Database:
                 clockChannelId UNSIGNED BIG INT   NULL DEFAULT NULL,
                 clockMessageId UNSIGNED BIG INT   NULL DEFAULT NULL,
                 odooId         UNSIGNED BIG INT   NULL DEFAULT NULL,
+                archived       BOOLEAN            NOT NULL DEFAULT 0,
                 FOREIGN KEY (employeeTypeID) REFERENCES employee_type(id)
             );
             CREATE TABLE punch_clock (
@@ -280,6 +281,8 @@ class Database:
                 await c.execute(f"ALTER TABLE work_time ADD COLUMN {column} UNSIGNED BIG INT NULL DEFAULT NULL")
         if not await self._column_exists("customer", "archived"):
             await c.execute("ALTER TABLE customer ADD COLUMN archived BOOLEAN NOT NULL DEFAULT 0")
+        if not await self._column_exists("employee", "archived"):
+            await c.execute("ALTER TABLE employee ADD COLUMN archived BOOLEAN NOT NULL DEFAULT 0")
         await c.commit()
 
         # 2. Sync queues + admin-approval queue.

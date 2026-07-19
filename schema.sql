@@ -30,6 +30,9 @@ CREATE TABLE employee (
     clockChannelId UNSIGNED BIG INT   NULL DEFAULT NULL,
     clockMessageId UNSIGNED BIG INT   NULL DEFAULT NULL,
     odooId         UNSIGNED BIG INT   NULL DEFAULT NULL,
+    -- archived (terminated) employees keep their history but lose their clock and
+    -- can't be given a new one; set when the linked hr.employee is archived in Odoo.
+    archived       BOOLEAN            NOT NULL DEFAULT 0,
     FOREIGN KEY (employeeTypeID) REFERENCES employee_type(id)
 );
 

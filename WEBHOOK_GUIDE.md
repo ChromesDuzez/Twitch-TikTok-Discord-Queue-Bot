@@ -57,6 +57,7 @@ real client IP behind Cloudflare (`CF-Connecting-IP`).
 POST /webhook/odoo/res.partner?token=<TOKEN>
 POST /webhook/odoo/hr.attendance?token=<TOKEN>
 POST /webhook/odoo/account.analytic.line?token=<TOKEN>
+POST /webhook/odoo/hr.employee?token=<TOKEN>          # archive/reactivate only (no delete route)
 # deletion (separate route so the action is unambiguous)
 POST /webhook/odoo/hr.attendance/delete?token=<TOKEN>
 POST /webhook/odoo/account.analytic.line/delete?token=<TOKEN>
@@ -125,6 +126,7 @@ don't fire needless webhooks.
 | `hr.attendance` | `hr.attendance` | `check_in`, `check_out`, **`employee_id`** | Punch times → `punch_clock`; a create mirrors an Odoo-built shift into a local punch, and `employee_id` re-assigns it |
 | `account.analytic.line` | `account.analytic.line` | `unit_amount`, **`project_id`**, **`task_id`**, **`partner_id`**, **`x_studio_shift`** | Worktime → `work_time`. Each round-trips: hours, category (from project), task, customer, and the shift/punch it belongs to. **Not `date`** — the worktime's timestamp is derived from its shift, so it's never watched or pulled back |
 | `res.partner` | `res.partner` | `name` (the base **Name** field, *not* the computed "Complete Name" — it drives `display_name`), **`active`**, and `customer_rank` (catches a contact promoted to a customer) | Customer name → `customer`; `active` toggles local archive |
+| `hr.employee` | `hr.employee` | **`active`** | Archiving a linked employee in Odoo removes their Discord clock so they can't punch in (history kept); unarchiving clears the flag. No Domain needed — only employees linked via `odooId` are affected |
 
 > **These watched-field lists exist because the bot now mirrors admin edits made
 > *in Odoo* back to Discord** (see [Inbound reconcile](#what-round-trips-from-odoo)
@@ -189,6 +191,7 @@ edit stays in sync instead of silently diverging. What's reconciled today:
 | Move an `account.analytic.line` to a different `x_studio_shift` | The `work_time` is re-attached to that punch (clearing the link keeps the current punch — never orphaned) |
 | **Create** an `account.analytic.line` with a shift link | Mirrored into a new `work_time` on the linked punch |
 | Rename / archive a `res.partner` | `customer` name / `archived` flag updated |
+| Archive / unarchive an `hr.employee` (e.g. a temp worker who didn't work out) | Linked employee is archived (clock removed → can't punch in, history kept) or reactivated |
 
 Attribution is still **Discord-first** — the normal flow is that work is assigned
 on the clock and pushed *out* to Odoo. This inbound mirroring is the safety net

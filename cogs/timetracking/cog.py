@@ -14,7 +14,7 @@ import discord
 from discord.ext import commands
 
 import config
-from botlog import log
+from botlog import log, timecard_log
 from .db import Database, RELEASE_VERSION, TARGET_VERSION, backup_database, resolve_db_path
 from .modals import Confirm
 from .odoo import inbox, sync
@@ -177,6 +177,35 @@ class TimeTracking(commands.Cog):
         )
         await render_clock(self, message, employee_id)
         return message
+
+    async def set_employee_archived(self, employee_id: int, archived: bool) -> bool:
+        """Archive or reactivate an employee. Used by the Odoo hr.employee reconcile
+        so terminating a temp worker in Odoo removes their Discord clock.
+
+        Archiving deletes their clock message and nulls the clock pointers so they
+        can no longer punch in -- but keeps the employee row and all their punches /
+        worktime for payroll and reports. Reactivating just clears the flag; an admin
+        re-creates the clock with /createclock. Returns True if state changed.
+        """
+        db = await self._ensure_db()
+        row = await db.fetchone(
+            "SELECT archived, clockChannelId, clockMessageId FROM employee WHERE id = ?",
+            (employee_id,),
+        )
+        if row is None or bool(row["archived"]) == archived:
+            return False
+        if archived:
+            if row["clockMessageId"]:
+                await self._delete_clock_message(row["clockChannelId"], row["clockMessageId"])
+            await db.execute(
+                "UPDATE employee SET archived = 1, clockChannelId = NULL, clockMessageId = NULL WHERE id = ?",
+                (employee_id,),
+            )
+            timecard_log.info(f"[Employee] Archived employee {employee_id}; clock removed, history kept.")
+        else:
+            await db.execute("UPDATE employee SET archived = 0 WHERE id = ?", (employee_id,))
+            timecard_log.info(f"[Employee] Reactivated employee {employee_id}; recreate their clock with /createclock.")
+        return True
 
     @commands.Cog.listener()
     async def on_ready(self):
@@ -389,10 +418,16 @@ class TimeTracking(commands.Cog):
             return
 
         row = await db.fetchone(
-            "SELECT clockChannelId, clockMessageId FROM employee WHERE id = ?", (employee_id,)
+            "SELECT clockChannelId, clockMessageId, archived FROM employee WHERE id = ?", (employee_id,)
         )
         if row is None:
             await ctx.respond(f"{user} is not in the employee database. Add them with /addemployee first.", ephemeral=True)
+            return
+        if row["archived"]:
+            await ctx.respond(
+                f"{user} is archived (terminated). Reactivate them in Odoo (unarchive the employee) before creating a clock.",
+                ephemeral=True,
+            )
             return
         if row["clockMessageId"] is not None:
             confirm = Confirm(user=ctx.user, timeout=180)
