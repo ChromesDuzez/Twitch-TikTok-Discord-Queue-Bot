@@ -133,6 +133,39 @@ needless webhooks for `res.partner`). Because the reconcile is idempotent (an
 unrelated change reconciles to a no-op), field-scoping is purely an efficiency
 win — no correctness risk, and no delay needed.
 
+### Record filters (the automation **Domain**)
+
+Watched fields decide *when* a rule fires; the **Domain** decides *which records*
+it fires for. Two of these models are shared across large parts of Odoo, so a
+Domain isn't optional polish — it's what keeps the bot from being flooded with
+pointers to records it will only fetch and discard. Set the Domain on the
+Automation Rule (the **“Before Update Domain” / record filter** on the rule
+form), and apply the **same Domain to that model's create/edit rule and its
+`/delete` rule** so both stay scoped identically.
+
+| Model | Domain (what to match) | Domain expression | Why it matters |
+| --- | --- | --- | --- |
+| `account.analytic.line` | Project **is set**, Journal Item **not set**, Financial Account **not set** | `[("project_id", "!=", False), ("move_line_id", "=", False), ("general_account_id", "=", False)]` | `account.analytic.line` backs timesheets **and** accounting cost/revenue postings, expenses, and other analytic entries. Only a genuine project **timesheet** has a project with no journal-item / financial-account linkage. Without this filter, every accounting posting fires the webhook; the bot pulls it, finds no `x_studio_shift` link, and skips it — many pointless round-trips. |
+| `res.partner` | Is a **customer** | `[("customer_rank", ">", 0)]` | `res.partner` holds contacts, vendors, companies, and portal users — the vast majority of which are not customers you clock work against. `customer_rank > 0` is Odoo's standard "this partner is a customer" flag and cuts the firing set down to just the records that map to a local `customer` row. |
+| `hr.attendance` | *(none required)* | `[]` | `hr.attendance` is a dedicated model — every record is a punch the bot may care about, so no Domain is needed. In a multi-company / multi-department setup you *may* narrow it, e.g. `[("employee_id.department_id", "=", <dept id>)]`. |
+
+**About the analytic-line field names.** In the Domain editor the three leaves
+read as **Project** (`project_id`), **Journal Item** (`move_line_id`), and
+**Financial Account** (`general_account_id`). The exact technical names can vary
+slightly by Odoo build; pick the fields whose labels are *Project*, *Journal
+Item*, and *Financial Account* and the "is set / is not set" operators — that's
+the combination that isolates timesheets. This mirrors the pre-existing rule that
+was already working in the test database.
+
+**Why the same Domain on the `/delete` rule.** If the delete automation is left
+unfiltered, deleting *any* accounting analytic line (or *any* partner) POSTs to
+the `/delete` endpoint. For a record the bot never tracked that resolves to a
+harmless "already gone locally" no-op — but for `hr.attendance` /
+`account.analytic.line` it still posts an **admin approval prompt** in the
+timecard channel before the bot works out it doesn't apply. Matching the Domain
+keeps delete approvals scoped to real timesheets/attendances and avoids that
+noise.
+
 ### Deletions & the shift field (requires Odoo Studio)
 
 Deletion support and attributing Odoo-created timesheets rely on a **Studio
