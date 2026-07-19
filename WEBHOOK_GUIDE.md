@@ -123,7 +123,7 @@ don't fire needless webhooks.
 | Model | Endpoint (`…/webhook/odoo/…`) | Watched fields (all the bot reads) | Used for |
 | --- | --- | --- | --- |
 | `hr.attendance` | `hr.attendance` | `check_in`, `check_out`, **`employee_id`** | Punch times → `punch_clock`; a create mirrors an Odoo-built shift into a local punch, and `employee_id` re-assigns it |
-| `account.analytic.line` | `account.analytic.line` | `unit_amount`, **`project_id`**, **`task_id`**, **`partner_id`**, **`date`**, **`x_studio_shift`** | Worktime → `work_time`. Every one of these round-trips: hours, category (from project), task, customer, date, and the shift/punch it belongs to |
+| `account.analytic.line` | `account.analytic.line` | `unit_amount`, **`project_id`**, **`task_id`**, **`partner_id`**, **`x_studio_shift`** | Worktime → `work_time`. Each round-trips: hours, category (from project), task, customer, and the shift/punch it belongs to. **Not `date`** — the worktime's timestamp is derived from its shift, so it's never watched or pulled back |
 | `res.partner` | `res.partner` | `name` (drives `display_name`), **`active`** | Customer name → `customer`; `active` toggles local archive |
 
 > **These watched-field lists exist because the bot now mirrors admin edits made
@@ -185,7 +185,7 @@ edit stays in sync instead of silently diverging. What's reconciled today:
 | Edit `hr.attendance` check-in/check-out | Punch times updated, clock re-rendered |
 | Re-assign `hr.attendance` to another employee | Punch moves to that employee (old + new clocks re-render). If the new employee isn't linked locally, the punch is left as-is and a warning is logged |
 | **Create** an `hr.attendance` from scratch in Odoo | Mirrored into a new local punch (employee resolved via its `odooId`); an in-flight punch the bot just created is *adopted*, not duplicated |
-| Edit an `account.analytic.line` (hours, project, task, customer, date) | The `work_time` row is re-synced field-for-field; category (`punchType`) is re-derived from the project |
+| Edit an `account.analytic.line` (hours, project, task, customer) | The `work_time` row is re-synced field-for-field; category (`punchType`) is re-derived from the project. The line's `date` is **not** pulled back — `timeStarted` stays shift-derived |
 | Move an `account.analytic.line` to a different `x_studio_shift` | The `work_time` is re-attached to that punch (clearing the link keeps the current punch — never orphaned) |
 | **Create** an `account.analytic.line` with a shift link | Mirrored into a new `work_time` on the linked punch |
 | Rename / archive a `res.partner` | `customer` name / `archived` flag updated |

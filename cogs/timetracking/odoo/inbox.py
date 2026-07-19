@@ -344,9 +344,10 @@ class InboxWorker:
             new_customer = wt["customerID"]
             if isinstance(partner, (list, tuple)):
                 new_customer = await self.cog.resolve_customer(partner[1])
-            # Odoo lines carry only a date; preserve the local time-of-day.
-            time_part = str(wt["timeStarted"])[11:19] or "00:00:00"
-            new_started = f"{work_date} {time_part}"
+            # NB: timeStarted is deliberately *not* reconciled. It's shift-derived
+            # (the punch's start), used only to refresh the view and compute
+            # timeSpent at clock-out -- the Odoo line carries just a date, so
+            # pulling it back would desync the worktime from its own shift.
             # Re-attach to a different shift only when it resolves to a known punch;
             # a cleared/untracked link keeps the current punch (never orphan).
             new_punch = linked_punch if linked_punch is not None else wt["punchID"]
@@ -355,15 +356,14 @@ class InboxWorker:
                 minutes != wt["timeSpent"] or punch_type != wt["punchType"]
                 or (proj_id or None) != (wt["odooProjectId"] or None)
                 or (task_id or None) != (wt["odooTaskId"] or None)
-                or new_customer != wt["customerID"] or new_started != str(wt["timeStarted"])
-                or new_punch != wt["punchID"]
+                or new_customer != wt["customerID"] or new_punch != wt["punchID"]
             )
             if not changed:
                 return False
             await self.db.execute(
                 "UPDATE work_time SET punchID = ?, customerID = ?, punchType = ?, timeSpent = ?, "
-                "timeStarted = ?, odooTaskId = ?, odooProjectId = ? WHERE id = ?",
-                (new_punch, new_customer, punch_type, minutes, new_started, task_id, proj_id, wt["id"]),
+                "odooTaskId = ?, odooProjectId = ? WHERE id = ?",
+                (new_punch, new_customer, punch_type, minutes, task_id, proj_id, wt["id"]),
             )
             await self._refresh_punch_clock(wt["punchID"])
             if new_punch != wt["punchID"]:
@@ -382,11 +382,14 @@ class InboxWorker:
         if linked_punch is None:
             return "retry"  # the parent attendance isn't synced locally yet
         customer_id = await self.cog.resolve_customer(partner[1]) if isinstance(partner, (list, tuple)) else 0
+        # timeStarted is shift-derived: use the parent punch's start; fall back to
+        # the Odoo line's date only if the punch somehow has no start recorded.
+        pstart = await self.db.fetchone("SELECT punchInTime FROM punch_clock WHERE id = ?", (linked_punch,))
+        started = (pstart["punchInTime"] if pstart and pstart["punchInTime"] else f"{work_date} 00:00:00")
         await self.db.execute(
             "INSERT INTO work_time (punchID, customerID, punchType, timeSpent, timeStarted, "
             "odooId, odooTaskId, odooProjectId) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (linked_punch, customer_id, punch_type, minutes,
-             f"{work_date} 00:00:00", odoo_id, task_id, proj_id),
+            (linked_punch, customer_id, punch_type, minutes, started, odoo_id, task_id, proj_id),
         )
         await self._refresh_punch_clock(linked_punch)
         log.info(f"[Inbox] Created local worktime from Odoo analytic.line {odoo_id} on punch {linked_punch}.")
