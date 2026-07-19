@@ -222,31 +222,93 @@ class InboxWorker:
             return True
         return False
 
+    async def _local_employee_id(self, emp_odoo_id) -> int | None:
+        """Map an Odoo hr.employee id to a local employee row (by odooId)."""
+        if not emp_odoo_id:
+            return None
+        row = await self.db.fetchone("SELECT id FROM employee WHERE odooId = ?", (emp_odoo_id,))
+        return row["id"] if row else None
+
+    async def _punch_by_attendance(self, att_odoo_id) -> int | None:
+        """Map an Odoo hr.attendance id to the local punch it represents."""
+        if not att_odoo_id:
+            return None
+        row = await self.db.fetchone("SELECT id FROM punch_clock WHERE odooId = ?", (att_odoo_id,))
+        return row["id"] if row else None
+
+    async def _refresh_punch_clock(self, punch_id):
+        """Re-render the clock of whichever employee owns this punch."""
+        if not punch_id:
+            return
+        row = await self.db.fetchone("SELECT employeeID FROM punch_clock WHERE id = ?", (punch_id,))
+        if row:
+            await self._refresh_employee_clock(row["employeeID"])
+
     async def _reconcile_attendance(self, odoo_id: int) -> bool:
         rec = await self.client.read_record(
             "hr.attendance", odoo_id, ["id", "employee_id", "check_in", "check_out"]
         )
         if rec is None:
             return False
+        new_in = sync.utc_str_to_local_str(rec["check_in"]) if rec.get("check_in") else None
+        new_out = sync.utc_str_to_local_str(rec["check_out"]) if rec.get("check_out") else None
+        emp_field = rec.get("employee_id")
+        emp_odoo = emp_field[0] if isinstance(emp_field, (list, tuple)) else None
+        local_emp = await self._local_employee_id(emp_odoo)
+
         punch = await self.db.fetchone(
             "SELECT id, employeeID, punchInTime, punchOutTime FROM punch_clock WHERE odooId = ?",
             (odoo_id,),
         )
-        if punch is None:
-            # We only reconcile attendances the bot already tracks locally.
-            log.debug(f"[Inbox] No local punch for hr.attendance {odoo_id}; skipping.")
-            return False
 
-        new_in = sync.utc_str_to_local_str(rec["check_in"]) if rec.get("check_in") else None
-        new_out = sync.utc_str_to_local_str(rec["check_out"]) if rec.get("check_out") else None
-        if new_in == punch["punchInTime"] and new_out == punch["punchOutTime"]:
+        if punch is None:
+            # Odoo-authored attendance (an admin built the shift in Odoo): mirror it
+            # as a local punch so the shift -- and any timesheet lines hanging off
+            # it -- become visible in Discord.
+            if local_emp is None:
+                log.debug(f"[Inbox] hr.attendance {odoo_id} employee not linked locally; skipping.")
+                return False
+            if not new_in:
+                return False
+            # Echo guard: if the bot just created this attendance outbound and hasn't
+            # written the odooId back yet, an unlinked local punch already matches
+            # (same employee + check-in). Adopt it instead of duplicating.
+            twin = await self.db.fetchone(
+                "SELECT id FROM punch_clock WHERE employeeID = ? AND punchInTime = ? AND odooId IS NULL",
+                (local_emp, new_in),
+            )
+            if twin is not None:
+                await self.db.execute(
+                    "UPDATE punch_clock SET odooId = ? WHERE id = ?", (odoo_id, twin["id"])
+                )
+                return True
+            await self.db.execute(
+                "INSERT INTO punch_clock (employeeID, punchInTime, punchOutTime, odooId) "
+                "VALUES (?, ?, ?, ?)",
+                (local_emp, new_in, new_out, odoo_id),
+            )
+            await self._refresh_employee_clock(local_emp)
+            log.info(f"[Inbox] Created local punch from Odoo hr.attendance {odoo_id} for employee {local_emp}.")
+            return True
+
+        # Existing punch: reconcile times and a possible employee reassignment.
+        # (The bot never rewrites employee_id in Odoo, so any change here is a real
+        # admin edit; an unlinked target employee is kept as-is rather than lost.)
+        new_emp = local_emp if local_emp is not None else punch["employeeID"]
+        if emp_odoo and local_emp is None:
+            log.warning(f"[Inbox] hr.attendance {odoo_id} reassigned to unlinked Odoo employee {emp_odoo}; keeping current.")
+        if (new_in == punch["punchInTime"] and new_out == punch["punchOutTime"]
+                and new_emp == punch["employeeID"]):
             return False  # already matches (echo of our own write)
 
         await self.db.execute(
-            "UPDATE punch_clock SET punchInTime = ?, punchOutTime = ? WHERE id = ?",
-            (new_in, new_out, punch["id"]),
+            "UPDATE punch_clock SET employeeID = ?, punchInTime = ?, punchOutTime = ? WHERE id = ?",
+            (new_emp, new_in, new_out, punch["id"]),
         )
         await self._refresh_employee_clock(punch["employeeID"])
+        if new_emp != punch["employeeID"]:
+            await self._refresh_employee_clock(new_emp)
+            log.info(f"[Inbox] hr.attendance {odoo_id} reassigned employee {punch['employeeID']} -> {new_emp}.")
         return True
 
     async def _reconcile_analytic_line(self, odoo_id: int):
@@ -255,44 +317,79 @@ class InboxWorker:
         if rec is None:
             return False
         minutes = _quarter_hour_minutes(rec.get("unit_amount"))
+        proj = rec.get("project_id")
+        proj_id = proj[0] if isinstance(proj, (list, tuple)) else None
+        task = rec.get("task_id")
+        task_id = task[0] if isinstance(task, (list, tuple)) else None
+        partner = rec.get("partner_id")
+        punch_type = _punch_type_for_project(proj_id)
+        work_date = str(rec.get("date") or sync.now_local_str())[:10]
+
+        # Resolve which punch this line is attached to via the shift link, if any.
+        shift = rec.get(shift_field()) if self.client.shift_field_available else None
+        att_odoo = (shift[0] if isinstance(shift, (list, tuple)) else shift) if shift else None
+        linked_punch = await self._punch_by_attendance(att_odoo)
 
         wt = await self.db.fetchone(
-            "SELECT id, timeSpent FROM work_time WHERE odooId = ?", (odoo_id,)
+            "SELECT id, punchID, customerID, punchType, timeSpent, timeStarted, odooTaskId, odooProjectId "
+            "FROM work_time WHERE odooId = ?",
+            (odoo_id,),
         )
-        if wt is not None:  # existing -> update hours (idempotent)
-            if minutes == wt["timeSpent"]:
+
+        if wt is not None:
+            # Existing line -> re-sync every field an admin could have changed in
+            # Odoo (hours, project/category, task, customer, date, and the shift it
+            # belongs to). Attribution is Discord-first, but admins do correct these
+            # directly in Odoo, so we mirror them back rather than let them drift.
+            new_customer = wt["customerID"]
+            if isinstance(partner, (list, tuple)):
+                new_customer = await self.cog.resolve_customer(partner[1])
+            # Odoo lines carry only a date; preserve the local time-of-day.
+            time_part = str(wt["timeStarted"])[11:19] or "00:00:00"
+            new_started = f"{work_date} {time_part}"
+            # Re-attach to a different shift only when it resolves to a known punch;
+            # a cleared/untracked link keeps the current punch (never orphan).
+            new_punch = linked_punch if linked_punch is not None else wt["punchID"]
+
+            changed = (
+                minutes != wt["timeSpent"] or punch_type != wt["punchType"]
+                or (proj_id or None) != (wt["odooProjectId"] or None)
+                or (task_id or None) != (wt["odooTaskId"] or None)
+                or new_customer != wt["customerID"] or new_started != str(wt["timeStarted"])
+                or new_punch != wt["punchID"]
+            )
+            if not changed:
                 return False
-            await self.db.execute("UPDATE work_time SET timeSpent = ? WHERE id = ?", (minutes, wt["id"]))
+            await self.db.execute(
+                "UPDATE work_time SET punchID = ?, customerID = ?, punchType = ?, timeSpent = ?, "
+                "timeStarted = ?, odooTaskId = ?, odooProjectId = ? WHERE id = ?",
+                (new_punch, new_customer, punch_type, minutes, new_started, task_id, proj_id, wt["id"]),
+            )
+            await self._refresh_punch_clock(wt["punchID"])
+            if new_punch != wt["punchID"]:
+                await self._refresh_punch_clock(new_punch)
+                log.info(f"[Inbox] analytic.line {odoo_id} moved punch {wt['punchID']} -> {new_punch}.")
+            log.info(f"[Inbox] Updated local worktime from Odoo analytic.line {odoo_id}.")
             return True
 
         # No local worktime yet -> create it from the shift link (Odoo-authored line).
         if not self.client.shift_field_available:
             log.debug(f"[Inbox] Shift field unavailable; can't attribute analytic.line {odoo_id}.")
             return False
-        shift = rec.get(shift_field())
         if not shift:
             log.debug(f"[Inbox] analytic.line {odoo_id} has no shift link; skipping.")
             return False
-        att_odoo = shift[0] if isinstance(shift, (list, tuple)) else shift
-        punch = await self.db.fetchone("SELECT id FROM punch_clock WHERE odooId = ?", (att_odoo,))
-        if punch is None:
+        if linked_punch is None:
             return "retry"  # the parent attendance isn't synced locally yet
-
-        proj = rec.get("project_id")
-        proj_id = proj[0] if isinstance(proj, (list, tuple)) else None
-        task = rec.get("task_id")
-        task_id = task[0] if isinstance(task, (list, tuple)) else None
-        partner = rec.get("partner_id")
         customer_id = await self.cog.resolve_customer(partner[1]) if isinstance(partner, (list, tuple)) else 0
-        work_date = str(rec.get("date") or sync.now_local_str())[:10]
-
         await self.db.execute(
             "INSERT INTO work_time (punchID, customerID, punchType, timeSpent, timeStarted, "
             "odooId, odooTaskId, odooProjectId) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (punch["id"], customer_id, _punch_type_for_project(proj_id), minutes,
+            (linked_punch, customer_id, punch_type, minutes,
              f"{work_date} 00:00:00", odoo_id, task_id, proj_id),
         )
-        log.info(f"[Inbox] Created local worktime from Odoo analytic.line {odoo_id} on punch {punch['id']}.")
+        await self._refresh_punch_clock(linked_punch)
+        log.info(f"[Inbox] Created local worktime from Odoo analytic.line {odoo_id} on punch {linked_punch}.")
         return True
 
     async def _refresh_employee_clock(self, employee_id: int):

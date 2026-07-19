@@ -122,9 +122,16 @@ don't fire needless webhooks.
 
 | Model | Endpoint (`…/webhook/odoo/…`) | Watched fields (all the bot reads) | Used for |
 | --- | --- | --- | --- |
-| `hr.attendance` | `hr.attendance` | `check_in`, `check_out`, `employee_id` | Punch times → `punch_clock` |
-| `account.analytic.line` | `account.analytic.line` | `unit_amount`, **`x_studio_shift`** | Worktime hours → `work_time` (the shift link attributes Odoo-created timesheets to a punch) |
+| `hr.attendance` | `hr.attendance` | `check_in`, `check_out`, **`employee_id`** | Punch times → `punch_clock`; a create mirrors an Odoo-built shift into a local punch, and `employee_id` re-assigns it |
+| `account.analytic.line` | `account.analytic.line` | `unit_amount`, **`project_id`**, **`task_id`**, **`partner_id`**, **`date`**, **`x_studio_shift`** | Worktime → `work_time`. Every one of these round-trips: hours, category (from project), task, customer, date, and the shift/punch it belongs to |
 | `res.partner` | `res.partner` | `name` (drives `display_name`), **`active`** | Customer name → `customer`; `active` toggles local archive |
+
+> **These watched-field lists exist because the bot now mirrors admin edits made
+> *in Odoo* back to Discord** (see [Inbound reconcile](#what-round-trips-from-odoo)
+> below). If a field the bot mirrors isn't in the rule's Watched Fields, an admin
+> editing it in Odoo won't fire a webhook and the two systems drift — which is the
+> whole failure mode these lists prevent. Add a field here only alongside code that
+> actually reads it; a watched field with no matching reconcile just wastes fetches.
 
 **Recommended trigger: “On Create and edit”, with Watched Fields set to the
 columns above** — fires on creation and when a watched field is edited, nothing
@@ -165,6 +172,29 @@ harmless "already gone locally" no-op — but for `hr.attendance` /
 timecard channel before the bot works out it doesn't apply. Matching the Domain
 keeps delete approvals scoped to real timesheets/attendances and avoids that
 noise.
+
+### What round-trips from Odoo
+
+The bot doesn't just import new records — it mirrors **edits an admin makes in
+Odoo** back into SQLite and re-renders the affected Discord clock. This matters
+when more than one person touches Odoo: a well-meaning "let me just fix it here"
+edit stays in sync instead of silently diverging. What's reconciled today:
+
+| Odoo change | Effect in Discord |
+| --- | --- |
+| Edit `hr.attendance` check-in/check-out | Punch times updated, clock re-rendered |
+| Re-assign `hr.attendance` to another employee | Punch moves to that employee (old + new clocks re-render). If the new employee isn't linked locally, the punch is left as-is and a warning is logged |
+| **Create** an `hr.attendance` from scratch in Odoo | Mirrored into a new local punch (employee resolved via its `odooId`); an in-flight punch the bot just created is *adopted*, not duplicated |
+| Edit an `account.analytic.line` (hours, project, task, customer, date) | The `work_time` row is re-synced field-for-field; category (`punchType`) is re-derived from the project |
+| Move an `account.analytic.line` to a different `x_studio_shift` | The `work_time` is re-attached to that punch (clearing the link keeps the current punch — never orphaned) |
+| **Create** an `account.analytic.line` with a shift link | Mirrored into a new `work_time` on the linked punch |
+| Rename / archive a `res.partner` | `customer` name / `archived` flag updated |
+
+Attribution is still **Discord-first** — the normal flow is that work is assigned
+on the clock and pushed *out* to Odoo. This inbound mirroring is the safety net
+for the cases where a change originates in Odoo instead. Because every reconcile
+re-fetches the authoritative record and is idempotent, a redundant webhook is a
+harmless no-op.
 
 ### Deletions & the shift field (requires Odoo Studio)
 
