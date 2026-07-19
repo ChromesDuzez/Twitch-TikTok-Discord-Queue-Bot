@@ -126,7 +126,7 @@ don't fire needless webhooks.
 | `hr.attendance` | `hr.attendance` | `check_in`, `check_out`, **`employee_id`** | Punch times → `punch_clock`; a create mirrors an Odoo-built shift into a local punch, and `employee_id` re-assigns it |
 | `account.analytic.line` | `account.analytic.line` | `unit_amount`, **`project_id`**, **`task_id`**, **`partner_id`**, **`x_studio_shift`** | Worktime → `work_time`. Each round-trips: hours, category (from project), task, customer, and the shift/punch it belongs to. **Not `date`** — the worktime's timestamp is derived from its shift, so it's never watched or pulled back |
 | `res.partner` | `res.partner` | `name` (the base **Name** field, *not* the computed "Complete Name" — it drives `display_name`), **`active`**, and `customer_rank` (catches a contact promoted to a customer) | Customer name → `customer`; `active` toggles local archive |
-| `hr.employee` | `hr.employee` | **`active`** | Archiving a linked employee in Odoo removes their Discord clock so they can't punch in (history kept); unarchiving clears the flag. No Domain needed — only employees linked via `odooId` are affected |
+| `hr.employee` | `hr.employee` | **`active`**, and (for the demographic pull) `name`, `mobile_phone`, `private_street`, `private_street2`, `private_city`, `private_state_id`, `private_zip` | `active` archives/reactivates the linked employee (removes/keeps their Discord clock, history kept); the rest are pulled **one-way Odoo → bot** to keep the weekly report's name/phone/address current. No Domain needed — only employees linked via `odooId` are affected |
 
 > **These watched-field lists exist because the bot now mirrors admin edits made
 > *in Odoo* back to Discord** (see [Inbound reconcile](#what-round-trips-from-odoo)
@@ -192,12 +192,24 @@ edit stays in sync instead of silently diverging. What's reconciled today:
 | **Create** an `account.analytic.line` with a shift link | Mirrored into a new `work_time` on the linked punch |
 | Rename / archive a `res.partner` | `customer` name / `archived` flag updated |
 | Archive / unarchive an `hr.employee` (e.g. a temp worker who didn't work out) | Linked employee is archived (clock removed → can't punch in, history kept) or reactivated |
+| Edit an `hr.employee`'s name / phone / address | Pulled one-way into the local employee row so the weekly report stays current (empty Odoo values never blank populated local data) |
 
 Attribution is still **Discord-first** — the normal flow is that work is assigned
 on the clock and pushed *out* to Odoo. This inbound mirroring is the safety net
 for the cases where a change originates in Odoo instead. Because every reconcile
 re-fetches the authoritative record and is idempotent, a redundant webhook is a
-harmless no-op.
+harmless no-op. (Employee **name/phone/address** are the exception to
+Discord-first: HR owns those, so they're pulled **one-way from Odoo** — the bot
+never pushes them back.)
+
+> **Employee field-name overrides (optional).** The `hr.employee` demographic pull
+> defaults to the standard Odoo 19 fields — `mobile_phone`, `private_street`,
+> `private_street2`, `private_city`, `private_state_id`, `private_zip` (`name` is
+> always `name`). If your Odoo uses different field names, override them without a
+> code change via env vars: `ODOO_EMPLOYEE_PHONE_FIELD`,
+> `ODOO_EMPLOYEE_STREET_FIELD`, `ODOO_EMPLOYEE_STREET2_FIELD`,
+> `ODOO_EMPLOYEE_CITY_FIELD`, `ODOO_EMPLOYEE_STATE_FIELD`, `ODOO_EMPLOYEE_ZIP_FIELD`
+> — and set the automation's Watched Fields to match whatever you point them at.
 
 ### Deletions & the shift field (requires Odoo Studio)
 

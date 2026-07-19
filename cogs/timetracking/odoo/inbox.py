@@ -57,6 +57,21 @@ def _quarter_hour_minutes(hours) -> int:
     return max(0, min(1440, int(round((hours or 0) * 4) / 4 * 60)))
 
 
+def _employee_field_map() -> dict:
+    """Local employee column -> Odoo hr.employee field name. The address/phone
+    fields vary by Odoo version/config, so they're env-overridable; defaults are
+    the standard Odoo 19 private-address fields. `addressState` is a Many2one
+    (res.country.state) whose display name we store."""
+    return {
+        "phoneNumber":  os.getenv("ODOO_EMPLOYEE_PHONE_FIELD", "mobile_phone"),
+        "addressLine1": os.getenv("ODOO_EMPLOYEE_STREET_FIELD", "private_street"),
+        "addressLine2": os.getenv("ODOO_EMPLOYEE_STREET2_FIELD", "private_street2"),
+        "addressCity":  os.getenv("ODOO_EMPLOYEE_CITY_FIELD", "private_city"),
+        "addressState": os.getenv("ODOO_EMPLOYEE_STATE_FIELD", "private_state_id"),
+        "addressZip":   os.getenv("ODOO_EMPLOYEE_ZIP_FIELD", "private_zip"),
+    }
+
+
 async def enqueue_inbound(db: Database, model: str, odoo_id: int,
                           action: str | None = None, write_uid: int | None = None):
     """Queue an inbound change. De-dupes against any pending row for the same
@@ -247,22 +262,53 @@ class InboxWorker:
             await self._refresh_employee_clock(row["employeeID"])
 
     async def _reconcile_employee(self, odoo_id: int) -> bool:
-        """Mirror an Odoo hr.employee archive/unarchive onto the local employee.
+        """Mirror an Odoo hr.employee onto the local employee (one-way; Odoo is the
+        system of record for employee demographics).
 
-        Archiving a temp worker in Odoo (active -> False) removes their Discord
-        clock so they can't punch in; unarchiving clears the flag. History is kept
-        either way. Only employees already linked via ``employee.odooId`` are
-        affected; unknown Odoo employees are ignored.
+        Handles two things: archive/unarchive (a temp worker terminated in Odoo
+        loses their Discord clock, history kept), and a **one-way pull of name /
+        phone / address** so the weekly report's employee header stays current.
+        Only employees linked via ``employee.odooId`` are affected; unknown Odoo
+        employees are ignored. Empty Odoo values never blank out a populated local
+        value (guards against an incomplete HR record wiping good data).
         """
-        rec = await self.client.read_record("hr.employee", odoo_id, ["id", "active"])
+        fmap = _employee_field_map()
+        fields = list(dict.fromkeys(["id", "active", "name", *fmap.values()]))
+        rec = await self.client.read_record("hr.employee", odoo_id, fields)
         if rec is None:
             return False  # deleted in Odoo; employees are archived, not deleted
-        emp = await self.db.fetchone("SELECT id FROM employee WHERE odooId = ?", (odoo_id,))
+        emp = await self.db.fetchone(
+            "SELECT id, name, phoneNumber, addressLine1, addressLine2, addressCity, "
+            "addressState, addressZip FROM employee WHERE odooId = ?",
+            (odoo_id,),
+        )
         if emp is None:
             log.debug(f"[Inbox] hr.employee {odoo_id} not linked locally; skipping.")
             return False
-        archived = not rec.get("active", True)
-        return await self.cog.set_employee_archived(emp["id"], archived)
+
+        # 1. archive / reactivate (this removes/keeps the clock).
+        changed = await self.cog.set_employee_archived(emp["id"], not rec.get("active", True))
+
+        # 2. one-way demographic pull. A Many2one (state) comes back as [id, name];
+        # everything else is scalar. Only overwrite when Odoo has a value.
+        def _val(raw):
+            if isinstance(raw, (list, tuple)):
+                return str(raw[1]).strip() if len(raw) > 1 else ""
+            return "" if raw in (False, None) else str(raw).strip()
+
+        incoming = {"name": _val(rec.get("name"))}
+        incoming.update({col: _val(rec.get(src)) for col, src in fmap.items()})
+        updates = {c: v for c, v in incoming.items() if v and v != (emp[c] or "")}
+        if updates:
+            sets = ", ".join(f"{c} = ?" for c in updates)  # keys are internal, not user input
+            await self.db.execute(
+                f"UPDATE employee SET {sets} WHERE id = ?", (*updates.values(), emp["id"])
+            )
+            log.info(f"[Inbox] Synced employee {emp['id']} from Odoo: {', '.join(updates)}.")
+            if "name" in updates:
+                await self._refresh_employee_clock(emp["id"])  # name shows on the clock
+            changed = True
+        return changed
 
     async def _reconcile_attendance(self, odoo_id: int) -> bool:
         rec = await self.client.read_record(
