@@ -124,7 +124,7 @@ don't fire needless webhooks.
 | --- | --- | --- | --- |
 | `hr.attendance` | `hr.attendance` | `check_in`, `check_out`, **`employee_id`** | Punch times → `punch_clock`; a create mirrors an Odoo-built shift into a local punch, and `employee_id` re-assigns it |
 | `account.analytic.line` | `account.analytic.line` | `unit_amount`, **`project_id`**, **`task_id`**, **`partner_id`**, **`x_studio_shift`** | Worktime → `work_time`. Each round-trips: hours, category (from project), task, customer, and the shift/punch it belongs to. **Not `date`** — the worktime's timestamp is derived from its shift, so it's never watched or pulled back |
-| `res.partner` | `res.partner` | `name` (the base **Name** field, *not* the computed "Complete Name" — it drives `display_name`), **`active`** | Customer name → `customer`; `active` toggles local archive |
+| `res.partner` | `res.partner` | `name` (the base **Name** field, *not* the computed "Complete Name" — it drives `display_name`), **`active`**, and `customer_rank` (catches a contact promoted to a customer) | Customer name → `customer`; `active` toggles local archive |
 
 > **These watched-field lists exist because the bot now mirrors admin edits made
 > *in Odoo* back to Discord** (see [Inbound reconcile](#what-round-trips-from-odoo)
@@ -153,7 +153,7 @@ form), and apply the **same Domain to that model's create/edit rule and its
 | Model | Domain (what to match) | Domain expression | Why it matters |
 | --- | --- | --- | --- |
 | `account.analytic.line` | Project **is set**, Journal Item **not set**, Financial Account **not set** | `[("project_id", "!=", False), ("move_line_id", "=", False), ("general_account_id", "=", False)]` | `account.analytic.line` backs timesheets **and** accounting cost/revenue postings, expenses, and other analytic entries. Only a genuine project **timesheet** has a project with no journal-item / financial-account linkage. Without this filter, every accounting posting fires the webhook; the bot pulls it, finds no `x_studio_shift` link, and skips it — many pointless round-trips. |
-| `res.partner` | Is a **customer** | `[("customer_rank", ">", 0)]` | `res.partner` holds contacts, vendors, companies, and portal users — the vast majority of which are not customers you clock work against. `customer_rank > 0` is Odoo's standard "this partner is a customer" flag and cuts the firing set down to just the records that map to a local `customer` row. |
+| `res.partner` | Is a **customer** — put this on **Apply on** (not Before Update Domain) and tick **Include archived** | `[("customer_rank", ">", 0)]` | `res.partner` holds contacts, vendors, companies, and portal users — the vast majority of which are not customers you clock work against. `customer_rank > 0` is Odoo's standard "this partner is a customer" flag and cuts the firing set down to just the records that map to a local `customer` row. It must sit on **Apply on** so it also filters *creates*; **Include archived** lets an archive (`active` → False) still match and fire the webhook. |
 | `hr.attendance` | *(none required)* | `[]` | `hr.attendance` is a dedicated model — every record is a punch the bot may care about, so no Domain is needed. In a multi-company / multi-department setup you *may* narrow it, e.g. `[("employee_id.department_id", "=", <dept id>)]`. |
 
 **About the analytic-line field names.** In the Domain editor the three leaves
