@@ -77,9 +77,15 @@ class SyncWorker:
             self._task = None
 
     async def _loop(self):
+        probe = 0
         while True:
             try:
                 if self.client.loaded:
+                    # Re-probe the Studio shift field periodically (self-heals if
+                    # it's added later); gates deletion support. ~every 10th pass.
+                    if probe % 10 == 0:
+                        await self.client.check_shift_field()
+                    probe += 1
                     await self.drain()
             except asyncio.CancelledError:
                 raise
@@ -96,7 +102,8 @@ class SyncWorker:
 
     async def _process(self, row):
         try:
-            handled = await self._dispatch(row["entity_type"], row["entity_id"], row["op"])
+            payload = json.loads(row["payload"] or "{}")
+            handled = await self._dispatch(row["entity_type"], row["entity_id"], row["op"], payload)
             if handled == "retry":
                 return  # dependency not ready yet; leave pending, try next pass
             status = "done" if handled else "skipped"
@@ -112,7 +119,7 @@ class SyncWorker:
             )
             log.warning(f"[Sync] Outbox #{row['id']} ({row['entity_type']}/{row['op']}) error: {e}")
 
-    async def _dispatch(self, entity_type: str, entity_id: int, op: str):
+    async def _dispatch(self, entity_type: str, entity_id: int, op: str, payload: dict):
         """Return True (done), False (skip), or 'retry' (dependency pending)."""
         if entity_type == "customer" and op == "create":
             return await self._sync_customer(entity_id)
@@ -124,8 +131,61 @@ class SyncWorker:
             return await self._sync_punch_edit(entity_id)
         if entity_type == "worktime" and op == "create":
             return await self._sync_worktime(entity_id)
+        # deletions (Discord -> Odoo): odoo id is carried in the payload because
+        # the local row is already gone by the time this drains.
+        if entity_type in ("punch", "worktime") and op == "delete":
+            return await self._delete_in_odoo(entity_type, payload.get("odoo_id"))
+        # restores (reject an Odoo-side delete; Discord wins): re-create in Odoo.
+        if entity_type == "punch" and op == "restore":
+            return await self._restore_punch(entity_id)
+        if entity_type == "worktime" and op == "restore":
+            return await self._restore_worktime(entity_id)
         log.warning(f"[Sync] Unknown outbox job: {entity_type}/{op}")
         return False
+
+    # ---- deletions (Discord -> Odoo) --------------------------------------
+
+    async def _delete_in_odoo(self, entity_type: str, odoo_id):
+        """Unlink an hr.attendance (punch) or account.analytic.line (worktime)."""
+        if not odoo_id:
+            return True  # nothing was synced to Odoo; nothing to delete
+        model = "hr.attendance" if entity_type == "punch" else "account.analytic.line"
+        await self.client.unlink(model, int(odoo_id))
+        log.info(f"[Sync] Deleted {model} {odoo_id} in Odoo.")
+        return True
+
+    # ---- restores (Odoo-side delete rejected; Discord is truth) -----------
+
+    async def _restore_punch(self, punch_id: int):
+        """Re-create a locally-still-present punch's hr.attendance in Odoo."""
+        punch = await self.db.fetchone(
+            "SELECT employeeID, punchInTime, punchOutTime FROM punch_clock WHERE id = ?", (punch_id,)
+        )
+        if punch is None or not punch["punchInTime"]:
+            return True
+        emp_odoo = await self._employee_odoo_id(punch["employeeID"])
+        if not emp_odoo:
+            return "retry"
+        att_id = await self.client.attendance_create(emp_odoo, local_str_to_utc_str(punch["punchInTime"]))
+        if not att_id:
+            return "retry"
+        await self.db.execute("UPDATE punch_clock SET odooId = ? WHERE id = ?", (att_id, punch_id))
+        if punch["punchOutTime"]:
+            await self.client.attendance_write(att_id, check_out_utc=local_str_to_utc_str(punch["punchOutTime"]))
+        # Re-create the worktime lines under the restored attendance.
+        for wt in await self.db.fetchall(
+            "SELECT id FROM work_time WHERE punchID = ? AND timeSpent > 0", (punch_id,)
+        ):
+            await self.db.execute("UPDATE work_time SET odooId = NULL WHERE id = ?", (wt["id"],))
+            await enqueue(self.db, "worktime", wt["id"], "restore")
+        log.info(f"[Sync] Restored punch {punch_id} as hr.attendance {att_id} in Odoo.")
+        return True
+
+    async def _restore_worktime(self, worktime_id: int):
+        """Re-create a locally-still-present worktime's analytic line in Odoo."""
+        # Clearing the stale odooId lets the normal create path re-post it.
+        await self.db.execute("UPDATE work_time SET odooId = NULL WHERE id = ?", (worktime_id,))
+        return await self._sync_worktime(worktime_id)
 
     # ---- handlers ----------------------------------------------------------
 
@@ -217,11 +277,14 @@ class SyncWorker:
             return True  # still open / zero hours -- nothing to post yet
 
         punch = await self.db.fetchone(
-            "SELECT employeeID FROM punch_clock WHERE id = ?", (wt["punchID"],)
+            "SELECT employeeID, odooId FROM punch_clock WHERE id = ?", (wt["punchID"],)
         )
         emp_odoo = await self._employee_odoo_id(punch["employeeID"]) if punch else None
         if not emp_odoo:
             return "retry"  # employee not linked to Odoo yet
+        # Wait for the parent attendance to sync so we can set the shift link.
+        if punch["odooId"] is None:
+            return "retry"
 
         hours = wt["timeSpent"] / 60
         work_date = str(wt["timeStarted"])[:10]
@@ -233,6 +296,7 @@ class SyncWorker:
             description=description,
             hours=hours,
             task_id=wt["odooTaskId"],
+            shift_attendance_id=punch["odooId"],
         )
         if line_id:
             await self.db.execute("UPDATE work_time SET odooId = ? WHERE id = ?", (line_id, worktime_id))

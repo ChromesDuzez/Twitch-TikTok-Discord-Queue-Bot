@@ -1,4 +1,4 @@
--- Reference schema for the timetracking database (schema version 4).
+-- Reference schema for the timetracking database (schema version 2).
 -- The bot creates/migrates this automatically at startup via cogs/timetracking/db.py;
 -- this file is documentation only.
 
@@ -49,10 +49,13 @@ CREATE TABLE punch_clock (
     FOREIGN KEY (employeeID) REFERENCES employee(id)
 );
 
+-- archived customers are hidden from the worktime search but kept for reports
+-- (set when a customer is deleted/archived in Odoo but still referenced locally).
 CREATE TABLE customer (
     id          INTEGER          PRIMARY KEY AUTOINCREMENT,
     name        TEXT             NOT NULL,
-    odooId      UNSIGNED BIG INT NULL DEFAULT NULL
+    odooId      UNSIGNED BIG INT NULL DEFAULT NULL,
+    archived    BOOLEAN          NOT NULL DEFAULT 0
 );
 
 -- odooTaskId / odooProjectId link a worktime punch to an Odoo work item:
@@ -112,5 +115,19 @@ CREATE TABLE odoo_inbox (
     status      TEXT    NOT NULL DEFAULT 'pending',  -- pending|done|failed
     attempts    INTEGER NOT NULL DEFAULT 0,
     last_error  TEXT    NULL,
+    created_at  DATETIME NOT NULL
+);
+
+-- Admin approvals awaiting a decision (e.g. an Odoo-side deletion the admin must
+-- approve). Persisted so the Approve/Reject view survives a bot restart.
+CREATE TABLE pending_action (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    action      TEXT    NOT NULL,      -- e.g. 'delete'
+    model       TEXT    NOT NULL,      -- Odoo model the action concerns
+    odoo_id     INTEGER NULL,          -- Odoo record id
+    local_kind  TEXT    NULL,          -- 'punch' | 'worktime'
+    local_id    INTEGER NULL,          -- local row id
+    channel_id  UNSIGNED BIG INT NULL, -- admin approval message location
+    message_id  UNSIGNED BIG INT NULL,
     created_at  DATETIME NOT NULL
 );

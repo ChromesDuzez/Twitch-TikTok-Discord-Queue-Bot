@@ -27,7 +27,7 @@ from .reports import (
     get_day_of_week,
     is_saturday,
 )
-from .views import ApprovePunch, render_clock
+from .views import ApprovePunch, DeleteApproval, render_clock
 
 
 class TimeTracking(commands.Cog):
@@ -77,6 +77,49 @@ class TimeTracking(commands.Cog):
         """Entry point for the webhook: queue an inbound Odoo change to reconcile."""
         await self._ensure_db()
         await inbox.enqueue_inbound(self.db, model, odoo_id, action, write_uid)
+
+    async def enqueue_inbound_delete(self, model: str, odoo_id: int):
+        """Entry point for the webhook: queue an Odoo-side deletion."""
+        await self._ensure_db()
+        await inbox.enqueue_inbound_delete(self.db, model, odoo_id)
+
+    async def post_delete_approval(self, model: str, odoo_id: int, local_kind: str, local_id: int):
+        """Post an admin approval for an Odoo-side deletion (Discord is truth)."""
+        db = await self._ensure_db()
+        # Build a human summary of what would be removed.
+        if local_kind == "punch":
+            p = await db.fetchone(
+                "SELECT e.name, pc.punchInTime, pc.punchOutTime FROM punch_clock pc "
+                "JOIN employee e ON pc.employeeID = e.id WHERE pc.id = ?", (local_id,))
+            n = (await db.fetchone("SELECT count(*) c FROM work_time WHERE punchID = ?", (local_id,)))["c"]
+            who = p["name"] if p else str(local_id)
+            summary = (f"🗑️ Odoo deleted a **shift** for **{who}** "
+                       f"({p['punchInTime'] if p else '?'} → {p['punchOutTime'] if p and p['punchOutTime'] else 'open'}, "
+                       f"{n} worktime). Approve deleting it here, or reject to restore it in Odoo.")
+        else:
+            w = await db.fetchone(
+                "SELECT wt.punchType, wt.timeSpent, c.name, e.name AS emp FROM work_time wt "
+                "JOIN punch_clock pc ON wt.punchID = pc.id JOIN employee e ON pc.employeeID = e.id "
+                "LEFT JOIN customer c ON wt.customerID = c.id WHERE wt.id = ?", (local_id,))
+            summary = (f"🗑️ Odoo deleted a **timesheet** on **{w['emp'] if w else '?'}**'s shift "
+                       f"({w['punchType'] if w else '?'}, {(w['timeSpent'] or 0)/60 if w else 0}h, "
+                       f"{w['name'] if w and w['name'] else 'n/a'}). Approve removing it here, or reject to restore it in Odoo.")
+
+        pending_id = await db.execute(
+            "INSERT INTO pending_action (action, model, odoo_id, local_kind, local_id, created_at) "
+            "VALUES ('delete', ?, ?, ?, ?, ?)",
+            (model, odoo_id, local_kind, local_id, sync.now_local_str()),
+        )
+        channel = self.bot.get_channel(int(os.getenv("TIMECARD_ADMIN_CHANNEL_ID")))
+        view = DeleteApproval(self, pending_id, model, odoo_id, local_kind, local_id)
+        msg = await channel.send(content=summary, view=view)
+        await db.execute(
+            "UPDATE pending_action SET channel_id = ?, message_id = ? WHERE id = ?",
+            (msg.channel.id, msg.id, pending_id),
+        )
+
+    async def clear_pending_action(self, pending_id: int):
+        await self.db.execute("DELETE FROM pending_action WHERE id = ?", (pending_id,))
 
     async def obtain_message(self, channel_id: int, message_id: int) -> discord.Message:
         channel = self.bot.get_channel(channel_id) or await self.bot.fetch_channel(channel_id)
@@ -168,6 +211,19 @@ class TimeTracking(commands.Cog):
             except Exception as e:  # noqa: BLE001
                 log.warning(f"[Approval] Failed to restore approval for punch {r['id']}: {e}")
         log.info("[Approval] Finished re-initializing approval message views.")
+
+        # Re-attach pending delete-approval views (Odoo-side deletions awaiting a decision).
+        for r in await db.fetchall(
+            "SELECT * FROM pending_action WHERE action = 'delete' "
+            "AND channel_id IS NOT NULL AND message_id IS NOT NULL"
+        ):
+            try:
+                msg = await self.obtain_message(r["channel_id"], r["message_id"])
+                await msg.edit(view=DeleteApproval.from_row(self, r))
+            except discord.NotFound:
+                await db.execute("DELETE FROM pending_action WHERE id = ?", (r["id"],))
+            except Exception as e:  # noqa: BLE001
+                log.warning(f"[Delete] Failed to restore delete-approval {r['id']}: {e}")
 
     # ---- customer commands -------------------------------------------------
 

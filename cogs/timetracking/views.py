@@ -16,7 +16,7 @@ import discord
 
 from botlog import timecard_log
 from .db import Database
-from .modals import CustomerInputModal, CustomerSelectMenu, EditPunchTimeModal, GetTimeSpent
+from .modals import Confirm, CustomerInputModal, CustomerSelectMenu, EditPunchTimeModal, GetTimeSpent
 from .perms import CLOCK_ROLES, has_perms
 from .odoo import sync
 from .state import ClockState, _as_bool, load_state
@@ -341,7 +341,8 @@ class StartWorkButton(discord.ui.Button):
 
     async def _search_customers(self, interaction: discord.Interaction, name: str):
         rows = await self.view.db.fetchall(
-            "SELECT id, name FROM customer WHERE name LIKE ? ORDER BY name LIMIT 25",
+            "SELECT id, name FROM customer WHERE name LIKE ? "
+            "AND (archived IS NULL OR archived = 0) ORDER BY name LIMIT 25",
             (f"%{name}%",),
         )
         if not rows:
@@ -510,6 +511,8 @@ class ApprovePunch(discord.ui.View):
         if not out_approval:
             self.add_item(ApproveButton("clock-out"))
             self.add_item(EditPunchButton("clock-out"))
+        # Removing an accidental shift entirely (admin-only).
+        self.add_item(DeleteShiftButton())
 
     @classmethod
     async def create(cls, cog, punch_id: int, message: discord.Message):
@@ -628,3 +631,167 @@ async def _refresh_clock_for_employee(cog, employee_id: int):
         await render_clock(cog, msg, employee_id)
     except Exception as e:  # noqa: BLE001
         timecard_log.warning(f"[Punch] Could not refresh clock for employee {employee_id}: {e}")
+
+
+# ---- deletion (accidental shift + Odoo-side delete approvals) ---------------
+
+async def delete_punch_cascade(cog, punch_id: int, to_odoo: bool = True) -> int | None:
+    """Delete a punch and its worktime, clean up its approval message, and
+    (optionally) cascade the deletes to Odoo. Returns the employee id so the
+    caller can refresh their clock."""
+    db = cog.db
+    punch = await db.fetchone(
+        "SELECT odooId, employeeID, checkChannelId, checkMessageId FROM punch_clock WHERE id = ?",
+        (punch_id,),
+    )
+    if punch is None:
+        return None
+    worktimes = await db.fetchall("SELECT id, odooId FROM work_time WHERE punchID = ?", (punch_id,))
+
+    # Cancel any still-pending (non-delete) Odoo pushes for these rows.
+    await db.execute(
+        "UPDATE odoo_outbox SET status = 'skipped' WHERE status = 'pending' AND op != 'delete' "
+        "AND entity_type = 'punch' AND entity_id = ?", (punch_id,))
+    for wt in worktimes:
+        await db.execute(
+            "UPDATE odoo_outbox SET status = 'skipped' WHERE status = 'pending' AND op != 'delete' "
+            "AND entity_type = 'worktime' AND entity_id = ?", (wt["id"],))
+
+    # Cascade deletes to Odoo (lines before attendance; FIFO guarantees order).
+    if to_odoo:
+        for wt in worktimes:
+            if wt["odooId"]:
+                await sync.enqueue(db, "worktime", wt["id"], "delete", {"odoo_id": wt["odooId"]})
+        if punch["odooId"]:
+            await sync.enqueue(db, "punch", punch_id, "delete", {"odoo_id": punch["odooId"]})
+
+    # Delete local rows, children first (FK-safe).
+    await db.execute("DELETE FROM work_time WHERE punchID = ?", (punch_id,))
+    await db.execute("DELETE FROM punch_clock WHERE id = ?", (punch_id,))
+
+    # Remove the approval message so no orphaned buttons linger.
+    if punch["checkChannelId"] and punch["checkMessageId"]:
+        try:
+            msg = await cog.obtain_message(punch["checkChannelId"], punch["checkMessageId"])
+            await msg.delete()
+        except Exception:  # noqa: BLE001
+            pass
+    return punch["employeeID"]
+
+
+async def delete_worktime_local(cog, worktime_id: int, to_odoo: bool = True) -> int | None:
+    """Delete a single worktime row (optionally cascading to Odoo). Returns the
+    employee id for a clock refresh."""
+    db = cog.db
+    wt = await db.fetchone("SELECT odooId, punchID FROM work_time WHERE id = ?", (worktime_id,))
+    if wt is None:
+        return None
+    await db.execute(
+        "UPDATE odoo_outbox SET status = 'skipped' WHERE status = 'pending' AND op != 'delete' "
+        "AND entity_type = 'worktime' AND entity_id = ?", (worktime_id,))
+    if to_odoo and wt["odooId"]:
+        await sync.enqueue(db, "worktime", worktime_id, "delete", {"odoo_id": wt["odooId"]})
+    await db.execute("DELETE FROM work_time WHERE id = ?", (worktime_id,))
+    punch = await db.fetchone("SELECT employeeID FROM punch_clock WHERE id = ?", (wt["punchID"],))
+    return punch["employeeID"] if punch else None
+
+
+class DeleteShiftButton(discord.ui.Button):
+    """Admin-only: delete an accidental shift from the approval message."""
+
+    def __init__(self):
+        super().__init__(label="Delete shift", style=discord.ButtonStyle.danger)
+
+    async def callback(self, interaction: discord.Interaction):
+        view: ApprovePunch = self.view
+        if not has_perms(interaction.user, accepted_roles=("TIMECARD_ADMIN_ROLE",)):
+            await interaction.response.send_message("This is not for you!", ephemeral=True)
+            return
+        row = await view.db.fetchone(
+            "SELECT count(*) AS c FROM work_time WHERE punchID = ?", (view.punch_id,)
+        )
+        wt_count = row["c"]
+        if wt_count:
+            confirm = Confirm(user=interaction.user, timeout=60)
+            await interaction.response.send_message(
+                f"This shift has {wt_count} worktime entr{'y' if wt_count == 1 else 'ies'}. "
+                "Delete them too?", view=confirm, ephemeral=True)
+            await confirm.wait()
+            if not confirm.value:
+                await interaction.followup.send("Deletion cancelled.", ephemeral=True)
+                return
+        else:
+            await interaction.response.defer(ephemeral=True)
+        emp = await delete_punch_cascade(view.cog, view.punch_id, to_odoo=True)
+        if emp:
+            await _refresh_clock_for_employee(view.cog, emp)
+        timecard_log.info(
+            f"[Punch] {interaction.user} deleted shift (punch {view.punch_id}, {wt_count} worktime).")
+        await interaction.followup.send("Shift deleted.", ephemeral=True)
+
+
+class DeleteApproval(discord.ui.View):
+    """Admin approval for an Odoo-originated deletion (Discord is source of truth)."""
+
+    def __init__(self, cog, pending_id: int, model: str, odoo_id: int,
+                 local_kind: str, local_id: int):
+        super().__init__(timeout=None)
+        self.cog = cog
+        self.db: Database = cog.db
+        self.pending_id = pending_id
+        self.model = model
+        self.odoo_id = odoo_id
+        self.local_kind = local_kind
+        self.local_id = local_id
+        self.add_item(DeleteApproveButton())
+        self.add_item(DeleteRejectButton())
+
+    @classmethod
+    def from_row(cls, cog, row):
+        return cls(cog, row["id"], row["model"], row["odoo_id"], row["local_kind"], row["local_id"])
+
+
+class DeleteApproveButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="Approve deletion", style=discord.ButtonStyle.danger)
+
+    async def callback(self, interaction: discord.Interaction):
+        view: DeleteApproval = self.view
+        if not has_perms(interaction.user, accepted_roles=("TIMECARD_ADMIN_ROLE",)):
+            await interaction.response.send_message("This is not for you!", ephemeral=True)
+            return
+        # Odoo already deleted it -> don't cascade back to Odoo.
+        if view.local_kind == "punch":
+            emp = await delete_punch_cascade(view.cog, view.local_id, to_odoo=False)
+        else:
+            emp = await delete_worktime_local(view.cog, view.local_id, to_odoo=False)
+        if emp:
+            await _refresh_clock_for_employee(view.cog, emp)
+        await view.cog.clear_pending_action(view.pending_id)
+        await interaction.message.edit(
+            content=interaction.message.content + f"\n✅ {interaction.user} approved the deletion.",
+            view=None)
+        timecard_log.info(
+            f"[Delete] {interaction.user} approved Odoo deletion of {view.model}:{view.odoo_id}.")
+        await interaction.response.send_message("Deletion approved.", ephemeral=True)
+
+
+class DeleteRejectButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="Reject (restore in Odoo)", style=discord.ButtonStyle.secondary)
+
+    async def callback(self, interaction: discord.Interaction):
+        view: DeleteApproval = self.view
+        if not has_perms(interaction.user, accepted_roles=("TIMECARD_ADMIN_ROLE",)):
+            await interaction.response.send_message("This is not for you!", ephemeral=True)
+            return
+        kind = "punch" if view.local_kind == "punch" else "worktime"
+        await sync.enqueue(view.db, kind, view.local_id, "restore")
+        await view.cog.clear_pending_action(view.pending_id)
+        await interaction.message.edit(
+            content=interaction.message.content
+            + f"\n♻️ {interaction.user} rejected — Discord wins; restoring in Odoo.",
+            view=None)
+        timecard_log.info(
+            f"[Delete] {interaction.user} rejected Odoo deletion of {view.model}:{view.odoo_id}; queued restore.")
+        await interaction.response.send_message("Kept locally; queued restore to Odoo.", ephemeral=True)

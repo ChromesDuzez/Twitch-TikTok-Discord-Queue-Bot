@@ -53,9 +53,14 @@ real client IP behind Cloudflare (`CF-Connecting-IP`).
 ## Endpoints (one per model)
 
 ```
+# create / update
 POST /webhook/odoo/res.partner?token=<TOKEN>
 POST /webhook/odoo/hr.attendance?token=<TOKEN>
 POST /webhook/odoo/account.analytic.line?token=<TOKEN>
+# deletion (separate route so the action is unambiguous)
+POST /webhook/odoo/hr.attendance/delete?token=<TOKEN>
+POST /webhook/odoo/account.analytic.line/delete?token=<TOKEN>
+POST /webhook/odoo/res.partner/delete?token=<TOKEN>
 ```
 
 Headers: `Content-Type: application/json`.
@@ -118,16 +123,37 @@ don't fire needless webhooks.
 | Model | Endpoint (`…/webhook/odoo/…`) | Watched fields (all the bot reads) | Used for |
 | --- | --- | --- | --- |
 | `hr.attendance` | `hr.attendance` | `check_in`, `check_out`, `employee_id` | Punch times → `punch_clock` |
-| `account.analytic.line` | `account.analytic.line` | `unit_amount` | Worktime hours → `work_time` |
-| `res.partner` | `res.partner` | `name` (drives `display_name`) | Customer name → `customer` |
+| `account.analytic.line` | `account.analytic.line` | `unit_amount`, **`x_studio_shift`** | Worktime hours → `work_time` (the shift link attributes Odoo-created timesheets to a punch) |
+| `res.partner` | `res.partner` | `name` (drives `display_name`), **`active`** | Customer name → `customer`; `active` toggles local archive |
 
 **Recommended trigger: “On Create and edit”, with Watched Fields set to the
 columns above** — fires on creation and when a watched field is edited, nothing
 else. Avoid *after last update*: it fires on **any** field change (a lot of
 needless webhooks for `res.partner`). Because the reconcile is idempotent (an
 unrelated change reconciles to a no-op), field-scoping is purely an efficiency
-win — no correctness risk, and no delay needed. Deletions aren't reconciled
-today, so leave *on deletion* off unless you later want to handle removals.
+win — no correctness risk, and no delay needed.
+
+### Deletions & the shift field (requires Odoo Studio)
+
+Deletion support and attributing Odoo-created timesheets rely on a **Studio
+Many2one field `x_studio_shift`** on `account.analytic.line` → `hr.attendance`
+(configurable via `ODOO_SHIFT_FIELD`). The bot sets it on lines it creates, and
+reads it to map an Odoo line to the right punch. **If that field doesn't exist
+(or Odoo Studio isn't enabled), the `/delete` routes return `503` and deletion
+support stays off** until it does (the bot re-checks periodically).
+
+To mirror deletions, add **“on deletion”** automations pointing at the `/delete`
+endpoints for `hr.attendance`, `account.analytic.line`, and `res.partner`. And
+for **archiving** a customer, add a `res.partner` update automation watching
+`active` (Odoo archive sets `active = False`).
+
+Because Discord is the source of truth, an Odoo-side deletion of an attendance or
+timesheet posts an **admin approval** in the timecard channel: approve to delete
+it locally, or reject and the bot **re-creates it in Odoo**. Customer deletions
+don't need approval — a referenced customer is archived locally (hidden from
+search, kept for reports); an unreferenced one is removed.
+
+Odoo 19 groups triggers as: **Timing Conditions** (based on date field / after
 
 Odoo 19 groups triggers as: **Timing Conditions** (based on date field / after
 creation / after last update), **Values Updated**, **Custom** (On Create / On
@@ -142,7 +168,7 @@ used here).
 | `400` | Missing/invalid integer `_id`, or wrong Content-Type |
 | `401` | Missing or wrong token |
 | `403` | IP allowlist enabled and the source IP isn't allowed |
-| `503` | Token not configured, or TimeTracking cog not loaded |
+| `503` | Token not configured, TimeTracking cog not loaded, or (for `/delete`) deletion support disabled because the `x_studio_shift` field is missing |
 
 ## Testing (curl)
 

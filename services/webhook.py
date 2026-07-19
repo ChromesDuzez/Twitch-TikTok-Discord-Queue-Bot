@@ -45,7 +45,7 @@ def _real_client_ip(request: web.Request) -> str | None:
 
 
 def make_app(bot) -> web.Application:
-    def make_handler(model: str):
+    def make_handler(model: str, deleting: bool = False):
         async def handle(request: web.Request):
             ip = _real_client_ip(request)
 
@@ -80,12 +80,19 @@ def make_app(bot) -> web.Application:
             write_uid = body.get("write_uid")
             write_uid = int(write_uid) if isinstance(write_uid, int) else None
 
-            # 4. Enqueue the pull for this route's (trusted) model. Return fast.
+            # 4. Enqueue for this route's (trusted) model. Return fast.
             cog = bot.get_cog("TimeTracking")
             if cog is None:
                 return web.Response(status=503, text="TimeTracking cog not loaded")
+            # Deletion support is gated on the Studio shift field existing.
+            if deleting and not getattr(cog.client, "shift_field_available", False):
+                log.warning("[Webhook] Deletion rejected: shift field unavailable (deletion disabled).")
+                return web.Response(status=503, text="Deletion support disabled until the shift field exists")
             try:
-                await cog.enqueue_inbound(model, record_id, action, write_uid)
+                if deleting:
+                    await cog.enqueue_inbound_delete(model, record_id)
+                else:
+                    await cog.enqueue_inbound(model, record_id, action, write_uid)
             except Exception as e:  # noqa: BLE001
                 log.exception("[Webhook] Handler error from %s: %s", ip, e)
                 return web.Response(status=500, text="Internal server error")
@@ -96,6 +103,7 @@ def make_app(bot) -> web.Application:
     app = web.Application()
     for model in SUPPORTED_MODELS:
         app.router.add_post(f"/webhook/odoo/{model}", make_handler(model))
+        app.router.add_post(f"/webhook/odoo/{model}/delete", make_handler(model, deleting=True))
     return app
 
 

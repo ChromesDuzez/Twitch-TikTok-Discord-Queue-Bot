@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from datetime import date, timedelta
 
 import requests
@@ -28,6 +29,11 @@ from botlog import log
 DEFAULT_TIMEOUT = 15
 
 
+def shift_field() -> str:
+    """The Many2one field on account.analytic.line linking to hr.attendance."""
+    return os.getenv("ODOO_SHIFT_FIELD", "x_studio_shift")
+
+
 class OdooClient:
     def __init__(self, url: str | None, db: str | None, username: str | None, api_key: str | None):
         self.url = url
@@ -35,6 +41,9 @@ class OdooClient:
         self.username = username
         self.api_key = api_key
         self.loaded = bool(url and db and username and api_key)
+        # Set by check_shift_field(): whether the Studio shift field exists.
+        # Deletion support is gated on this (see services/webhook.py).
+        self.shift_field_available = False
 
     # ---- core --------------------------------------------------------------
 
@@ -83,6 +92,35 @@ class OdooClient:
         except Exception as e:  # noqa: BLE001 - best-effort probe
             log.warning(f"[Odoo] Verification failed: {e}")
             return False
+
+    async def field_exists(self, model: str, field: str) -> bool:
+        """True if a field is defined on a model (e.g. a Studio custom field)."""
+        try:
+            rows = await self.call(
+                "/ir.model.fields/search_read",
+                {"domain": [["model", "=", model], ["name", "=", field]], "fields": ["id"], "limit": 1},
+            )
+            return bool(rows)
+        except Exception as e:  # noqa: BLE001 - best-effort probe
+            log.warning(f"[Odoo] field_exists probe failed: {e}")
+            return False
+
+    async def check_shift_field(self) -> bool:
+        """Probe for the shift Studio field and cache the result. Gates deletions."""
+        if not self.loaded:
+            self.shift_field_available = False
+            return False
+        available = await self.field_exists("account.analytic.line", shift_field())
+        if available != self.shift_field_available:
+            log.warning("[Odoo] Shift field '%s' %s — deletion support %s.",
+                        shift_field(), "found" if available else "missing",
+                        "enabled" if available else "DISABLED")
+        self.shift_field_available = available
+        return available
+
+    async def unlink(self, model: str, odoo_id: int):
+        """Delete a record in Odoo by id."""
+        return await self.call(f"/{model}/unlink", {"ids": [odoo_id]})
 
     async def read_record(self, model: str, odoo_id: int, fields: list):
         """Fetch a single record's fields by id (used by inbound reconcile).
@@ -215,13 +253,14 @@ class OdooClient:
 
     async def add_timesheet(
         self, project_id: int, date: str, employee_odoo_id: int, description: str,
-        hours: float, task_id: int | None = None,
+        hours: float, task_id: int | None = None, shift_attendance_id: int | None = None,
     ):
         """Create one account.analytic.line (timesheet). ``company_id`` is read
         from the task when given, otherwise from the project.
 
-        Used for Service (task_id set), Construction and Office (project only).
-        Returns the new analytic-line id.
+        ``shift_attendance_id`` sets the Studio shift link (only when the field
+        exists in this Odoo). Used for Service (task_id set), Construction and
+        Office (project only). Returns the new analytic-line id.
         """
         company_id = False
         if task_id:
@@ -255,6 +294,10 @@ class OdooClient:
         }
         if task_id:
             vals["task_id"] = task_id
+        # Link the timesheet back to its attendance (shift) when the Studio
+        # field is available, so it round-trips and supports deletions.
+        if shift_attendance_id and self.shift_field_available:
+            vals[shift_field()] = shift_attendance_id
         result = await self.call("/account.analytic.line/create", {"vals_list": [vals]})
         if isinstance(result, list) and result:
             return result[0]

@@ -11,6 +11,7 @@ loop the way the previous synchronous ``sqlite3`` calls did.
 
 from __future__ import annotations
 
+import glob
 import os
 import shutil
 from datetime import datetime
@@ -22,10 +23,12 @@ from botlog import log
 # Human-facing release version (bumped on major rewrites or schema epochs).
 RELEASE_VERSION = "2.0"
 
-# Internal schema/migration counter. This is what actually drives upgrades and
-# what the live db filename is stamped with (timetracker.v{N}.db). Bump it
-# whenever a new migration is added below.
-TARGET_VERSION = 4
+# Internal schema/migration counter, kept in lock-step with the .env version.
+# This whole V2.0 refactor is ONE version: the pre-refactor database is
+# version 1, the refactored schema is version 2. Drives upgrades and stamps the
+# live db filename (timetracker.v{N}.db). Bump (both here and ENV in config.py)
+# on a future schema change.
+TARGET_VERSION = 2
 
 # Canonical worktime categories the employee can start. NOTE: "Shop" is NOT one
 # of these -- shop time is a calculated remainder in reports, never a punch.
@@ -137,7 +140,8 @@ class Database:
             CREATE TABLE customer (
                 id          INTEGER          PRIMARY KEY AUTOINCREMENT,
                 name        TEXT             NOT NULL,
-                odooId      UNSIGNED BIG INT NULL DEFAULT NULL
+                odooId      UNSIGNED BIG INT NULL DEFAULT NULL,
+                archived    BOOLEAN          NOT NULL DEFAULT 0
             );
             CREATE TABLE work_time (
                 id            INTEGER          PRIMARY KEY,
@@ -184,6 +188,17 @@ class Database:
                 last_error  TEXT    NULL,
                 created_at  DATETIME NOT NULL
             );
+            CREATE TABLE pending_action (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                action      TEXT    NOT NULL,
+                model       TEXT    NOT NULL,
+                odoo_id     INTEGER NULL,
+                local_kind  TEXT    NULL,
+                local_id    INTEGER NULL,
+                channel_id  UNSIGNED BIG INT NULL,
+                message_id  UNSIGNED BIG INT NULL,
+                created_at  DATETIME NOT NULL
+            );
             """
         )
         await c.executemany(
@@ -214,29 +229,23 @@ class Database:
         await c.commit()
         row = await self.fetchone("SELECT version FROM schema_version LIMIT 1")
         if row is None:
-            # A pre-existing legacy database with no version marker starts at 1.
-            # A freshly created database is already at TARGET_VERSION.
+            # A pre-existing (pre-refactor) database with no version marker is
+            # version 1; a freshly created database is already at TARGET_VERSION.
             current = TARGET_VERSION if await self._is_fresh_target() else 1
             await c.execute("INSERT INTO schema_version (version) VALUES (?)", (current,))
             await c.commit()
         else:
             current = row["version"]
 
+        # One collapsed upgrade brings a pre-refactor db up to the full schema.
+        # (Databases stamped with a higher dev-era number already have the full
+        # schema, so they just get re-stamped to TARGET below.)
         if current < 2:
             await self._migrate_to_v2()
-            current = 2
 
-        if current < 3:
-            await self._migrate_to_v3()
-            current = 3
-
-        if current < 4:
-            await self._migrate_to_v4()
-            current = 4
-
-        await c.execute("UPDATE schema_version SET version = ?", (current,))
+        await c.execute("UPDATE schema_version SET version = ?", (TARGET_VERSION,))
         await c.commit()
-        log.info(f"[DB] Schema at version {current}.")
+        log.info(f"[DB] Schema at version {TARGET_VERSION}.")
 
     async def _is_fresh_target(self) -> bool:
         """True when punch_clock already uses an INTEGER rowid PK (fresh create)."""
@@ -252,18 +261,29 @@ class Database:
         return False
 
     async def _migrate_to_v2(self):
-        """Legacy -> v2: add odooId columns, add outbox, make id columns atomic."""
-        log.info("[DB] Migrating schema to v2...")
+        """Pre-refactor (v1) -> v2: the full V2.0 schema, in one idempotent step.
+
+        Adds Odoo id columns, the outbox/inbox queues, worktime task/project
+        links, customer archiving, the pending-action queue, and rebuilds the
+        punch_clock / work_time ids to atomic INTEGER rowids (preserving ids).
+        Every step is guarded so it is safe to re-run.
+        """
+        log.info("[DB] Upgrading pre-refactor database to v2...")
         c = self._conn
 
-        # 1. Ensure odooId columns exist (older schema.sql builds lacked them).
+        # 1. Odoo id + link columns (older builds lacked them).
         for table in ("employee", "punch_clock", "customer", "work_time"):
             if not await self._column_exists(table, "odooId"):
                 await c.execute(f"ALTER TABLE {table} ADD COLUMN odooId UNSIGNED BIG INT NULL DEFAULT NULL")
+        for column in ("odooTaskId", "odooProjectId"):
+            if not await self._column_exists("work_time", column):
+                await c.execute(f"ALTER TABLE work_time ADD COLUMN {column} UNSIGNED BIG INT NULL DEFAULT NULL")
+        if not await self._column_exists("customer", "archived"):
+            await c.execute("ALTER TABLE customer ADD COLUMN archived BOOLEAN NOT NULL DEFAULT 0")
         await c.commit()
 
-        # 2. Offline-safe Odoo sync queue.
-        await c.execute(
+        # 2. Sync queues + admin-approval queue.
+        await c.executescript(
             """
             CREATE TABLE IF NOT EXISTS odoo_outbox (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -275,13 +295,36 @@ class Database:
                 attempts    INTEGER NOT NULL DEFAULT 0,
                 last_error  TEXT    NULL,
                 created_at  DATETIME NOT NULL
-            )
+            );
+            CREATE TABLE IF NOT EXISTS odoo_inbox (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                model       TEXT    NOT NULL,
+                odoo_id     INTEGER NOT NULL,
+                action      TEXT    NULL,
+                write_uid   INTEGER NULL,
+                status      TEXT    NOT NULL DEFAULT 'pending',
+                attempts    INTEGER NOT NULL DEFAULT 0,
+                last_error  TEXT    NULL,
+                created_at  DATETIME NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS pending_action (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                action      TEXT    NOT NULL,
+                model       TEXT    NOT NULL,
+                odoo_id     INTEGER NULL,
+                local_kind  TEXT    NULL,
+                local_id    INTEGER NULL,
+                channel_id  UNSIGNED BIG INT NULL,
+                message_id  UNSIGNED BIG INT NULL,
+                created_at  DATETIME NOT NULL
+            );
             """
         )
         await c.commit()
 
         # 3. Rebuild punch_clock / work_time so `id` is an INTEGER rowid alias
-        #    (atomic autoincrement). Existing ids are preserved verbatim.
+        #    (atomic autoincrement). Existing ids are preserved verbatim; the
+        #    columns added above come along. Skipped when already rebuilt.
         await self._rebuild_id_as_rowid(
             "punch_clock",
             """
@@ -306,53 +349,22 @@ class Database:
             "work_time",
             """
             CREATE TABLE work_time_new (
-                id          INTEGER          PRIMARY KEY,
-                punchID     UNSIGNED BIG INT NOT NULL,
-                customerID  INTEGER          NOT NULL DEFAULT 0,
-                punchType   TEXT CHECK( punchType IN ('Construction','Service','Office') ) NOT NULL,
-                timeSpent   INTEGER CHECK( timeSpent >= 0 AND timeSpent <= 1440 AND timeSpent % 15 = 0 ) NOT NULL DEFAULT 0,
-                timeStarted DATETIME         NOT NULL,
-                odooId      UNSIGNED BIG INT NULL DEFAULT NULL,
+                id            INTEGER          PRIMARY KEY,
+                punchID       UNSIGNED BIG INT NOT NULL,
+                customerID    INTEGER          NOT NULL DEFAULT 0,
+                punchType     TEXT CHECK( punchType IN ('Construction','Service','Office') ) NOT NULL,
+                timeSpent     INTEGER CHECK( timeSpent >= 0 AND timeSpent <= 1440 AND timeSpent % 15 = 0 ) NOT NULL DEFAULT 0,
+                timeStarted   DATETIME         NOT NULL,
+                odooId        UNSIGNED BIG INT NULL DEFAULT NULL,
+                odooTaskId    UNSIGNED BIG INT NULL DEFAULT NULL,
+                odooProjectId UNSIGNED BIG INT NULL DEFAULT NULL,
                 FOREIGN KEY (punchID) REFERENCES punch_clock(id),
                 FOREIGN KEY (customerID) REFERENCES customer(id)
             )
             """,
-            "id, punchID, customerID, punchType, timeSpent, timeStarted, odooId",
+            "id, punchID, customerID, punchType, timeSpent, timeStarted, odooId, odooTaskId, odooProjectId",
         )
-        log.info("[DB] Migration to v2 complete.")
-
-    async def _migrate_to_v3(self):
-        """v2 -> v3: link worktime to an Odoo task/project for timesheet sync."""
-        log.info("[DB] Migrating schema to v3...")
-        c = self._conn
-        for column in ("odooTaskId", "odooProjectId"):
-            if not await self._column_exists("work_time", column):
-                await c.execute(
-                    f"ALTER TABLE work_time ADD COLUMN {column} UNSIGNED BIG INT NULL DEFAULT NULL"
-                )
-        await c.commit()
-        log.info("[DB] Migration to v3 complete.")
-
-    async def _migrate_to_v4(self):
-        """v3 -> v4: inbound Odoo change queue for pull-based reconciliation."""
-        log.info("[DB] Migrating schema to v4...")
-        await self._conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS odoo_inbox (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                model       TEXT    NOT NULL,
-                odoo_id     INTEGER NOT NULL,
-                action      TEXT    NULL,
-                write_uid   INTEGER NULL,
-                status      TEXT    NOT NULL DEFAULT 'pending',
-                attempts    INTEGER NOT NULL DEFAULT 0,
-                last_error  TEXT    NULL,
-                created_at  DATETIME NOT NULL
-            )
-            """
-        )
-        await self._conn.commit()
-        log.info("[DB] Migration to v4 complete.")
+        log.info("[DB] Upgrade to v2 complete.")
 
     async def _rebuild_id_as_rowid(self, table: str, create_new_sql: str, columns: str):
         """Rebuild `table` from a `<table>_new` definition, copying all columns.
@@ -422,11 +434,20 @@ def resolve_db_path(base_dir: str, prefix: str = "timetracker") -> tuple[str, st
     target = os.path.join(base_dir, db_filename(TARGET_VERSION, prefix))
     if os.path.exists(target):
         return target, None
-    for k in range(TARGET_VERSION - 1, 0, -1):
-        cand = os.path.join(base_dir, db_filename(k, prefix))
-        if os.path.exists(cand):
-            return target, cand
-    legacy = os.path.join(base_dir, f"{prefix}.db")  # pre-versioning (v1) name
+    # Any other version-stamped file (older OR a higher dev-era number) is a
+    # valid source to upgrade + rename; pick the highest-numbered one.
+    best_ver, best_path = None, None
+    for path in glob.glob(os.path.join(base_dir, f"{prefix}.v*.db")):
+        name = os.path.basename(path)
+        try:
+            ver = int(name[len(prefix) + 2:-3])  # strip "{prefix}.v" and ".db"
+        except ValueError:
+            continue
+        if best_ver is None or ver > best_ver:
+            best_ver, best_path = ver, path
+    if best_path:
+        return target, best_path
+    legacy = os.path.join(base_dir, f"{prefix}.db")  # pre-versioning name
     if os.path.exists(legacy):
         return target, legacy
     return target, None

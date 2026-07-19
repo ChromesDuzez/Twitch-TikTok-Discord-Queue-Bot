@@ -157,3 +157,6 @@ discord-bot-venv/
 
 # Log files (rotating)
 logs/
+
+# Local Claude Code settings (machine-specific)
+.claude/settings.local.json

@@ -37,11 +37,11 @@ ALLOWLIST_KEY = "WEBHOOK_IP_ALLOWLIST"
 ALLOWLIST_ENABLED_KEY = "WEBHOOK_IP_ALLOWLIST_ENABLED"
 ENV_VERSION_KEY = "ENV_VERSION"
 
-# Bump when adding an env migration below. New *additions* are picked up
-# automatically from .env.example; migrations here handle renames/removals.
-# NOTE: kept at 1 for the whole V2.0 release — new keys added during V2 dev (e.g.
-# the TESTING settings) ride along the 0->1 migration via the .env.example sync.
-ENV_TARGET_VERSION = 1
+# Env version, kept in lock-step with the DB schema version (db.py TARGET_VERSION).
+# The whole V2.0 refactor is ONE version: pre-refactor = 1, this release = 2.
+# New keys added during V2 dev (TESTING, ODOO_SHIFT_FIELD, ...) ride along the
+# 1->2 migration via the .env.example sync. Bump both on a future change.
+ENV_TARGET_VERSION = 2
 
 _write_lock = threading.Lock()
 
@@ -75,9 +75,10 @@ def _rename_env(old: str, new: str):
 # Key ADDITIONS are handled automatically by syncing from .env.example, so they
 # don't need an entry here.
 ENV_MIGRATIONS = {
-    # v1: HMAC signing was replaced by the auto-generated WEBHOOK_TOKEN. (Additions
-    # like the TESTING settings come from .env.example automatically.)
-    1: [lambda: _remove_env("ODOO_WEBHOOK_SECRET")],
+    # v2 (the whole V2.0 refactor): HMAC signing was replaced by the
+    # auto-generated WEBHOOK_TOKEN. New keys (TESTING, ODOO_SHIFT_FIELD, ...)
+    # come from .env.example automatically.
+    2: [lambda: _remove_env("ODOO_WEBHOOK_SECRET")],
 }
 
 
@@ -98,9 +99,10 @@ def migrate_env():
     ENV_VERSION. Backs the file up first. No-op when already current.
     """
     try:
-        current = int(os.getenv(ENV_VERSION_KEY, "0") or 0)
+        # No marker = a pre-refactor .env, which is version 1.
+        current = int(os.getenv(ENV_VERSION_KEY, "1") or 1)
     except ValueError:
-        current = 0
+        current = 1
     if current >= ENV_TARGET_VERSION:
         return
 
