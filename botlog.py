@@ -76,6 +76,9 @@ def setup_logging() -> logging.Logger:
 
     verbose = bool(os.getenv("DEBUGGING"))
     console_level = logging.DEBUG if verbose else logging.INFO
+    # The rotating file is the verbose troubleshooting record: DEBUG by default,
+    # but overridable (e.g. LOG_FILE_LEVEL=INFO to make it quieter).
+    file_level = _level_from_env("LOG_FILE_LEVEL", logging.DEBUG)
     formatter = logging.Formatter(_FMT, _DATEFMT)
 
     log.setLevel(logging.DEBUG)  # capture everything; handlers decide what to show
@@ -97,7 +100,7 @@ def setup_logging() -> logging.Logger:
             backupCount=int(os.getenv("LOG_BACKUP_COUNT", "5")),
             encoding="utf-8",
         )
-        file_handler.setLevel(logging.DEBUG)  # the file is the verbose record
+        file_handler.setLevel(file_level)  # DEBUG by default; see LOG_FILE_LEVEL
         file_handler.setFormatter(formatter)
         log.addHandler(file_handler)
     except Exception as e:  # noqa: BLE001 - never let logging setup crash the bot
@@ -106,8 +109,9 @@ def setup_logging() -> logging.Logger:
             "File logging disabled: %s", (e,), None))
 
     _configured = True
-    log.info("[Log] Logging initialized (console=%s, file=%s).",
-             logging.getLevelName(console_level), os.getenv("LOG_FILE", "logs/bot.log"))
+    log.info("[Log] Logging initialized (console=%s, file=%s@%s).",
+             logging.getLevelName(console_level), os.getenv("LOG_FILE", "logs/bot.log"),
+             logging.getLevelName(file_level))
     return log
 
 
