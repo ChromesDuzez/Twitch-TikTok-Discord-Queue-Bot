@@ -120,5 +120,6 @@ async def run_webserver(bot):
     port = int(os.getenv("WEBHOOK_PORT", "8080"))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
+    bot.webhook_runner = runner  # keep a handle so shutdown can clean it up
     log.info("[Webhook] Server started on port %s. Routes: %s",
              port, ", ".join(f"/webhook/odoo/{m}" for m in SUPPORTED_MODELS))

@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 import discord
 import os # default module
 from dotenv import load_dotenv
-import argparse, asyncio, json, re, sys, urllib.parse
+import argparse, asyncio, json, logging, re, sys, urllib.parse
 from prompt_toolkit import PromptSession
 from services.webhook import run_webserver
 from botlog import log, setup_logging, attach_discord
@@ -197,47 +197,81 @@ async def _halt_for_review_if_upgraded() -> bool:
     return False
 
 
+async def _shutdown_cleanup():
+    """Release resources so the process can actually exit: stop the Odoo workers and
+    close the db connection (frees the aiosqlite worker thread + the WAL lock), and
+    shut down the webhook server. Without this the non-daemon db thread keeps the
+    process alive after the loop ends -- the 'still running, still using the db' hang."""
+    if bot is None:
+        return
+    tt = bot.get_cog("TimeTracking")
+    if tt is not None:
+        try:
+            await tt.close_db()  # stops sync+inbox workers and closes the db
+        except Exception:
+            log.exception("[Bot] Error closing the timecard database during shutdown")
+    runner = getattr(bot, "webhook_runner", None)
+    if runner is not None:
+        try:
+            await runner.cleanup()
+        except Exception:
+            log.exception("[Bot] Error cleaning up the webhook server during shutdown")
+
+
 async def main():
     global bot_task
     # Catch exceptions from tasks that aren't awaited (webhook server, etc.).
     asyncio.get_running_loop().set_exception_handler(_loop_exception_handler)
-    await setup_bot()
+    try:
+        await setup_bot()
 
-    # After an upgrade (or first-run .env creation), pause so the admin can review
-    # new settings / the migrated database before the bot connects.
-    if await _halt_for_review_if_upgraded():
+        # After an upgrade (or first-run .env creation), pause so the admin can
+        # review new settings / the migrated database before the bot connects.
+        if await _halt_for_review_if_upgraded():
+            return
+
+        # The webhook server only serves the Odoo/timecard integration.
+        if TIMETRACKING_ENABLED:
+            bot.loop.create_task(run_webserver(bot))
+        else:
+            log.info("[Bot] Timetracking disabled — webhook server not started.")
+        bot_task = asyncio.create_task(bot.start(os.getenv("BOT_TOKEN")))
+        cli_task = asyncio.create_task(cli_input_loop())
+
+        done, pending = await asyncio.wait([bot_task, cli_task], return_when=asyncio.FIRST_COMPLETED)
+
+        for task in done:
+            if task == bot_task:
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    log.info("[CLI] Bot task was cancelled")
+                except Exception as e:
+                    log.exception("[CLI] Bot task exception: %s", e)
+
+        for task in pending:
+            task.cancel()
+    finally:
+        # Runs on every exit path (shutdown, halt-for-review, error).
         if bot and not bot.is_closed():
             await bot.close()
-        return
+        await _shutdown_cleanup()
+        log.info("[Bot] Shutdown complete.")
 
-    # The webhook server only serves the Odoo/timecard integration.
-    if TIMETRACKING_ENABLED:
-        bot.loop.create_task(run_webserver(bot))
-    else:
-        log.info("[Bot] Timetracking disabled — webhook server not started.")
-    bot_task = asyncio.create_task(bot.start(os.getenv("BOT_TOKEN")))
-    cli_task = asyncio.create_task(cli_input_loop())
-
-    done, pending = await asyncio.wait([bot_task, cli_task], return_when=asyncio.FIRST_COMPLETED)
-
-    for task in done:
-        if task == bot_task:
-            try:
-                await task
-            except asyncio.CancelledError:
-                log.info("[CLI] Bot task was cancelled")
-            except Exception as e:
-                log.exception("[CLI] Bot task exception: %s", e)
-
-    for task in pending:
-        task.cancel()
-
-    if bot and not bot.is_closed():
-        await bot.close()
 
 if __name__ == "__main__":
+    _code = 0
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         log.info("[Bot] Interrupted by user; shutting down.")
-    # Any other uncaught exception is logged by sys.excepthook (_log_unhandled_exception).
+    except Exception:
+        log.exception("[Bot] Fatal error during run.")
+        _code = 1
+    finally:
+        # Flush logs, then hard-exit past any lingering non-daemon thread (the
+        # prompt_toolkit CLI reader on Windows, an in-flight Odoo request) so the
+        # process actually terminates instead of hanging. The db was already closed
+        # gracefully above, so this loses nothing.
+        logging.shutdown()
+        os._exit(_code)
