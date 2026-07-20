@@ -45,14 +45,15 @@ sys.excepthook = _log_unhandled_exception
 
 #load environment variables from .env file and other configurations
 # On first run, create .env from .env.example so the bot can start.
-config.ensure_env_file()
+ENV_CREATED = config.ensure_env_file()
 load_dotenv()
 # Configure logging now that .env is loaded (honors LOG_FILE / DEBUGGING /
 # LOG_FILE_LEVEL) and before anything else that can fail, so startup errors --
 # including cog import failures -- are captured in the log file.
 setup_logging()
 # Version + upgrade the .env (add new keys, rename/remove old ones), like the DB.
-config.migrate_env()
+# Returns the keys added this run so startup can pause for review after an upgrade.
+ENV_ADDED_KEYS = config.migrate_env()
 
 # The webhook (server, admin cog, token) exists only for the Odoo/timecard
 # integration, so everything webhook-related is gated on timetracking.
@@ -165,11 +166,50 @@ async def cli_input_loop():
         except KeyboardInterrupt:
             break
 
+async def _halt_for_review_if_upgraded() -> bool:
+    """Run pending migrations up front (env already done; DB now). If an upgrade or
+    first-run creation happened, log what needs review and return True so the caller
+    stops before the bot goes live — giving the admin a chance to set new config."""
+    review = []
+    if ENV_CREATED:
+        review.append("a new .env was created from .env.example — fill in your settings (BOT_TOKEN, channel IDs, Odoo, etc.)")
+    elif ENV_ADDED_KEYS:
+        review.append(f"{len(ENV_ADDED_KEYS)} new .env setting(s) were added, may need values: {', '.join(ENV_ADDED_KEYS)}")
+
+    if TIMETRACKING_ENABLED:
+        tt = bot.get_cog("TimeTracking")
+        if tt is not None:
+            try:
+                await tt._open_db()  # back up + migrate now; workers start later
+            except Exception:
+                log.exception("[Bot] Database initialization/upgrade failed — not starting.")
+                return True
+            if tt.db_upgraded:
+                review.append("the timecard database was upgraded (a timestamped backup was saved next to it)")
+
+    if review:
+        log.warning(
+            "[Bot] Startup PAUSED after an upgrade so you can review configuration:\n  - %s\n"
+            "[Bot] Review the items above (and your .env), then start the bot again.",
+            "\n  - ".join(review),
+        )
+        return True
+    return False
+
+
 async def main():
     global bot_task
     # Catch exceptions from tasks that aren't awaited (webhook server, etc.).
     asyncio.get_running_loop().set_exception_handler(_loop_exception_handler)
     await setup_bot()
+
+    # After an upgrade (or first-run .env creation), pause so the admin can review
+    # new settings / the migrated database before the bot connects.
+    if await _halt_for_review_if_upgraded():
+        if bot and not bot.is_closed():
+            await bot.close()
+        return
+
     # The webhook server only serves the Odoo/timecard integration.
     if TIMETRACKING_ENABLED:
         bot.loop.create_task(run_webserver(bot))

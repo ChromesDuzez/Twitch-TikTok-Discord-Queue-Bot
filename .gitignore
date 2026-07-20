@@ -151,7 +151,13 @@ dmypy.json
 config.properties
 
 # End of https://www.toptal.com/developers/gitignore/api/python
+
+# Timecard SQLite database, its WAL/SHM sidecars, and the timestamped backups.
 *.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.db.backup_*
 test env/dbTestData.sql
 *.xlsx
 

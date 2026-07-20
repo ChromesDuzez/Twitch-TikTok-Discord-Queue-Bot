@@ -91,12 +91,15 @@ def _backup_env() -> str | None:
     return dest
 
 
-def migrate_env():
+def migrate_env() -> list[str]:
     """Upgrade the .env to the current version, like the database does.
 
     Applies rename/remove migrations, then adds any new keys present in
     .env.example (preserving the user's existing values), and stamps
     ENV_VERSION. Backs the file up first. No-op when already current.
+
+    Returns the list of keys added this run (empty when nothing changed) so the
+    caller can pause for review.
     """
     try:
         # No marker = a pre-refactor .env, which is version 1.
@@ -104,7 +107,7 @@ def migrate_env():
     except ValueError:
         current = 1
     if current >= ENV_TARGET_VERSION:
-        return
+        return []
 
     _backup_env()
 
@@ -114,6 +117,7 @@ def migrate_env():
             op()
 
     # 2. Additions: any key in the example that's missing gets its default.
+    added: list[str] = []
     if os.path.exists(EXAMPLE_PATH):
         example = dotenv_values(EXAMPLE_PATH)
         existing = dotenv_values(ENV_PATH) if os.path.exists(ENV_PATH) else {}
@@ -122,10 +126,12 @@ def migrate_env():
                 continue
             if key not in existing:
                 _set_env(key, default or "")
+                added.append(key)
                 log.info("[Config] Added new .env setting: %s", key)
 
     _set_env(ENV_VERSION_KEY, str(ENV_TARGET_VERSION))
     log.warning("[Config] Upgraded .env from v%s to v%s (backup saved).", current, ENV_TARGET_VERSION)
+    return added
 
 
 # ---- first-run bootstrap ---------------------------------------------------

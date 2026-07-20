@@ -35,6 +35,7 @@ class TimeTracking(commands.Cog):
         self.bot = bot
         self.db_path: str | None = None  # resolved (version-stamped) on first use
         self.db: Database | None = None
+        self.db_upgraded = False  # True once an older/legacy db was migrated this run
         self.client = OdooClient(
             os.getenv("ODOO_URL"), os.getenv("ODOO_DB"),
             os.getenv("ODOO_USERNAME"), os.getenv("ODOO_API_KEY"),
@@ -46,13 +47,18 @@ class TimeTracking(commands.Cog):
 
     # ---- lifecycle ---------------------------------------------------------
 
-    async def _ensure_db(self) -> Database:
-        """Open + migrate the DB on first use (backs up existing data first)."""
+    async def _open_db(self) -> Database:
+        """Resolve, back up, upgrade, and open the DB (no background workers).
+
+        Sets ``self.db_upgraded`` when an older/legacy db was migrated this run, so
+        startup can pause for review before the bot goes live. Idempotent.
+        """
         async with self._lock:
             if self.db is None:
                 # A test bot uses a separate db file so it can never touch prod's.
                 prefix = "timetracker.test" if config.is_testing() else "timetracker"
                 target, source = resolve_db_path(os.getcwd(), prefix)
+                self.db_upgraded = source is not None
                 if source is not None:
                     # Upgrading an older/legacy db: back it up, then rename it to
                     # the current version-stamped name so migrations bring it up.
@@ -67,6 +73,13 @@ class TimeTracking(commands.Cog):
                     company_name=os.getenv("COMPANY_NAME"),
                     debug=bool(os.getenv("DEBUGGING")),
                 )
+        return self.db
+
+    async def _ensure_db(self) -> Database:
+        """Open the DB (if needed) and start the Odoo sync/inbox workers."""
+        await self._open_db()
+        async with self._lock:
+            if self.sync is None:
                 self.sync = sync.SyncWorker(self.db, self.client)
                 self.sync.start()
                 self.inbox = inbox.InboxWorker(self)

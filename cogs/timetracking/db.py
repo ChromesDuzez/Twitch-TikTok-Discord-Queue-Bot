@@ -46,7 +46,9 @@ class Database:
 
     async def setup(self, company_name: str | None = None, debug: bool = False):
         """Open the connection, create/migrate the schema, return self."""
-        fresh = not os.path.exists(self.path)
+        # An absent OR zero-byte file is "fresh" — a 0-byte file has no schema, so
+        # migrating it would ALTER tables that don't exist (and hang the driver).
+        fresh = (not os.path.exists(self.path)) or os.path.getsize(self.path) == 0
         # Autocommit mode: we manage transactions explicitly where needed (the
         # id-rebuild migration) and avoid Python's implicit-BEGIN pitfalls.
         self._conn = await aiosqlite.connect(self.path, isolation_level=None)
