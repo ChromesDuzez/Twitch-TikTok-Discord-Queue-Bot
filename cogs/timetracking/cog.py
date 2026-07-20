@@ -5,8 +5,6 @@ render clock messages from DB state (never from embed text), and enqueue Odoo
 sync jobs after local commits.
 """
 
-from __future__ import annotations
-
 import asyncio
 import os
 

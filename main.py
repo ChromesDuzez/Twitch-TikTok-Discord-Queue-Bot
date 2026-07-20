@@ -132,7 +132,24 @@ async def setup_bot():
                   len(failed), ", ".join(failed))
 
     bot.add_listener(on_ready, 'on_ready')
+    # Registering a listener also suppresses py-cord's default stderr-only handler,
+    # so slash-command errors are logged (to the file) instead of just printed.
+    bot.add_listener(on_application_command_error, 'on_application_command_error')
     bot.slash_command(description="Shutdown the bot. [Only BOT owner can use this command]")(shutdown)
+
+
+async def on_application_command_error(ctx, error):
+    """Log any slash-command exception through our logger (so it lands in the log
+    file) and let the user know, instead of py-cord dumping it to stderr only."""
+    cmd = ctx.command.qualified_name if getattr(ctx, "command", None) else "unknown"
+    log.error("[Bot] Error in command '/%s'", cmd, exc_info=error)
+    try:
+        await ctx.respond("Something went wrong running that command — it's been logged.", ephemeral=True)
+    except Exception:
+        try:
+            await ctx.followup.send("Something went wrong running that command — it's been logged.", ephemeral=True)
+        except Exception:
+            pass
 
 async def cli_shutdown():
     global bot_task
