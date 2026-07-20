@@ -332,8 +332,9 @@ class TimeTracking(commands.Cog):
         return [discord.OptionChoice(name=r["name"], value=r["id"]) for r in rows]
 
     async def odoo_employee_autocomplete(self, ctx: discord.AutocompleteContext):
-        """Suggest Odoo hr.employee records. Cached per run to avoid hammering
-        the API on every keystroke."""
+        """Suggest **unlinked** Odoo hr.employee records — an Odoo employee already
+        linked to a local employee is hidden (linking is one-to-one). The Odoo list
+        is cached per run; the linked set is read fresh so it updates as links change."""
         if not self.client.loaded:
             return []
         if self._odoo_employees is None:
@@ -342,8 +343,13 @@ class TimeTracking(commands.Cog):
             except Exception as e:  # noqa: BLE001
                 log.warning(f"[Odoo] employee autocomplete fetch failed: {e}")
                 return []
+        linked = set()
+        if self.db is not None:
+            linked = {r["odooId"] for r in
+                      await self.db.fetchall("SELECT odooId FROM employee WHERE odooId IS NOT NULL")}
         term = ctx.value.lower()
-        matches = [e for e in self._odoo_employees if term in e["display_name"].lower()]
+        matches = [e for e in self._odoo_employees
+                   if e["id"] not in linked and term in e["display_name"].lower()]
         return [discord.OptionChoice(name=e["display_name"], value=e["id"]) for e in matches[:25]]
 
     @discord.slash_command(name="addemployee", description="Add a new Employee to the system.")
@@ -375,6 +381,14 @@ class TimeTracking(commands.Cog):
         if existing:
             await ctx.respond(f"{name} (<@{emp_id}>) already exists in the database.", ephemeral=True)
             return
+        if odoo_employee is not None:
+            clash = await db.fetchone("SELECT id, name FROM employee WHERE odooId = ?", (odoo_employee,))
+            if clash is not None:
+                await ctx.respond(
+                    f"Odoo employee {odoo_employee} is already linked to {clash['name']} (<@{clash['id']}>). "
+                    f"Unlink them first with /unlinkemployee.", ephemeral=True,
+                )
+                return
         try:
             await db.execute(
                 "INSERT INTO employee (id, name, phoneNumber, addressLine1, addressLine2, "
@@ -409,8 +423,46 @@ class TimeTracking(commands.Cog):
         if row is None:
             await ctx.respond(f"{user} is not in the employee database. Add them with /addemployee first.", ephemeral=True)
             return
+        # Linking is one-to-one: refuse an Odoo employee already linked elsewhere.
+        clash = await db.fetchone(
+            "SELECT id, name FROM employee WHERE odooId = ? AND id != ?", (odoo_employee, emp_id)
+        )
+        if clash is not None:
+            await ctx.respond(
+                f"Odoo employee {odoo_employee} is already linked to {clash['name']} (<@{clash['id']}>). "
+                f"Unlink them first with /unlinkemployee.", ephemeral=True,
+            )
+            return
         await db.execute("UPDATE employee SET odooId = ? WHERE id = ?", (odoo_employee, emp_id))
+        timecard_log.info(f"[Employee] {ctx.author} linked employee {emp_id} to Odoo employee {odoo_employee}.")
         await ctx.respond(f"Linked {row['name']} (<@{emp_id}>) to Odoo employee {odoo_employee}.", ephemeral=True)
+
+    @discord.slash_command(name="unlinkemployee", description="Remove an employee's link to their Odoo hr.employee record.")
+    @commands.has_permissions(administrator=True)
+    async def unlinkemployee(
+        self, ctx: discord.ApplicationContext,
+        user: discord.Option(str, description="The employee's Discord user"),  # type: ignore
+    ):
+        db = await self._ensure_db()
+        try:
+            emp_id = int(user[2:-1])
+        except (ValueError, IndexError):
+            await ctx.respond(f"'{user}' is not a valid user mention.", ephemeral=True)
+            return
+        row = await db.fetchone("SELECT name, odooId FROM employee WHERE id = ?", (emp_id,))
+        if row is None:
+            await ctx.respond(f"{user} is not in the employee database.", ephemeral=True)
+            return
+        if row["odooId"] is None:
+            await ctx.respond(f"{row['name']} (<@{emp_id}>) isn't linked to an Odoo employee.", ephemeral=True)
+            return
+        await db.execute("UPDATE employee SET odooId = NULL WHERE id = ?", (emp_id,))
+        timecard_log.info(f"[Employee] {ctx.author} unlinked employee {emp_id} from Odoo employee {row['odooId']}.")
+        await ctx.respond(
+            f"Unlinked {row['name']} (<@{emp_id}>) from Odoo employee {row['odooId']}. "
+            f"That Odoo employee is now available to link again; new punches won't sync until re-linked.",
+            ephemeral=True,
+        )
 
     # ---- clock commands ----------------------------------------------------
 
