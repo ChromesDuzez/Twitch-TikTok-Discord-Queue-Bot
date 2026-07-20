@@ -185,8 +185,8 @@ def _parse_channel(*env_vars) -> int | None:
 def attach_discord(bot):
     """Add the Discord channel handlers and start their flush tasks. Call when ready.
 
-    Routes general/infra logs to BOT_LOG_ID (or LOG_CHANNEL_ID) and timecard
-    activity logs to TIMECARD_LOG_ID (falling back to the general channel).
+    Routes general/infra logs to BOT_LOG_ID and timecard activity logs to
+    TIMECARD_LOG_ID (falling back to the general channel).
     """
     global _discord_handlers
     if _discord_handlers:
@@ -197,7 +197,7 @@ def attach_discord(bot):
     level = _level_from_env("LOG_DISCORD_LEVEL", logging.INFO)
     fmt = logging.Formatter("[%(levelname)s] %(message)s")
 
-    general_id = _parse_channel("LOG_CHANNEL_ID", "BOT_LOG_ID")
+    general_id = _parse_channel("BOT_LOG_ID")
     timecard_id = _parse_channel("TIMECARD_LOG_ID") or general_id
 
     # General handler on the root logger; excludes timecard records so they

@@ -63,7 +63,7 @@ def _employee_field_map() -> dict:
     the standard Odoo 19 private-address fields. `addressState` is a Many2one
     (res.country.state) whose display name we store."""
     return {
-        "phoneNumber":  os.getenv("ODOO_EMPLOYEE_PHONE_FIELD", "mobile_phone"),
+        "phoneNumber":  os.getenv("ODOO_EMPLOYEE_PHONE_FIELD", "private_phone"),
         "addressLine1": os.getenv("ODOO_EMPLOYEE_STREET_FIELD", "private_street"),
         "addressLine2": os.getenv("ODOO_EMPLOYEE_STREET2_FIELD", "private_street2"),
         "addressCity":  os.getenv("ODOO_EMPLOYEE_CITY_FIELD", "private_city"),
