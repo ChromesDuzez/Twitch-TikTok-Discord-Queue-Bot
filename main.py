@@ -4,11 +4,26 @@ from dataclasses import dataclass, field
 import discord
 import os # default module
 from dotenv import load_dotenv
-import argparse, asyncio, json, re, urllib.parse
+import argparse, asyncio, json, re, sys, urllib.parse
 from prompt_toolkit import PromptSession
 from services.webhook import run_webserver
 from botlog import log, setup_logging, attach_discord
 import config
+
+
+def _log_unhandled_exception(exc_type, exc_value, exc_tb):
+    """Last-resort hook: route any uncaught exception through the logger (so it
+    lands in the log file) instead of a bare stderr traceback."""
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+        return
+    log.critical("[Bot] Unhandled exception", exc_info=(exc_type, exc_value, exc_tb))
+
+
+def _loop_exception_handler(loop, context):
+    """Log exceptions from background tasks that asyncio would otherwise swallow."""
+    message = context.get("message", "unhandled exception in event loop")
+    log.error("[Bot] Async task error: %s", message, exc_info=context.get("exception"))
 
 class ChromesBot(discord.Bot):
     def __init__(self, *args, **kwargs):
@@ -25,10 +40,17 @@ class ChromesBot(discord.Bot):
             self.OdooLoaded = True
             log.info("[Bot] Odoo configuration loaded successfully.")
 
+# Log any uncaught exception (esp. to the log file) instead of a bare stderr dump.
+sys.excepthook = _log_unhandled_exception
+
 #load environment variables from .env file and other configurations
 # On first run, create .env from .env.example so the bot can start.
 config.ensure_env_file()
 load_dotenv()
+# Configure logging now that .env is loaded (honors LOG_FILE / DEBUGGING /
+# LOG_FILE_LEVEL) and before anything else that can fail, so startup errors --
+# including cog import failures -- are captured in the log file.
+setup_logging()
 # Version + upgrade the .env (add new keys, rename/remove old ones), like the DB.
 config.migrate_env()
 
@@ -93,9 +115,20 @@ async def setup_bot():
                      debug_guilds=debug_guilds)
     bot.cli_session = None  # Will be set after bot is ready
 
+    failed = []
     for cog in cogs_list:
         log.info("[Bot] Loading cog %s", cog)
-        bot.load_extension(f'cogs.{cog}')
+        try:
+            bot.load_extension(f'cogs.{cog}')
+        except Exception:
+            # log.exception writes the full traceback to console + file (+ Discord
+            # once attached), so a bad cog is recorded, not just dumped to stderr.
+            log.exception("[Bot] Failed to load cog '%s'", cog)
+            failed.append(cog)
+    if failed:
+        log.error("[Bot] %d cog(s) failed to load: %s. The bot will run without "
+                  "them — see the traceback(s) above (also in the log file).",
+                  len(failed), ", ".join(failed))
 
     bot.add_listener(on_ready, 'on_ready')
     bot.slash_command(description="Shutdown the bot. [Only BOT owner can use this command]")(shutdown)
@@ -134,7 +167,8 @@ async def cli_input_loop():
 
 async def main():
     global bot_task
-    setup_logging()
+    # Catch exceptions from tasks that aren't awaited (webhook server, etc.).
+    asyncio.get_running_loop().set_exception_handler(_loop_exception_handler)
     await setup_bot()
     # The webhook server only serves the Odoo/timecard integration.
     if TIMETRACKING_ENABLED:
@@ -162,4 +196,8 @@ async def main():
         await bot.close()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        log.info("[Bot] Interrupted by user; shutting down.")
+    # Any other uncaught exception is logged by sys.excepthook (_log_unhandled_exception).

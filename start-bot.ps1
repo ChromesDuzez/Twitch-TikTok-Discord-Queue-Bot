@@ -1,6 +1,4 @@
-Write-Host "Activating the virtual environment..."
-.\discord-bot-venv\Scripts\activate
+# Run the bot using the venv's Python directly (no activation needed, and avoids
+# the `py` launcher picking system Python over the venv).
 Write-Host "Starting the bot..."
-py -3.12 main.py
-Write-Host "Deactivating the virtual environment..."
-deactivate
+.\discord-bot-venv\Scripts\python.exe main.py
