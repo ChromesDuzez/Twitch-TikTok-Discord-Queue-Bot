@@ -368,6 +368,19 @@ class TimeTracking(commands.Cog):
                                                 value=f"<@{r['id']}>"))
         return out[:25]
 
+    async def unlinked_employee_autocomplete(self, ctx: discord.AutocompleteContext):
+        """Local employees not yet linked to an Odoo employee (for /linkemployee).
+        The choice value is a mention so it parses like a manually-typed user."""
+        if self.db is None:
+            return []
+        rows = await self.db.fetchall(
+            "SELECT id, name FROM employee WHERE odooId IS NULL ORDER BY name"
+        )
+        term = ctx.value.lower()
+        out = [discord.OptionChoice(name=r["name"][:100], value=f"<@{r['id']}>")
+               for r in rows if term in r["name"].lower()]
+        return out[:25]
+
     @discord.slash_command(name="addemployee", description="Add a new Employee to the system.")
     @commands.has_permissions(administrator=True)
     async def addemployee(
@@ -426,7 +439,7 @@ class TimeTracking(commands.Cog):
     @commands.has_permissions(administrator=True)
     async def linkemployee(
         self, ctx: discord.ApplicationContext,
-        user: discord.Option(str, description="The employee's Discord user"),  # type: ignore
+        user: discord.Option(str, description="The employee to link", autocomplete=unlinked_employee_autocomplete),  # type: ignore
         odoo_employee: discord.Option(int, description="Odoo employee", autocomplete=odoo_employee_autocomplete),  # type: ignore
     ):
         db = await self._ensure_db()
