@@ -38,7 +38,7 @@ async def get_current_punch(db: Database, employee_id: int) -> int | None:
     """The id of the employee's open punch (clocked in), or None."""
     row = await db.fetchone(
         "SELECT id FROM punch_clock WHERE employeeID = ? AND punchOutTime IS NULL "
-        "ORDER BY id DESC LIMIT 1",
+        "AND legacy = 0 ORDER BY id DESC LIMIT 1",
         (employee_id,),
     )
     return row["id"] if row else None

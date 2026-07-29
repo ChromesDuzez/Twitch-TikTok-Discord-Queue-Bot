@@ -49,6 +49,10 @@ CREATE TABLE punch_clock (
     checkChannelId   UNSIGNED BIG INT NULL DEFAULT NULL,
     checkMessageId   UNSIGNED BIG INT NULL DEFAULT NULL,
     odooId           UNSIGNED BIG INT NULL DEFAULT NULL,
+    -- legacy = migrated pre-v2 historical data: reportable but NEVER synced to Odoo,
+    -- and ignored when finding the "current open punch" (so it can't leak on clock-out).
+    -- The v1->v2 upgrade sets this to 1 for every migrated punch; new punches are 0.
+    legacy           BOOLEAN          NOT NULL DEFAULT 0,
     FOREIGN KEY (employeeID) REFERENCES employee(id)
 );
 

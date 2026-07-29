@@ -205,10 +205,10 @@ class SyncWorker:
 
     async def _sync_punch_in(self, punch_id: int):
         punch = await self.db.fetchone(
-            "SELECT employeeID, punchInTime, odooId FROM punch_clock WHERE id = ?", (punch_id,)
+            "SELECT employeeID, punchInTime, odooId, legacy FROM punch_clock WHERE id = ?", (punch_id,)
         )
-        if punch is None or punch["odooId"] is not None:
-            return True  # already synced
+        if punch is None or punch["legacy"] or punch["odooId"] is not None:
+            return True  # legacy (never sync) or already synced
         emp_odoo = await self._employee_odoo_id(punch["employeeID"])
         if not emp_odoo or not punch["punchInTime"]:
             return "retry"  # employee not linked to Odoo yet
@@ -221,9 +221,9 @@ class SyncWorker:
 
     async def _sync_punch_out(self, punch_id: int):
         punch = await self.db.fetchone(
-            "SELECT punchOutTime, odooId FROM punch_clock WHERE id = ?", (punch_id,)
+            "SELECT punchOutTime, odooId, legacy FROM punch_clock WHERE id = ?", (punch_id,)
         )
-        if punch is None:
+        if punch is None or punch["legacy"]:
             return True
         if punch["odooId"] is None:
             return "retry"  # wait for the check-in to sync first
@@ -238,10 +238,10 @@ class SyncWorker:
         """Push an admin time correction to Odoo. Creates the attendance if it
         wasn't synced yet, otherwise rewrites check-in/check-out."""
         punch = await self.db.fetchone(
-            "SELECT employeeID, punchInTime, punchOutTime, odooId FROM punch_clock WHERE id = ?",
+            "SELECT employeeID, punchInTime, punchOutTime, odooId, legacy FROM punch_clock WHERE id = ?",
             (punch_id,),
         )
-        if punch is None or not punch["punchInTime"]:
+        if punch is None or punch["legacy"] or not punch["punchInTime"]:
             return True
         emp_odoo = await self._employee_odoo_id(punch["employeeID"])
         if not emp_odoo:
@@ -269,6 +269,11 @@ class SyncWorker:
         )
         if wt is None or wt["odooId"] is not None:
             return True  # gone or already timesheeted
+        punch = await self.db.fetchone(
+            "SELECT employeeID, odooId, legacy FROM punch_clock WHERE id = ?", (wt["punchID"],)
+        )
+        if punch is None or punch["legacy"]:
+            return True  # legacy worktime (historical): never sync
         if not wt["odooProjectId"]:
             # No Odoo work item linked (e.g. created while Odoo was offline).
             # Local record stays authoritative; nothing to post.
@@ -276,10 +281,7 @@ class SyncWorker:
         if not wt["timeSpent"]:
             return True  # still open / zero hours -- nothing to post yet
 
-        punch = await self.db.fetchone(
-            "SELECT employeeID, odooId FROM punch_clock WHERE id = ?", (wt["punchID"],)
-        )
-        emp_odoo = await self._employee_odoo_id(punch["employeeID"]) if punch else None
+        emp_odoo = await self._employee_odoo_id(punch["employeeID"])
         if not emp_odoo:
             return "retry"  # employee not linked to Odoo yet
         # Wait for the parent attendance to sync so we can set the shift link.

@@ -138,6 +138,7 @@ class Database:
                 checkChannelId   UNSIGNED BIG INT NULL DEFAULT NULL,
                 checkMessageId   UNSIGNED BIG INT NULL DEFAULT NULL,
                 odooId           UNSIGNED BIG INT NULL DEFAULT NULL,
+                legacy           BOOLEAN          NOT NULL DEFAULT 0,
                 FOREIGN KEY (employeeID) REFERENCES employee(id)
             );
             CREATE TABLE customer (
@@ -285,6 +286,12 @@ class Database:
             await c.execute("ALTER TABLE customer ADD COLUMN archived BOOLEAN NOT NULL DEFAULT 0")
         if not await self._column_exists("employee", "archived"):
             await c.execute("ALTER TABLE employee ADD COLUMN archived BOOLEAN NOT NULL DEFAULT 0")
+        # Everything present at the v1->v2 upgrade is historical: flag it 'legacy' so
+        # it stays reportable but is NEVER synced to Odoo (and is ignored as an open
+        # punch, so employees start clocked-out and stale v1 punches can't leak).
+        if not await self._column_exists("punch_clock", "legacy"):
+            await c.execute("ALTER TABLE punch_clock ADD COLUMN legacy BOOLEAN NOT NULL DEFAULT 0")
+            await c.execute("UPDATE punch_clock SET legacy = 1")
         await c.commit()
 
         # 2. Sync queues + admin-approval queue.
@@ -344,11 +351,12 @@ class Database:
                 checkChannelId   UNSIGNED BIG INT NULL DEFAULT NULL,
                 checkMessageId   UNSIGNED BIG INT NULL DEFAULT NULL,
                 odooId           UNSIGNED BIG INT NULL DEFAULT NULL,
+                legacy           BOOLEAN          NOT NULL DEFAULT 0,
                 FOREIGN KEY (employeeID) REFERENCES employee(id)
             )
             """,
             "id, employeeID, punchInTime, punchInApproval, punchOutTime, "
-            "punchOutApproval, ignoreLunchBreak, checkChannelId, checkMessageId, odooId",
+            "punchOutApproval, ignoreLunchBreak, checkChannelId, checkMessageId, odooId, legacy",
         )
         await self._rebuild_id_as_rowid(
             "work_time",
