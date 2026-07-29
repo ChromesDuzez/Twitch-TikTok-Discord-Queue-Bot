@@ -768,6 +768,50 @@ class TimeTracking(commands.Cog):
         rows = await self.db.fetchall("SELECT name FROM employee_group")
         return [r["name"] for r in rows if ctx.value.lower() in r["name"].lower()]
 
+    async def _gather_timecard(self, db, employee_ids, start, end):
+        """Build (employees, punch_data, employee_data) for the given employees whose
+        punch-in falls in [start, end). Shared by all report commands; legacy punches
+        are INCLUDED (this is reporting, not sync)."""
+        if not employee_ids:
+            return [], {}, {}
+        placeholders = ",".join("?" for _ in employee_ids)
+        punches = await db.fetchall(
+            f"""
+            SELECT e.id, e.name, pc.id AS punch_id, pc.punchInTime, pc.punchOutTime,
+                   pc.punchInApproval, pc.punchOutApproval, pc.ignoreLunchBreak
+            FROM punch_clock pc
+            JOIN employee e ON pc.employeeID = e.id
+            WHERE pc.punchInTime BETWEEN ? AND ? AND e.id IN ({placeholders})
+            ORDER BY e.name, pc.punchInTime
+            """,
+            tuple([str(start), str(end)] + list(employee_ids)),
+        )
+        punch_data: dict = {}
+        employee_data: dict = {}
+        for p in punches:
+            name = p["name"]
+            punch_tuple = (name, p["punch_id"], p["punchInTime"], p["punchOutTime"],
+                           p["punchInApproval"], p["punchOutApproval"], p["ignoreLunchBreak"])
+            work_rows = await db.fetchall(
+                """
+                SELECT wt.punchType, c.name, wt.timeSpent
+                FROM work_time wt JOIN customer c ON wt.customerID = c.id
+                WHERE wt.punchID = ? ORDER BY wt.timeStarted
+                """,
+                (p["punch_id"],),
+            )
+            work_punches = [(w["punchType"], w["name"], w["timeSpent"]) for w in work_rows]
+            if name not in punch_data:
+                punch_data[name] = []
+                emp = await db.fetchone(
+                    "SELECT name, addressLine1, addressLine2, addressCity, addressState, "
+                    "addressZip, phoneNumber FROM employee WHERE id = ?",
+                    (p["id"],),
+                )
+                employee_data[name] = tuple(emp)
+            punch_data[name].append((punch_tuple, work_punches))
+        return list(punch_data.keys()), punch_data, employee_data
+
     @discord.slash_command(name="timecardreport", description="Generate a weekly punch report given an end date.")
     @commands.has_permissions(administrator=True)
     async def timecardreport(
@@ -797,48 +841,13 @@ class TimeTracking(commands.Cog):
                 await ctx.respond(f"No employees in group '{employee_group}'.", ephemeral=True)
                 return
 
-            placeholders = ",".join("?" for _ in employee_ids)
-            punches = await db.fetchall(
-                f"""
-                SELECT e.id, e.name, pc.id AS punch_id, pc.punchInTime, pc.punchOutTime,
-                       pc.punchInApproval, pc.punchOutApproval, pc.ignoreLunchBreak
-                FROM punch_clock pc
-                JOIN employee e ON pc.employeeID = e.id
-                WHERE pc.punchInTime BETWEEN ? AND ? AND e.id IN ({placeholders})
-                ORDER BY e.name, pc.punchInTime
-                """,
-                tuple([str(week_start), str(week_end)] + employee_ids),
+            employees, punch_data, employee_data = await self._gather_timecard(
+                db, employee_ids, week_start, week_end
             )
-            if not punches:
+            if not employees:
                 await ctx.respond(f"No punches for the week ending {week_end_date} in '{employee_group}'.", ephemeral=True)
                 return
 
-            punch_data: dict = {}
-            employee_data: dict = {}
-            for p in punches:
-                name = p["name"]
-                punch_tuple = (name, p["punch_id"], p["punchInTime"], p["punchOutTime"],
-                               p["punchInApproval"], p["punchOutApproval"], p["ignoreLunchBreak"])
-                work_rows = await db.fetchall(
-                    """
-                    SELECT wt.punchType, c.name, wt.timeSpent
-                    FROM work_time wt JOIN customer c ON wt.customerID = c.id
-                    WHERE wt.punchID = ? ORDER BY wt.timeStarted
-                    """,
-                    (p["punch_id"],),
-                )
-                work_punches = [(w["punchType"], w["name"], w["timeSpent"]) for w in work_rows]
-                if name not in punch_data:
-                    punch_data[name] = []
-                    emp = await db.fetchone(
-                        "SELECT name, addressLine1, addressLine2, addressCity, addressState, "
-                        "addressZip, phoneNumber FROM employee WHERE id = ?",
-                        (p["id"],),
-                    )
-                    employee_data[name] = tuple(emp)
-                punch_data[name].append((punch_tuple, work_punches))
-
-            employees = list(punch_data.keys())
             safe_group = employee_group.strip().replace(" ", "_")
             file_path = f"reports/{safe_group}_Weekly_Report_{week_end_date}.xlsx"
 
@@ -858,6 +867,104 @@ class TimeTracking(commands.Cog):
         except Exception as e:  # noqa: BLE001
             log.exception(f"[Report] error: {e}")
             await ctx.respond(f"An error occurred: {e}", ephemeral=True)
+
+    @discord.slash_command(name="mytimecard", description="DM yourself your own timecard for a week.")
+    async def mytimecard(
+        self, ctx: discord.ApplicationContext,
+        week_end_date: discord.Option(str, default=None, description="Week-ending SATURDAY [YYYY-MM-DD]; defaults to the most recent.", autocomplete=week_ending_autocomplete),  # type: ignore
+    ):
+        from datetime import datetime, timedelta
+        db = await self._ensure_db()
+        await ctx.defer(ephemeral=True)
+        emp_id = ctx.author.id
+        if await db.fetchone("SELECT id FROM employee WHERE id = ?", (emp_id,)) is None:
+            await ctx.followup.send("You're not in the employee system.", ephemeral=True)
+            return
+        if not week_end_date:  # default to the most recent Saturday
+            today = datetime.now()
+            week_end_date = (today - timedelta(days=(today.weekday() - 5) % 7)).strftime("%Y-%m-%d")
+        try:
+            eow = datetime.strptime(week_end_date, "%Y-%m-%d")
+        except ValueError:
+            await ctx.followup.send("Invalid date — use YYYY-MM-DD (a Saturday).", ephemeral=True)
+            return
+        if not is_saturday(week_end_date):
+            await ctx.followup.send(f"{week_end_date} is a {get_day_of_week(week_end_date)}, not a Saturday.", ephemeral=True)
+            return
+        week_start, week_end = eow - timedelta(days=6), eow + timedelta(days=1)
+        employees, punch_data, employee_data = await self._gather_timecard(db, [emp_id], week_start, week_end)
+        if not employees:
+            await ctx.followup.send(f"You have no punches for the week ending {week_end_date}.", ephemeral=True)
+            return
+        os.makedirs("reports", exist_ok=True)
+        file_path = f"reports/My_Timecard_{emp_id}_{week_end_date}.xlsx"
+        await asyncio.to_thread(generate_timecard_report, file_path, employees, punch_data, employee_data, week_end_date)
+        try:
+            await ctx.author.send(content=f"Here's your timecard for the week ending {week_end_date}.",
+                                  file=discord.File(file_path))
+            await ctx.followup.send("I've DM'd you your timecard. \U0001f4ec", ephemeral=True)
+        except discord.Forbidden:  # DMs closed -> deliver ephemerally instead
+            await ctx.followup.send(content="Your DMs are closed, so here it is (only you can see this):",
+                                    file=discord.File(file_path), ephemeral=True)
+
+    @discord.slash_command(name="timecardrange", description="Report over a custom date range (up to 1 year).")
+    @commands.has_permissions(administrator=True)
+    async def timecardrange(
+        self, ctx: discord.ApplicationContext,
+        start_date: discord.Option(str, description="Start date [YYYY-MM-DD]"),  # type: ignore
+        end_date: discord.Option(str, description="End date [YYYY-MM-DD]"),  # type: ignore
+        employee_group: discord.Option(str, default=None, description="Employee group (default: everyone)", autocomplete=employee_group_autocomplete),  # type: ignore
+    ):
+        from datetime import datetime, timedelta
+        db = await self._ensure_db()
+        await ctx.defer(ephemeral=True)
+        try:
+            start = datetime.strptime(start_date, "%Y-%m-%d")
+            end = datetime.strptime(end_date, "%Y-%m-%d")
+        except ValueError:
+            await ctx.followup.send("Invalid date — use YYYY-MM-DD.", ephemeral=True)
+            return
+        if end < start:
+            await ctx.followup.send("The end date is before the start date.", ephemeral=True)
+            return
+        if (end - start).days > 366:
+            await ctx.followup.send("That range is over a year — please pick 1 year or less (Excel gets slow).", ephemeral=True)
+            return
+        if employee_group:
+            group = await db.fetchone("SELECT id FROM employee_group WHERE name = ?", (employee_group,))
+            if not group:
+                await ctx.followup.send(f"Employee group '{employee_group}' not found.", ephemeral=True)
+                return
+            members = await db.fetchall("SELECT employeeID FROM group_member WHERE groupID = ?", (group["id"],))
+            employee_ids = [m["employeeID"] for m in members]
+            label_group = employee_group
+        else:
+            rows = await db.fetchall("SELECT id FROM employee WHERE archived = 0 OR archived IS NULL")
+            employee_ids = [r["id"] for r in rows]
+            label_group = "All"
+        if not employee_ids:
+            await ctx.followup.send("No employees to report on.", ephemeral=True)
+            return
+        employees, punch_data, employee_data = await self._gather_timecard(
+            db, employee_ids, start, end + timedelta(days=1)  # inclusive of the end date
+        )
+        if not employees:
+            await ctx.followup.send(f"No punches between {start_date} and {end_date}.", ephemeral=True)
+            return
+        period_label = f"{start_date} to {end_date}"
+        os.makedirs("reports", exist_ok=True)
+        safe = label_group.strip().replace(" ", "_")
+        file_path = f"reports/{safe}_Range_{start_date}_to_{end_date}.xlsx"
+        await asyncio.to_thread(generate_timecard_report, file_path, employees, punch_data, employee_data, period_label)
+        chan_id = os.getenv("TIMECARD_REPORTS_CHANNEL_ID")
+        reports_channel = self.bot.get_channel(int(chan_id)) if chan_id else None
+        if reports_channel:
+            await reports_channel.send(content=f"Timecard report: **{label_group}**, {period_label}.",
+                                       file=discord.File(file_path))
+            await ctx.followup.send(f"Report for {period_label} sent to the reports channel.", ephemeral=True)
+        else:
+            await ctx.followup.send(content=f"Report for {period_label} (reports channel not set):",
+                                    file=discord.File(file_path), ephemeral=True)
 
     @discord.slash_command(name="timecardexportdb", description="Send the timecard db file in chat.")
     async def timecardexportdb(self, ctx: discord.ApplicationContext):
