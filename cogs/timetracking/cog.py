@@ -583,6 +583,33 @@ class TimeTracking(commands.Cog):
             )
         await ctx.respond(f"Clock deleted for {user}.", ephemeral=True)
 
+    @discord.slash_command(name="refreshclock", description="Refresh your own time clock if the display looks stuck.")
+    async def refreshclock(self, ctx: discord.ApplicationContext):
+        db = await self._ensure_db()
+        emp_id = ctx.author.id
+        row = await db.fetchone(
+            "SELECT clockChannelId, clockMessageId FROM employee WHERE id = ?", (emp_id,)
+        )
+        if row is None:
+            await ctx.respond("You're not set up with a time clock yet — ask an admin to run /createclock.", ephemeral=True)
+            return
+        if row["clockChannelId"] and row["clockMessageId"]:
+            try:
+                msg = await self.obtain_message(row["clockChannelId"], row["clockMessageId"])
+                await render_clock(self, msg, emp_id)
+                await ctx.respond("Your time clock has been refreshed.", ephemeral=True)
+                return
+            except discord.NotFound:
+                pass  # the message is gone -> re-create it below
+            except Exception as e:  # noqa: BLE001
+                log.exception("[Clock] refreshclock failed for %s", emp_id)
+                await ctx.respond(f"Couldn't refresh your clock: {e}", ephemeral=True)
+                return
+        # No/missing clock message -> re-create it in its original channel.
+        channel = self.bot.get_channel(row["clockChannelId"]) if row["clockChannelId"] else None
+        await self.make_clock(emp_id, channel or ctx.channel)
+        await ctx.respond("Your time clock message was missing, so I re-created it.", ephemeral=True)
+
     # ---- reports -----------------------------------------------------------
 
     async def week_ending_autocomplete(self, ctx: discord.AutocompleteContext):

@@ -122,12 +122,31 @@ class ClockView(discord.ui.View):
             if state.lunch_skipable:
                 self.add_item(IgnoreLunchButton(state.ignore_lunch))
 
+        # Always-visible self-service refresh (own row) so an employee can fix a
+        # stale display themselves.
+        self.add_item(RefreshButton(employee_id))
+
     # shared guard
     async def _guard(self, interaction: discord.Interaction) -> bool:
         if not _can_operate(interaction.user, self.employee_id):
             await interaction.response.send_message("This is not for you!", ephemeral=True)
             return False
         return True
+
+
+class RefreshButton(discord.ui.Button):
+    """Re-render the clock from DB state. Persistent (survives restarts) and on its
+    own row so it's always available if the display goes stale."""
+    def __init__(self, employee_id: int):
+        super().__init__(label="Refresh", emoji="🔄", style=discord.ButtonStyle.secondary,
+                         custom_id=f"clock:{employee_id}:refresh", row=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        view: ClockView = self.view
+        if not await view._guard(interaction):
+            return
+        await interaction.response.defer()
+        await render_clock(view.cog, view.message, view.employee_id)
 
 
 class ClockInButton(discord.ui.Button):
