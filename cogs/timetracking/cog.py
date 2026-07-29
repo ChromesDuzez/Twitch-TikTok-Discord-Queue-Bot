@@ -42,6 +42,7 @@ class TimeTracking(commands.Cog):
         self.inbox: inbox.InboxWorker | None = None
         self._lock = asyncio.Lock()
         self._odoo_employees: list | None = None  # cached hr.employee list for autocomplete
+        self._odoo_customers: list | None = None  # cached res.partner (customer) list for autocomplete
 
     # ---- lifecycle ---------------------------------------------------------
 
@@ -381,6 +382,49 @@ class TimeTracking(commands.Cog):
                for r in rows if term in r["name"].lower()]
         return out[:25]
 
+    async def unlinked_customer_autocomplete(self, ctx: discord.AutocompleteContext):
+        """Local customers not yet linked to an Odoo partner (value = local id)."""
+        if self.db is None:
+            return []
+        rows = await self.db.fetchall(
+            "SELECT id, name FROM customer WHERE odooId IS NULL "
+            "AND (archived IS NULL OR archived = 0) ORDER BY name"
+        )
+        term = ctx.value.lower()
+        return [discord.OptionChoice(name=r["name"][:100], value=r["id"])
+                for r in rows if term in r["name"].lower()][:25]
+
+    async def linked_customer_autocomplete(self, ctx: discord.AutocompleteContext):
+        """Local customers currently linked to an Odoo partner (value = local id)."""
+        if self.db is None:
+            return []
+        rows = await self.db.fetchall(
+            "SELECT id, name, odooId FROM customer WHERE odooId IS NOT NULL ORDER BY name"
+        )
+        term = ctx.value.lower()
+        return [discord.OptionChoice(name=f"{r['name']} (Odoo #{r['odooId']})"[:100], value=r["id"])
+                for r in rows if term in r["name"].lower() or term in str(r["odooId"])][:25]
+
+    async def odoo_customer_autocomplete(self, ctx: discord.AutocompleteContext):
+        """Suggest **unlinked** Odoo customers (res.partner). Cached per run; the
+        linked set is read fresh so it updates as links change."""
+        if not self.client.loaded:
+            return []
+        if self._odoo_customers is None:
+            try:
+                self._odoo_customers = await self.client.get_customer_list() or []
+            except Exception as e:  # noqa: BLE001
+                log.warning(f"[Odoo] customer autocomplete fetch failed: {e}")
+                return []
+        linked = set()
+        if self.db is not None:
+            linked = {r["odooId"] for r in
+                      await self.db.fetchall("SELECT odooId FROM customer WHERE odooId IS NOT NULL")}
+        term = ctx.value.lower()
+        matches = [c for c in self._odoo_customers
+                   if c["id"] not in linked and term in c["display_name"].lower()]
+        return [discord.OptionChoice(name=c["display_name"][:100], value=c["id"]) for c in matches[:25]]
+
     @discord.slash_command(name="addemployee", description="Add a new Employee to the system.")
     @commands.has_permissions(administrator=True)
     async def addemployee(
@@ -492,6 +536,104 @@ class TimeTracking(commands.Cog):
             f"That Odoo employee is now available to link again; new punches won't sync until re-linked.",
             ephemeral=True,
         )
+
+    # ---- customer <-> Odoo linking -----------------------------------------
+
+    @discord.slash_command(name="synccustomers", description="Auto-link local customers to Odoo partners by exact name.")
+    @commands.has_permissions(administrator=True)
+    async def synccustomers(self, ctx: discord.ApplicationContext):
+        if not self.client.loaded:
+            await ctx.respond("Odoo isn't configured, so there's nothing to link to.", ephemeral=True)
+            return
+        await ctx.defer(ephemeral=True)
+        db = await self._ensure_db()
+        try:
+            odoo_customers = await self.client.get_customer_list() or []
+        except Exception as e:  # noqa: BLE001
+            log.exception("[Customer] synccustomers: Odoo fetch failed")
+            await ctx.followup.send(f"Couldn't fetch Odoo customers: {e}", ephemeral=True)
+            return
+        # Case-insensitive Odoo name -> [partner ids]. One Odoo call, match in memory.
+        by_name: dict[str, list[int]] = {}
+        for c in odoo_customers:
+            by_name.setdefault((c["display_name"] or "").strip().lower(), []).append(c["id"])
+        already = {r["odooId"] for r in await db.fetchall("SELECT odooId FROM customer WHERE odooId IS NOT NULL")}
+        unlinked = await db.fetchall(
+            "SELECT id, name FROM customer WHERE odooId IS NULL AND (archived IS NULL OR archived = 0)"
+        )
+        linked = ambiguous = nomatch = 0
+        for c in unlinked:
+            candidates = [i for i in by_name.get((c["name"] or "").strip().lower(), []) if i not in already]
+            if len(candidates) == 1:
+                await db.execute("UPDATE customer SET odooId = ? WHERE id = ?", (candidates[0], c["id"]))
+                already.add(candidates[0]); linked += 1
+            elif len(candidates) > 1:
+                ambiguous += 1
+            else:
+                nomatch += 1
+        timecard_log.info(f"[Customer] {ctx.author} synccustomers: {linked} linked, {ambiguous} ambiguous, {nomatch} no-match.")
+        await ctx.followup.send(
+            f"Auto-link complete: **{linked}** linked by exact name. "
+            f"**{ambiguous + nomatch}** still unlinked ({ambiguous} ambiguous, {nomatch} no match) — "
+            f"link those with `/linkcustomer` (see `/unlinkedcustomers`).",
+            ephemeral=True,
+        )
+
+    @discord.slash_command(name="linkcustomer", description="Link a local customer to their Odoo partner.")
+    @commands.has_permissions(administrator=True)
+    async def linkcustomer(
+        self, ctx: discord.ApplicationContext,
+        customer: discord.Option(int, description="Local customer", autocomplete=unlinked_customer_autocomplete),  # type: ignore
+        odoo_partner: discord.Option(int, description="Odoo customer", autocomplete=odoo_customer_autocomplete),  # type: ignore
+    ):
+        db = await self._ensure_db()
+        row = await db.fetchone("SELECT id, name FROM customer WHERE id = ?", (customer,))
+        if row is None:
+            await ctx.respond("That customer isn't in the database.", ephemeral=True)
+            return
+        clash = await db.fetchone("SELECT name FROM customer WHERE odooId = ? AND id != ?", (odoo_partner, customer))
+        if clash is not None:
+            await ctx.respond(
+                f"Odoo partner {odoo_partner} is already linked to '{clash['name']}'. "
+                f"Unlink it first with /unlinkcustomer.", ephemeral=True,
+            )
+            return
+        await db.execute("UPDATE customer SET odooId = ? WHERE id = ?", (odoo_partner, customer))
+        timecard_log.info(f"[Customer] {ctx.author} linked customer {customer} ({row['name']}) to Odoo partner {odoo_partner}.")
+        await ctx.respond(f"Linked '{row['name']}' to Odoo partner {odoo_partner}.", ephemeral=True)
+
+    @discord.slash_command(name="unlinkcustomer", description="Remove a customer's link to their Odoo partner.")
+    @commands.has_permissions(administrator=True)
+    async def unlinkcustomer(
+        self, ctx: discord.ApplicationContext,
+        customer: discord.Option(int, description="Linked customer", autocomplete=linked_customer_autocomplete),  # type: ignore
+    ):
+        db = await self._ensure_db()
+        row = await db.fetchone("SELECT name, odooId FROM customer WHERE id = ?", (customer,))
+        if row is None:
+            await ctx.respond("That customer isn't in the database.", ephemeral=True)
+            return
+        if row["odooId"] is None:
+            await ctx.respond(f"'{row['name']}' isn't linked to an Odoo partner.", ephemeral=True)
+            return
+        await db.execute("UPDATE customer SET odooId = NULL WHERE id = ?", (customer,))
+        timecard_log.info(f"[Customer] {ctx.author} unlinked customer {customer} ({row['name']}) from Odoo partner {row['odooId']}.")
+        await ctx.respond(f"Unlinked '{row['name']}' from Odoo partner {row['odooId']}.", ephemeral=True)
+
+    @discord.slash_command(name="unlinkedcustomers", description="List local customers not yet linked to an Odoo partner.")
+    @commands.has_permissions(administrator=True)
+    async def unlinkedcustomers(self, ctx: discord.ApplicationContext):
+        db = await self._ensure_db()
+        rows = await db.fetchall(
+            "SELECT name FROM customer WHERE odooId IS NULL AND (archived IS NULL OR archived = 0) ORDER BY name"
+        )
+        if not rows:
+            await ctx.respond("All customers are linked to Odoo. \U0001f389", ephemeral=True)
+            return
+        names = [r["name"] for r in rows]
+        preview = "\n".join(f"• {n}" for n in names[:40])
+        more = f"\n…and {len(names) - 40} more." if len(names) > 40 else ""
+        await ctx.respond(f"**{len(names)}** unlinked customer(s):\n{preview}{more}\n\nLink them with /linkcustomer.", ephemeral=True)
 
     # ---- clock commands ----------------------------------------------------
 

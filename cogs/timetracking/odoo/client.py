@@ -145,6 +145,17 @@ class OdooClient:
             },
         )
 
+    async def get_customer_list(self):
+        """All Odoo customers (res.partner with customer_rank > 0), for linking."""
+        return await self.call(
+            "/res.partner/search_read",
+            {
+                "domain": [["customer_rank", ">", 0], ["active", "=", True]],
+                "fields": ["id", "display_name"],
+                "order": "display_name asc",
+            },
+        )
+
     async def create_partner(self, name: str, block_duplicate: bool = True):
         if block_duplicate:
             existing = await self.search_partners_by_name(name)
