@@ -28,7 +28,19 @@ from .reports import (
     get_day_of_week,
     is_saturday,
 )
-from .views import ApprovePunch, DeleteApproval, render_clock
+from .views import ApprovePunch, DeleteApproval, delete_punch_cascade, render_clock
+
+
+def _parse_punch_time(raw: str) -> str:
+    """Accept 'YYYY-MM-DD HH:MM' or '...:SS' -> normalized 'YYYY-MM-DD HH:MM:SS'."""
+    from datetime import datetime
+    raw = (raw or "").strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return datetime.strptime(raw, fmt).strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            continue
+    raise ValueError(f"'{raw}' isn't a valid date/time — use `YYYY-MM-DD HH:MM` (e.g. 2026-08-19 08:00).")
 
 
 class TimeTracking(commands.Cog):
@@ -201,6 +213,19 @@ class TimeTracking(commands.Cog):
         )
         await render_clock(self, message, employee_id)
         return message
+
+    async def _refresh_clock(self, employee_id: int):
+        """Re-render an employee's clock message if they have one (best-effort)."""
+        row = await self.db.fetchone(
+            "SELECT clockChannelId, clockMessageId FROM employee WHERE id = ?", (employee_id,)
+        )
+        if not row or not row["clockChannelId"] or not row["clockMessageId"]:
+            return
+        try:
+            msg = await self.obtain_message(row["clockChannelId"], row["clockMessageId"])
+            await render_clock(self, msg, employee_id)
+        except Exception:  # noqa: BLE001
+            log.warning("[Clock] Could not refresh clock for employee %s", employee_id)
 
     async def set_employee_archived(self, employee_id: int, archived: bool) -> bool:
         """Archive or reactivate an employee. Used by the Odoo hr.employee reconcile
@@ -437,6 +462,37 @@ class TimeTracking(commands.Cog):
                    if c["id"] not in linked and term in c["display_name"].lower()]
         return [discord.OptionChoice(name=c["display_name"][:100], value=c["id"]) for c in matches[:25]]
 
+    async def employee_autocomplete(self, ctx: discord.AutocompleteContext):
+        """All active employees (value = a mention, so it parses like a typed user)."""
+        if self.db is None:
+            return []
+        rows = await self.db.fetchall(
+            "SELECT id, name FROM employee WHERE archived = 0 OR archived IS NULL ORDER BY name"
+        )
+        term = ctx.value.lower()
+        return [discord.OptionChoice(name=r["name"][:100], value=f"<@{r['id']}>")
+                for r in rows if term in r["name"].lower()][:25]
+
+    async def punch_autocomplete(self, ctx: discord.AutocompleteContext):
+        """Recent punches, shown as 'Name · MM-DD HH:MM→out (#id)' (value = punch id)."""
+        if self.db is None:
+            return []
+        rows = await self.db.fetchall(
+            "SELECT pc.id, e.name, pc.punchInTime, pc.punchOutTime FROM punch_clock pc "
+            "JOIN employee e ON pc.employeeID = e.id ORDER BY pc.id DESC LIMIT 300"
+        )
+        term = ctx.value.lower()
+        out = []
+        for r in rows:
+            pin = (r["punchInTime"] or "")[5:16] or "?"
+            pout = (r["punchOutTime"] or "")[5:16] or "open"
+            label = f"{r['name']} · {pin}→{pout} (#{r['id']})"
+            if term in label.lower():
+                out.append(discord.OptionChoice(name=label[:100], value=r["id"]))
+            if len(out) >= 25:
+                break
+        return out
+
     @discord.slash_command(name="addemployee", description="Add a new Employee to the system.")
     @commands.has_permissions(administrator=True)
     async def addemployee(
@@ -646,6 +702,118 @@ class TimeTracking(commands.Cog):
         preview = "\n".join(f"• {n}" for n in names[:40])
         more = f"\n…and {len(names) - 40} more." if len(names) > 40 else ""
         await ctx.respond(f"**{len(names)}** unlinked customer(s):\n{preview}{more}\n\nLink them with /linkcustomer.", ephemeral=True)
+
+    # ---- punch management (after-the-fact fixes, no DB browser needed) ------
+
+    @discord.slash_command(name="addpunch", description="Manually add a punch for an employee (e.g. a missed clock-in).")
+    @commands.has_permissions(administrator=True)
+    async def addpunch(
+        self, ctx: discord.ApplicationContext,
+        employee: discord.Option(str, description="The employee", autocomplete=employee_autocomplete),  # type: ignore
+        clock_in: discord.Option(str, description="Clock-in time [YYYY-MM-DD HH:MM]"),  # type: ignore
+        clock_out: discord.Option(str, default=None, description="Clock-out time [YYYY-MM-DD HH:MM] (leave blank for an open punch)"),  # type: ignore
+        approved: discord.Option(bool, default=True, description="Mark it approved (default yes)"),  # type: ignore
+    ):
+        db = await self._ensure_db()
+        try:
+            emp_id = int(employee[2:-1])
+        except (ValueError, IndexError):
+            await ctx.respond(f"'{employee}' is not a valid user mention.", ephemeral=True)
+            return
+        row = await db.fetchone("SELECT name FROM employee WHERE id = ?", (emp_id,))
+        if row is None:
+            await ctx.respond(f"{employee} is not in the employee database. Add them with /addemployee first.", ephemeral=True)
+            return
+        try:
+            pin = _parse_punch_time(clock_in)
+            pout = _parse_punch_time(clock_out) if clock_out else None
+        except ValueError as e:
+            await ctx.respond(str(e), ephemeral=True)
+            return
+        if pout and pout < pin:
+            await ctx.respond("Clock-out is before clock-in.", ephemeral=True)
+            return
+        appr = 1 if approved else 0
+        punch_id = await db.execute(
+            "INSERT INTO punch_clock (employeeID, punchInTime, punchInApproval, punchOutTime, punchOutApproval) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (emp_id, pin, appr, pout, appr),
+        )
+        await sync.enqueue(db, "punch", punch_id, "in")
+        if pout:
+            await sync.enqueue(db, "punch", punch_id, "out")
+        await self._refresh_clock(emp_id)
+        timecard_log.info(f"[Punch] {ctx.author} added punch {punch_id} for employee {emp_id} ({pin} -> {pout or 'open'}).")
+        await ctx.respond(f"Added punch #{punch_id} for {row['name']}: `{pin}` → `{pout or 'open'}`.", ephemeral=True)
+
+    @discord.slash_command(name="editpunch", description="Fix a punch's clock-in/out time or approval.")
+    @commands.has_permissions(administrator=True)
+    async def editpunch(
+        self, ctx: discord.ApplicationContext,
+        punch: discord.Option(int, description="The punch to edit", autocomplete=punch_autocomplete),  # type: ignore
+        clock_in: discord.Option(str, default=None, description="New clock-in time [YYYY-MM-DD HH:MM]"),  # type: ignore
+        clock_out: discord.Option(str, default=None, description="New clock-out time [YYYY-MM-DD HH:MM]"),  # type: ignore
+        approved: discord.Option(bool, default=None, description="Set approval (leave blank to keep as-is)"),  # type: ignore
+    ):
+        db = await self._ensure_db()
+        row = await db.fetchone(
+            "SELECT employeeID, punchInTime, punchOutTime FROM punch_clock WHERE id = ?", (punch,)
+        )
+        if row is None:
+            await ctx.respond("That punch doesn't exist.", ephemeral=True)
+            return
+        sets, params = [], []
+        try:
+            if clock_in is not None:
+                sets.append("punchInTime = ?"); params.append(_parse_punch_time(clock_in))
+            if clock_out is not None:
+                sets.append("punchOutTime = ?"); params.append(_parse_punch_time(clock_out))
+        except ValueError as e:
+            await ctx.respond(str(e), ephemeral=True)
+            return
+        if approved is not None:
+            sets.append("punchInApproval = ?"); params.append(1 if approved else 0)
+            sets.append("punchOutApproval = ?"); params.append(1 if approved else 0)
+        if not sets:
+            await ctx.respond("Nothing to change — provide a new clock-in, clock-out, or approval.", ephemeral=True)
+            return
+        await db.execute(f"UPDATE punch_clock SET {', '.join(sets)} WHERE id = ?", (*params, punch))
+        await sync.enqueue(db, "punch", punch, "edit")
+        await self._refresh_clock(row["employeeID"])
+        timecard_log.info(f"[Punch] {ctx.author} edited punch {punch} ({', '.join(sets)}).")
+        await ctx.respond(f"Updated punch #{punch}.", ephemeral=True)
+
+    @discord.slash_command(name="deletepunch", description="Delete a punch and its worktime (FK-safe).")
+    @commands.has_permissions(administrator=True)
+    async def deletepunch(
+        self, ctx: discord.ApplicationContext,
+        punch: discord.Option(int, description="The punch to delete", autocomplete=punch_autocomplete),  # type: ignore
+    ):
+        db = await self._ensure_db()
+        row = await db.fetchone(
+            "SELECT e.name AS ename, pc.punchInTime, pc.punchOutTime FROM punch_clock pc "
+            "JOIN employee e ON pc.employeeID = e.id WHERE pc.id = ?", (punch,)
+        )
+        if row is None:
+            await ctx.respond("That punch doesn't exist.", ephemeral=True)
+            return
+        n = (await db.fetchone("SELECT count(*) c FROM work_time WHERE punchID = ?", (punch,)))["c"]
+        extra = f" and its **{n}** worktime entr{'y' if n == 1 else 'ies'}" if n else ""
+        confirm = Confirm(user=ctx.user, timeout=60)
+        await ctx.respond(
+            f"Delete punch #{punch} for **{row['ename']}** "
+            f"(`{row['punchInTime']}` → `{row['punchOutTime'] or 'open'}`){extra}?",
+            view=confirm, ephemeral=True,
+        )
+        await confirm.wait()
+        if not confirm.value:
+            await ctx.followup.send("Cancelled.", ephemeral=True)
+            return
+        emp = await delete_punch_cascade(self, punch, to_odoo=True)
+        timecard_log.info(f"[Punch] {ctx.author} deleted punch {punch} via /deletepunch.")
+        if emp:
+            await self._refresh_clock(emp)
+        await ctx.followup.send(f"Deleted punch #{punch}.", ephemeral=True)
 
     # ---- clock commands ----------------------------------------------------
 
