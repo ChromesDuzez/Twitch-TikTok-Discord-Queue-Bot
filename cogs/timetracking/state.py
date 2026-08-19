@@ -53,7 +53,7 @@ async def load_state(db: Database, employee_id: int) -> ClockState:
     if current_punch is not None:
         wt = await db.fetchone(
             "SELECT id, punchType FROM work_time WHERE punchID = ? AND timeSpent = 0 "
-            "ORDER BY id DESC LIMIT 1",
+            "AND detached = 0 ORDER BY id DESC LIMIT 1",
             (current_punch,),
         )
         if wt:

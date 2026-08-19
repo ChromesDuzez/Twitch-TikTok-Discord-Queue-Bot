@@ -397,43 +397,56 @@ class InboxWorker:
         linked_punch = await self._punch_by_attendance(att_odoo)
 
         wt = await self.db.fetchone(
-            "SELECT id, punchID, customerID, punchType, timeSpent, timeStarted, odooTaskId, odooProjectId "
-            "FROM work_time WHERE odooId = ?",
+            "SELECT id, punchID, customerID, punchType, timeSpent, timeStarted, odooTaskId, "
+            "odooProjectId, detached FROM work_time WHERE odooId = ?",
             (odoo_id,),
         )
 
         if wt is not None:
             # Existing line -> re-sync every field an admin could have changed in
-            # Odoo (hours, project/category, task, customer, date, and the shift it
-            # belongs to). Attribution is Discord-first, but admins do correct these
-            # directly in Odoo, so we mirror them back rather than let them drift.
+            # Odoo (hours, project/category, task, customer, and the shift it belongs
+            # to). Attribution is Discord-first, but admins do correct these directly
+            # in Odoo, so we mirror them back rather than let them drift.
             new_customer = wt["customerID"]
             if isinstance(partner, (list, tuple)):
                 new_customer = await self.cog.resolve_customer(partner[1])
-            # NB: timeStarted is deliberately *not* reconciled. It's shift-derived
-            # (the punch's start), used only to refresh the view and compute
-            # timeSpent at clock-out -- the Odoo line carries just a date, so
-            # pulling it back would desync the worktime from its own shift.
-            # Re-attach to a different shift only when it resolves to a known punch;
-            # a cleared/untracked link keeps the current punch (never orphan).
-            new_punch = linked_punch if linked_punch is not None else wt["punchID"]
+            # NB: timeStarted is deliberately *not* reconciled -- it's shift-derived.
+            #
+            # Shift link decides attachment:
+            #  * resolves to a known punch  -> (re)attach there and clear 'detached'
+            #  * explicitly cleared in Odoo -> SOFT-DETACH: keep the row + its last
+            #    punch, but flag detached so it's hidden from reports/clock and not
+            #    synced, until a shift is re-assigned (which re-attaches this same row)
+            #  * set to an untracked shift  -> leave the current state alone
+            # (A real Odoo-side *delete* of the line hard-removes the row elsewhere.)
+            if self.client.shift_field_available and linked_punch is not None:
+                new_punch, new_detached = linked_punch, 0
+            elif self.client.shift_field_available and not shift:
+                new_punch, new_detached = wt["punchID"], 1
+            else:
+                new_punch, new_detached = wt["punchID"], wt["detached"]
 
             changed = (
                 minutes != wt["timeSpent"] or punch_type != wt["punchType"]
                 or (proj_id or None) != (wt["odooProjectId"] or None)
                 or (task_id or None) != (wt["odooTaskId"] or None)
                 or new_customer != wt["customerID"] or new_punch != wt["punchID"]
+                or new_detached != wt["detached"]
             )
             if not changed:
                 return False
             await self.db.execute(
                 "UPDATE work_time SET punchID = ?, customerID = ?, punchType = ?, timeSpent = ?, "
-                "odooTaskId = ?, odooProjectId = ? WHERE id = ?",
-                (new_punch, new_customer, punch_type, minutes, task_id, proj_id, wt["id"]),
+                "odooTaskId = ?, odooProjectId = ?, detached = ? WHERE id = ?",
+                (new_punch, new_customer, punch_type, minutes, task_id, proj_id, new_detached, wt["id"]),
             )
             await self._refresh_punch_clock(wt["punchID"])
             if new_punch != wt["punchID"]:
                 await self._refresh_punch_clock(new_punch)
+            if new_detached != wt["detached"]:
+                log.info(f"[Inbox] analytic.line {odoo_id} "
+                         f"{'soft-detached (shift cleared)' if new_detached else 're-attached to a shift'}.")
+            elif new_punch != wt["punchID"]:
                 log.info(f"[Inbox] analytic.line {odoo_id} moved punch {wt['punchID']} -> {new_punch}.")
             log.info(f"[Inbox] Updated local worktime from Odoo analytic.line {odoo_id}.")
             return True

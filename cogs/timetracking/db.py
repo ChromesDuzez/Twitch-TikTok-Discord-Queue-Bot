@@ -157,6 +157,7 @@ class Database:
                 odooId        UNSIGNED BIG INT NULL DEFAULT NULL,
                 odooTaskId    UNSIGNED BIG INT NULL DEFAULT NULL,
                 odooProjectId UNSIGNED BIG INT NULL DEFAULT NULL,
+                detached      BOOLEAN          NOT NULL DEFAULT 0,
                 FOREIGN KEY (punchID) REFERENCES punch_clock(id),
                 FOREIGN KEY (customerID) REFERENCES customer(id)
             );
@@ -267,6 +268,7 @@ class Database:
         ("work_time", "odooId", "UNSIGNED BIG INT NULL DEFAULT NULL"),
         ("work_time", "odooTaskId", "UNSIGNED BIG INT NULL DEFAULT NULL"),
         ("work_time", "odooProjectId", "UNSIGNED BIG INT NULL DEFAULT NULL"),
+        ("work_time", "detached", "BOOLEAN NOT NULL DEFAULT 0"),
     )
 
     async def _ensure_columns(self):

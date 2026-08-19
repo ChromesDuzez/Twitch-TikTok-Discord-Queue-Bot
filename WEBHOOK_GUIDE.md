@@ -199,7 +199,8 @@ edit stays in sync instead of silently diverging. What's reconciled today:
 | Re-assign `hr.attendance` to another employee | Punch moves to that employee (old + new clocks re-render). If the new employee isn't linked locally, the punch is left as-is and a warning is logged |
 | **Create** an `hr.attendance` from scratch in Odoo | Mirrored into a new local punch (employee resolved via its `odooId`); an in-flight punch the bot just created is *adopted*, not duplicated |
 | Edit an `account.analytic.line` (hours, project, task, customer) | The `work_time` row is re-synced field-for-field; category (`punchType`) is re-derived from the project. The line's `date` is **not** pulled back — `timeStarted` stays shift-derived |
-| Move an `account.analytic.line` to a different `x_studio_shift` | The `work_time` is re-attached to that punch (clearing the link keeps the current punch — never orphaned) |
+| Move an `account.analytic.line` to a different `x_studio_shift` | The `work_time` is re-attached to that punch |
+| **Clear** the `x_studio_shift` on a worktime | The `work_time` is **soft-detached** — kept but hidden from reports/clock and not attributed, until a shift is re-assigned (re-attaches the same row); only a real Odoo delete removes it |
 | **Create** an `account.analytic.line` with a shift link | Mirrored into a new `work_time` on the linked punch |
 | Rename / archive a `res.partner` | `customer` name / `archived` flag updated |
 | Archive / unarchive an `hr.employee` (e.g. a temp worker who didn't work out) | Linked employee is archived (clock removed → can't punch in, history kept) or reactivated |

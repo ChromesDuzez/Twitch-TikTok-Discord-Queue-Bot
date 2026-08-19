@@ -80,6 +80,10 @@ CREATE TABLE work_time (
     odooId        UNSIGNED BIG INT NULL DEFAULT NULL,
     odooTaskId    UNSIGNED BIG INT NULL DEFAULT NULL,
     odooProjectId UNSIGNED BIG INT NULL DEFAULT NULL,
+    -- detached = its Odoo shift link (x_studio_shift) was cleared: the row is kept
+    -- but soft-hidden (excluded from reports/clock, not attributed) until a shift is
+    -- re-assigned, which re-attaches it. A real Odoo-side delete removes the row.
+    detached      BOOLEAN          NOT NULL DEFAULT 0,
     FOREIGN KEY (punchID) REFERENCES punch_clock(id),
     FOREIGN KEY (customerID) REFERENCES customer(id)
 );

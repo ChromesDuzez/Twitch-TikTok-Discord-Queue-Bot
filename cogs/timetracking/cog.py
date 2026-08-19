@@ -808,7 +808,7 @@ class TimeTracking(commands.Cog):
                 """
                 SELECT wt.punchType, c.name, wt.timeSpent
                 FROM work_time wt JOIN customer c ON wt.customerID = c.id
-                WHERE wt.punchID = ? ORDER BY wt.timeStarted
+                WHERE wt.punchID = ? AND wt.detached = 0 ORDER BY wt.timeStarted
                 """,
                 (p["punch_id"],),
             )
