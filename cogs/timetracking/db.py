@@ -249,7 +249,45 @@ class Database:
 
         await c.execute("UPDATE schema_version SET version = ?", (TARGET_VERSION,))
         await c.commit()
+        # Self-heal: add any expected column that's missing. Handles a database that
+        # was stamped at the current version BEFORE a column was later introduced
+        # (e.g. a dev/test db created before `legacy` existed) without a recreate.
+        await self._ensure_columns()
         log.info(f"[DB] Schema at version {TARGET_VERSION}.")
+
+    # Columns that must exist on the current schema. Kept idempotent so a db
+    # stamped before a column was added self-heals on the next startup.
+    _EXPECTED_COLUMNS = (
+        ("employee", "odooId", "UNSIGNED BIG INT NULL DEFAULT NULL"),
+        ("employee", "archived", "BOOLEAN NOT NULL DEFAULT 0"),
+        ("punch_clock", "odooId", "UNSIGNED BIG INT NULL DEFAULT NULL"),
+        ("punch_clock", "legacy", "BOOLEAN NOT NULL DEFAULT 0"),
+        ("customer", "odooId", "UNSIGNED BIG INT NULL DEFAULT NULL"),
+        ("customer", "archived", "BOOLEAN NOT NULL DEFAULT 0"),
+        ("work_time", "odooId", "UNSIGNED BIG INT NULL DEFAULT NULL"),
+        ("work_time", "odooTaskId", "UNSIGNED BIG INT NULL DEFAULT NULL"),
+        ("work_time", "odooProjectId", "UNSIGNED BIG INT NULL DEFAULT NULL"),
+    )
+
+    async def _ensure_columns(self):
+        """Idempotently add any missing expected column. New columns default to
+        their neutral value (e.g. legacy=0) -- data already at this version is NOT
+        historical, so it is correctly left non-legacy and still syncs."""
+        c = self._conn
+        added = False
+        for table, col, decl in self._EXPECTED_COLUMNS:
+            if not await self._column_exists(table, col):
+                await c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+                log.warning(f"[DB] Added missing column {table}.{col} (self-heal).")
+                added = True
+        if added:
+            # Requeue any sync rows that only failed because of the now-added column.
+            for tbl in ("odoo_outbox", "odoo_inbox"):
+                await c.execute(
+                    f"UPDATE {tbl} SET status = 'pending', attempts = 0, last_error = NULL "
+                    f"WHERE status = 'failed' AND last_error LIKE '%no such column%'"
+                )
+        await c.commit()
 
     async def _is_fresh_target(self) -> bool:
         """True when punch_clock already uses an INTEGER rowid PK (fresh create)."""
