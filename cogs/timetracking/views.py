@@ -665,7 +665,7 @@ async def delete_punch_cascade(cog, punch_id: int, to_odoo: bool = True) -> int 
     )
     if punch is None:
         return None
-    worktimes = await db.fetchall("SELECT id, odooId FROM work_time WHERE punchID = ?", (punch_id,))
+    worktimes = await db.fetchall("SELECT id, odooId, detached FROM work_time WHERE punchID = ?", (punch_id,))
 
     # Cancel any still-pending (non-delete) Odoo pushes for these rows.
     await db.execute(
@@ -677,9 +677,12 @@ async def delete_punch_cascade(cog, punch_id: int, to_odoo: bool = True) -> int 
             "AND entity_type = 'worktime' AND entity_id = ?", (wt["id"],))
 
     # Cascade deletes to Odoo (lines before attendance; FIFO guarantees order).
+    # A DETACHED worktime's Odoo line was deliberately unlinked from this shift by an
+    # admin (kept, not deleted) -- so delete it locally (its punch is going away) but
+    # leave its Odoo line alone; only its local orphan is cleaned up.
     if to_odoo:
         for wt in worktimes:
-            if wt["odooId"]:
+            if wt["odooId"] and not wt["detached"]:
                 await sync.enqueue(db, "worktime", wt["id"], "delete", {"odoo_id": wt["odooId"]})
         if punch["odooId"]:
             await sync.enqueue(db, "punch", punch_id, "delete", {"odoo_id": punch["odooId"]})
