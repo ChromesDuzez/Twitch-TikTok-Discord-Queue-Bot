@@ -28,7 +28,11 @@ from .reports import (
     get_day_of_week,
     is_saturday,
 )
-from .views import ApprovePunch, DeleteApproval, delete_punch_cascade, render_clock
+from .views import (
+    ApprovePunch, DeleteApproval, delete_punch_cascade, delete_worktime_local, render_clock,
+)
+
+WORKTYPES = ["Construction", "Service", "Office"]
 
 
 def _parse_punch_time(raw: str) -> str:
@@ -41,6 +45,14 @@ def _parse_punch_time(raw: str) -> str:
         except ValueError:
             continue
     raise ValueError(f"'{raw}' isn't a valid date/time — use `YYYY-MM-DD HH:MM` (e.g. 2026-08-19 08:00).")
+
+
+def _hours_to_minutes(hours: float) -> int:
+    """Hours -> minutes rounded to the quarter hour (the schema requires % 15 == 0)."""
+    minutes = int(round((hours or 0) * 4) / 4 * 60)
+    if minutes < 0 or minutes > 1440:
+        raise ValueError("Hours must be between 0 and 24.")
+    return minutes
 
 
 class TimeTracking(commands.Cog):
@@ -493,6 +505,38 @@ class TimeTracking(commands.Cog):
                 break
         return out
 
+    async def customer_autocomplete(self, ctx: discord.AutocompleteContext):
+        """All active customers by name (value = local customer id)."""
+        if self.db is None:
+            return []
+        rows = await self.db.fetchall(
+            "SELECT id, name FROM customer WHERE archived = 0 OR archived IS NULL ORDER BY name"
+        )
+        term = ctx.value.lower()
+        return [discord.OptionChoice(name=r["name"][:100], value=r["id"])
+                for r in rows if term in r["name"].lower()][:25]
+
+    async def worktime_autocomplete(self, ctx: discord.AutocompleteContext):
+        """Recent worktime entries, shown as 'Name · Type Nh Customer (#id)'."""
+        if self.db is None:
+            return []
+        rows = await self.db.fetchall(
+            "SELECT wt.id, e.name AS ename, wt.punchType, wt.timeSpent, c.name AS cname "
+            "FROM work_time wt JOIN punch_clock pc ON wt.punchID = pc.id "
+            "JOIN employee e ON pc.employeeID = e.id LEFT JOIN customer c ON wt.customerID = c.id "
+            "ORDER BY wt.id DESC LIMIT 300"
+        )
+        term = ctx.value.lower()
+        out = []
+        for r in rows:
+            label = f"{r['ename']} · {r['punchType']} {r['timeSpent'] / 60:g}h" \
+                    f"{(' ' + r['cname']) if r['cname'] else ''} (#{r['id']})"
+            if term in label.lower():
+                out.append(discord.OptionChoice(name=label[:100], value=r["id"]))
+            if len(out) >= 25:
+                break
+        return out
+
     @discord.slash_command(name="addemployee", description="Add a new Employee to the system.")
     @commands.has_permissions(administrator=True)
     async def addemployee(
@@ -814,6 +858,101 @@ class TimeTracking(commands.Cog):
         if emp:
             await self._refresh_clock(emp)
         await ctx.followup.send(f"Deleted punch #{punch}.", ephemeral=True)
+
+    # ---- worktime management -----------------------------------------------
+
+    @discord.slash_command(name="addworktime", description="Add a worktime entry to a punch.")
+    @commands.has_permissions(administrator=True)
+    async def addworktime(
+        self, ctx: discord.ApplicationContext,
+        punch: discord.Option(int, description="The punch/shift", autocomplete=punch_autocomplete),  # type: ignore
+        worktype: discord.Option(str, description="Type of work", choices=WORKTYPES),  # type: ignore
+        hours: discord.Option(float, description="Hours on the quarter hour (e.g. 1.5)"),  # type: ignore
+        customer: discord.Option(int, default=None, description="Customer (required for Construction/Service)", autocomplete=customer_autocomplete),  # type: ignore
+    ):
+        db = await self._ensure_db()
+        prow = await db.fetchone("SELECT employeeID, punchInTime FROM punch_clock WHERE id = ?", (punch,))
+        if prow is None:
+            await ctx.respond("That punch doesn't exist.", ephemeral=True)
+            return
+        try:
+            minutes = _hours_to_minutes(hours)
+        except ValueError as e:
+            await ctx.respond(str(e), ephemeral=True)
+            return
+        cust_id = 0
+        if worktype in ("Construction", "Service"):
+            if not customer:
+                await ctx.respond(f"{worktype} work needs a customer.", ephemeral=True)
+                return
+            if await db.fetchone("SELECT 1 FROM customer WHERE id = ?", (customer,)) is None:
+                await ctx.respond("That customer doesn't exist.", ephemeral=True)
+                return
+            cust_id = customer
+        started = prow["punchInTime"] or sync.now_local_str()
+        wt_id = await db.execute(
+            "INSERT INTO work_time (punchID, customerID, punchType, timeSpent, timeStarted) VALUES (?, ?, ?, ?, ?)",
+            (punch, cust_id, worktype, minutes, started),
+        )
+        await self._refresh_clock(prow["employeeID"])
+        timecard_log.info(f"[Work] {ctx.author} added worktime {wt_id} to punch {punch} ({worktype}, {minutes}min).")
+        note = " (local only — it isn't pushed to Odoo; add it in Odoo directly if you need it there)" if self.client.loaded else ""
+        await ctx.respond(f"Added {worktype} worktime #{wt_id} ({hours:g}h) to punch #{punch}.{note}", ephemeral=True)
+
+    @discord.slash_command(name="editworktime", description="Edit a worktime entry's type, hours, or customer.")
+    @commands.has_permissions(administrator=True)
+    async def editworktime(
+        self, ctx: discord.ApplicationContext,
+        worktime: discord.Option(int, description="The worktime to edit", autocomplete=worktime_autocomplete),  # type: ignore
+        worktype: discord.Option(str, default=None, description="New type", choices=WORKTYPES),  # type: ignore
+        hours: discord.Option(float, default=None, description="New hours (quarter-hour)"),  # type: ignore
+        customer: discord.Option(int, default=None, description="New customer", autocomplete=customer_autocomplete),  # type: ignore
+    ):
+        db = await self._ensure_db()
+        wt = await db.fetchone("SELECT punchID, odooId FROM work_time WHERE id = ?", (worktime,))
+        if wt is None:
+            await ctx.respond("That worktime doesn't exist.", ephemeral=True)
+            return
+        sets, params = [], []
+        if worktype is not None:
+            sets.append("punchType = ?"); params.append(worktype)
+        if hours is not None:
+            try:
+                params.append(_hours_to_minutes(hours)); sets.append("timeSpent = ?")
+            except ValueError as e:
+                await ctx.respond(str(e), ephemeral=True)
+                return
+        if customer is not None:
+            if await db.fetchone("SELECT 1 FROM customer WHERE id = ?", (customer,)) is None:
+                await ctx.respond("That customer doesn't exist.", ephemeral=True)
+                return
+            sets.append("customerID = ?"); params.append(customer)
+        if not sets:
+            await ctx.respond("Nothing to change — provide a new type, hours, or customer.", ephemeral=True)
+            return
+        await db.execute(f"UPDATE work_time SET {', '.join(sets)} WHERE id = ?", (*params, worktime))
+        prow = await db.fetchone("SELECT employeeID FROM punch_clock WHERE id = ?", (wt["punchID"],))
+        if prow:
+            await self._refresh_clock(prow["employeeID"])
+        timecard_log.info(f"[Work] {ctx.author} edited worktime {worktime} ({', '.join(sets)}).")
+        note = " (Odoo copy not changed — edit it in Odoo if it needs to match)" if wt["odooId"] else ""
+        await ctx.respond(f"Updated worktime #{worktime}.{note}", ephemeral=True)
+
+    @discord.slash_command(name="deleteworktime", description="Delete a single worktime entry.")
+    @commands.has_permissions(administrator=True)
+    async def deleteworktime(
+        self, ctx: discord.ApplicationContext,
+        worktime: discord.Option(int, description="The worktime to delete", autocomplete=worktime_autocomplete),  # type: ignore
+    ):
+        db = await self._ensure_db()
+        if await db.fetchone("SELECT 1 FROM work_time WHERE id = ?", (worktime,)) is None:
+            await ctx.respond("That worktime doesn't exist.", ephemeral=True)
+            return
+        emp = await delete_worktime_local(self, worktime, to_odoo=True)
+        if emp:
+            await self._refresh_clock(emp)
+        timecard_log.info(f"[Work] {ctx.author} deleted worktime {worktime} via /deleteworktime.")
+        await ctx.respond(f"Deleted worktime #{worktime}.", ephemeral=True)
 
     # ---- clock commands ----------------------------------------------------
 
