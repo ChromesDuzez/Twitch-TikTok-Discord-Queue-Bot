@@ -13,7 +13,10 @@ from discord.ext import commands
 
 import config
 from botlog import log, timecard_log
-from .db import Database, RELEASE_VERSION, TARGET_VERSION, backup_database, resolve_db_path
+from .db import (
+    Database, RELEASE_VERSION, TARGET_VERSION, archive_stale_dbs, backup_database,
+    db_archive_dir, db_dir, move_db_file, resolve_db_path,
+)
 from .modals import Confirm
 from .odoo import inbox, sync
 from .odoo.client import OdooClient
@@ -54,24 +57,33 @@ class TimeTracking(commands.Cog):
         """
         async with self._lock:
             if self.db is None:
+                base = os.getcwd()
                 # A test bot uses a separate db file so it can never touch prod's.
                 prefix = "timetracker.test" if config.is_testing() else "timetracker"
-                target, source = resolve_db_path(os.getcwd(), prefix)
-                self.db_upgraded = source is not None
+                target, source = resolve_db_path(base, prefix)
+                # A source at the SAME version is just being relocated into
+                # database/ (no backup, no review); a different/legacy version is a
+                # real upgrade -> back it up first and flag for the startup review.
+                relocating = source is not None and os.path.basename(source) == os.path.basename(target)
+                self.db_upgraded = source is not None and not relocating
                 if source is not None:
-                    # Upgrading an older/legacy db: back it up, then rename it to
-                    # the current version-stamped name so migrations bring it up.
-                    backup_database(source)
-                    log.info(
-                        f"[DB] Upgrading {os.path.basename(source)} -> "
-                        f"{os.path.basename(target)} (schema v{TARGET_VERSION}, release {RELEASE_VERSION})."
-                    )
-                    os.rename(source, target)
+                    if relocating:
+                        log.info(f"[DB] Relocating {os.path.basename(source)} into {db_dir(base)}/.")
+                    else:
+                        backup_database(source, db_archive_dir(base))
+                        log.info(
+                            f"[DB] Upgrading {os.path.basename(source)} -> "
+                            f"{os.path.basename(target)} (schema v{TARGET_VERSION}, release {RELEASE_VERSION})."
+                        )
+                    move_db_file(source, target)
                 self.db_path = target
                 self.db = await Database(target).setup(
                     company_name=os.getenv("COMPANY_NAME"),
                     debug=bool(os.getenv("DEBUGGING")),
                 )
+                # Sweep any leftover old versions / backups for this prefix into
+                # database/archive/ so only the live file remains in view.
+                archive_stale_dbs(base, prefix, target)
         return self.db
 
     async def _ensure_db(self) -> Database:

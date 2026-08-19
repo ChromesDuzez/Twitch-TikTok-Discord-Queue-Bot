@@ -26,7 +26,7 @@ from discord.ext import commands
 
 import config
 from botlog import log
-from cogs.timetracking.db import TARGET_VERSION, Database, db_filename
+from cogs.timetracking.db import TARGET_VERSION, Database, db_dir, db_filename
 from cogs.timetracking.modals import Confirm
 
 # env var -> default channel name the test bot manages
@@ -95,10 +95,12 @@ class Testing(commands.Cog):
             log.exception("[Test] Import failed: %s", e)
             return await ctx.respond(f"Import failed (is it a valid timetracker db?): {e}", ephemeral=True)
 
-        target = os.path.join(os.getcwd(), db_filename(TARGET_VERSION, "timetracker.test"))
+        target = os.path.join(db_dir(os.getcwd()), db_filename(TARGET_VERSION, "timetracker.test"))
         await tt.close_db()
-        if os.path.exists(target):
-            os.remove(target)
+        os.makedirs(db_dir(os.getcwd()), exist_ok=True)
+        for suffix in ("", "-wal", "-shm", "-journal"):  # clear the old test db + sidecars
+            if os.path.exists(target + suffix):
+                os.remove(target + suffix)
         shutil.move(tmp, target)
         await tt._ensure_db()
         log.warning("[Test] Imported prod snapshot into %s by %s.", os.path.basename(target), ctx.author)

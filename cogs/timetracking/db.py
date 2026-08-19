@@ -450,15 +450,19 @@ class Database:
         await c.commit()
 
 
-def backup_database(path: str) -> str | None:
-    """Timestamped copy of the db before migrations. Returns the backup path."""
-    if not os.path.exists(path):
-        return None
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    dest = f"{path}.backup_{stamp}"
-    shutil.copy2(path, dest)
-    log.info(f"[DB] Backed up database to {dest}")
-    return dest
+# All timetracking db files live under <run-dir>/database/ so it's obvious which
+# file is live; superseded files + backups go in the archive subfolder. Paths are
+# relative to a base_dir arg so tests can point them at a temp directory.
+DB_SUBDIR = "database"
+DB_ARCHIVE_SUBDIR = "archive"
+
+
+def db_dir(base_dir: str) -> str:
+    return os.path.join(base_dir, DB_SUBDIR)
+
+
+def db_archive_dir(base_dir: str) -> str:
+    return os.path.join(base_dir, DB_SUBDIR, DB_ARCHIVE_SUBDIR)
 
 
 def db_filename(version: int = TARGET_VERSION, prefix: str = "timetracker") -> str:
@@ -470,35 +474,91 @@ def db_filename(version: int = TARGET_VERSION, prefix: str = "timetracker") -> s
     return f"{prefix}.v{version}.db"
 
 
+def move_db_file(src: str, dst: str):
+    """Move a db file and any of its WAL sidecars together (keeps them consistent)."""
+    os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
+    for suffix in ("", "-wal", "-shm", "-journal"):
+        if os.path.exists(src + suffix):
+            shutil.move(src + suffix, dst + suffix)
+
+
+def backup_database(path: str, archive_dir: str) -> str | None:
+    """Timestamped copy of the db into the archive folder before a migration."""
+    if not os.path.exists(path):
+        return None
+    os.makedirs(archive_dir, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    dest = os.path.join(archive_dir, f"{os.path.basename(path)}.backup_{stamp}")
+    shutil.copy2(path, dest)
+    log.info(f"[DB] Backed up database to {dest}")
+    return dest
+
+
 def resolve_db_path(base_dir: str, prefix: str = "timetracker") -> tuple[str, str | None]:
-    """Work out which db file to use and whether one needs upgrading.
+    """Work out which db file to use and whether one needs upgrading/relocating.
 
-    The live file is stamped with the current schema version so its version is
-    obvious on disk and the upgrade path is unambiguous. Returns
-    ``(target_path, source_to_upgrade_or_None)``:
+    The live file lives at ``<base_dir>/database/{prefix}.v{N}.db``. Returns
+    ``(target_path, source_or_None)``:
 
-    * target already at current version  -> (target, None)
-    * an older ``{prefix}.v{k}.db`` or the legacy ``{prefix}.db`` exists
-      -> (target, that_older_path)   [caller backs it up + renames to target]
-    * nothing yet                        -> (target, None)   [fresh create]
+    * target already present               -> (target, None)
+    * an older/legacy file, or a same-version file still in the run-dir root
+      -> (target, that_path)   [caller backs it up if it's a real upgrade, then
+                                moves it to target]
+    * nothing yet                          -> (target, None)  [fresh create]
+
+    Sources are searched in the database folder first, then the legacy run-dir
+    root, so files from older installs are pulled in automatically.
     """
-    target = os.path.join(base_dir, db_filename(TARGET_VERSION, prefix))
+    os.makedirs(db_archive_dir(base_dir), exist_ok=True)  # creates database/ + archive/
+    ddir = db_dir(base_dir)
+    target = os.path.join(ddir, db_filename(TARGET_VERSION, prefix))
     if os.path.exists(target):
         return target, None
-    # Any other version-stamped file (older OR a higher dev-era number) is a
-    # valid source to upgrade + rename; pick the highest-numbered one.
     best_ver, best_path = None, None
-    for path in glob.glob(os.path.join(base_dir, f"{prefix}.v*.db")):
-        name = os.path.basename(path)
-        try:
-            ver = int(name[len(prefix) + 2:-3])  # strip "{prefix}.v" and ".db"
-        except ValueError:
-            continue
-        if best_ver is None or ver > best_ver:
-            best_ver, best_path = ver, path
+    for d in (ddir, base_dir):  # database/ first, then legacy root
+        for path in glob.glob(os.path.join(d, f"{prefix}.v*.db")):
+            name = os.path.basename(path)
+            try:
+                ver = int(name[len(prefix) + 2:-3])  # strip "{prefix}.v" and ".db"
+            except ValueError:
+                continue
+            if best_ver is None or ver > best_ver:
+                best_ver, best_path = ver, path
     if best_path:
         return target, best_path
-    legacy = os.path.join(base_dir, f"{prefix}.db")  # pre-versioning name
-    if os.path.exists(legacy):
-        return target, legacy
+    for d in (ddir, base_dir):
+        legacy = os.path.join(d, f"{prefix}.db")  # pre-versioning name
+        if os.path.exists(legacy):
+            return target, legacy
     return target, None
+
+
+def archive_stale_dbs(base_dir: str, prefix: str, keep_path: str) -> list[str]:
+    """Move superseded db files + backups for ``prefix`` into database/archive/,
+    leaving only the live file (``keep_path``) and its sidecars. Prefix-scoped so
+    it never touches the other bot's (test vs prod) files. Returns moved paths."""
+    adir = db_archive_dir(base_dir)
+    os.makedirs(adir, exist_ok=True)
+    keep = os.path.abspath(keep_path)
+    live = {keep, keep + "-wal", keep + "-shm", keep + "-journal"}
+    patterns = (
+        f"{prefix}.db", f"{prefix}.v*.db",
+        f"{prefix}.db.backup_*", f"{prefix}.v*.db.backup_*",
+        f"{prefix}.db-wal", f"{prefix}.db-shm", f"{prefix}.db-journal",
+        f"{prefix}.v*.db-wal", f"{prefix}.v*.db-shm", f"{prefix}.v*.db-journal",
+    )
+    moved = []
+    for d in (base_dir, db_dir(base_dir)):  # root + database/ (not the archive itself)
+        for pat in patterns:
+            for path in glob.glob(os.path.join(d, pat)):
+                ap = os.path.abspath(path)
+                if ap in live:
+                    continue
+                dest = os.path.join(adir, os.path.basename(path))
+                if os.path.exists(dest):  # avoid clobber
+                    dest += f".{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                shutil.move(path, dest)
+                moved.append(dest)
+    if moved:
+        log.info(f"[DB] Archived {len(moved)} old db file(s) to {adir}/.")
+    return moved
