@@ -10,25 +10,32 @@ into its authoritative SQLite store, refreshing any affected Discord message.
 SQLite stays the source of truth. Outbound sync (bot → Odoo) is handled
 separately by the sync worker and needs no webhook.
 
-## Why this is safe without HMAC signing
+## Why we don't cryptographically sign the messages
 
-The payload never carries data the bot trusts — it's a pointer the bot
-re-fetches authoritatively. So:
+A common way to secure a webhook is to have the sender attach a cryptographic
+signature to each message (often called *HMAC signing*) that the receiver verifies.
+We don't need that here, because the message Odoo sends never contains any data the
+bot trusts. It's just a pointer — a record id — and the bot turns around and fetches
+that record from Odoo itself over the authenticated connection. So:
 
-- **The model comes from the URL, not the body.** There's one endpoint per
-  model. The only thing read from the payload is an integer `_id`. A
-  malicious/garbage `_model` value can't do anything because it's never used.
-- **A forged request can't inject data** — worst case it makes the bot do a
-  redundant Odoo read that reconciles to truth (a no-op). Replay is harmless for
-  the same reason.
-- The residual risk is just *abuse/DoS*, which a shared **token** handles. HMAC
-  signing (and the Odoo-side code to produce it) is unnecessary here.
+- **The record type comes from the web address, not the message body.** There's a
+  separate address per record type, and the only thing read from the message body
+  is the id number. A faked or garbage type value in the body can't do anything
+  because the bot never reads it.
+- **A forged message can't slip in bad data** — the worst it can do is make the bot
+  re-fetch a record from Odoo and confirm it already matches, which changes nothing.
+  Re-sending the same message is harmless for the same reason.
+- The only real risk left is someone flooding the address with requests to overload
+  it (a denial-of-service attempt), and a shared secret **token** handles that.
+  Signing would also mean maintaining extra code on the Odoo side — unnecessary here.
 
 ## Authentication
 
 ### Token (required)
 
-The bot checks a shared secret token, in constant time. Provide it either way:
+The bot checks a shared secret token on every request. The comparison takes the
+same amount of time whether the token is right or wrong, so an attacker can't guess
+it character-by-character by timing how fast the bot replies. Provide it either way:
 
 - URL query: `...?token=<WEBHOOK_TOKEN>`  ← works with Odoo's no-code webhook
 - Header: `X-Webhook-Token: <WEBHOOK_TOKEN>`
@@ -40,15 +47,18 @@ read it from the server's `.env`, then update your Odoo URLs).
 
 ### IP allowlist (optional, off by default)
 
-A coarse pre-filter. When enabled (`/webhookallowlist enable`), the bot only
-accepts webhooks from IPs in `WEBHOOK_IP_ALLOWLIST`, which is auto-refreshed
-with the Odoo host's resolved IP(s) every time the bot calls Odoo. It uses the
-real client IP behind Cloudflare (`CF-Connecting-IP`).
+A rough extra filter that only accepts webhooks coming from known IP addresses.
+When enabled (`/webhookallowlist enable`), the bot only accepts webhooks from the
+addresses in `WEBHOOK_IP_ALLOWLIST`, which it refreshes with Odoo's own address
+every time it calls Odoo. When the traffic comes through Cloudflare, the bot reads
+the sender's true address from the `CF-Connecting-IP` header Cloudflare adds
+(otherwise it would only see Cloudflare's own address).
 
-> ⚠️ Caveat: with Cloudflare-fronted Odoo hosting, the IP you *connect to* (the
-> frontend) may differ from the IP Odoo *sends from* (its egress). If enabling
-> the allowlist blocks legit webhooks, that mismatch is why — just disable it
-> (the token is the real auth) or add the egress IP to `WEBHOOK_IP_ALLOWLIST`.
+> ⚠️ Caveat: with Cloudflare-fronted Odoo hosting, the address you *connect to*
+> (the front door) can differ from the address Odoo *sends from* (its outbound
+> address). If enabling the allowlist blocks legitimate webhooks, that mismatch is
+> why — just turn it off (the token is the real protection) or add Odoo's outbound
+> address to `WEBHOOK_IP_ALLOWLIST`.
 
 ## Endpoints (one per model)
 
@@ -82,10 +92,10 @@ tunnel** (`cloudflared`), which dials out to Cloudflare and publishes a public
 `https://` hostname that forwards to the bot's local `WEBHOOK_PORT`:
 
 - No inbound ports opened on your network/firewall.
-- **HTTPS is automatic** (Cloudflare terminates TLS), so the `?token=` in the
-  URL is encrypted in transit.
-- Cloudflare sets `CF-Connecting-IP` to the real origin, which is what the IP
-  allowlist checks.
+- **The connection is encrypted automatically** — Cloudflare handles the HTTPS
+  encryption for you, so the `?token=` in the address is protected in transit.
+- Cloudflare passes along each request's true sending address in the
+  `CF-Connecting-IP` header, which is the address the optional IP allowlist checks.
 
 Quick setup: in the Cloudflare Zero Trust dashboard, create a **Tunnel**, add a
 **Public Hostname** (e.g. `hooks.yourdomain.com`) with service
@@ -138,9 +148,10 @@ don't fire needless webhooks.
 **Recommended trigger: “On Create and edit”, with Watched Fields set to the
 columns above** — fires on creation and when a watched field is edited, nothing
 else. Avoid *after last update*: it fires on **any** field change (a lot of
-needless webhooks for `res.partner`). Because the reconcile is idempotent (an
-unrelated change reconciles to a no-op), field-scoping is purely an efficiency
-win — no correctness risk, and no delay needed.
+needless webhooks for `res.partner`). Since re-fetching a record that didn't
+really change just makes the bot do nothing, limiting the watched fields is purely
+an efficiency win — nothing breaks if a rule fires more than needed, and no delay
+is needed.
 
 ### Record filters (the automation **Domain**)
 
@@ -168,8 +179,8 @@ was already working in the test database.
 
 **Why the same Domain on the `/delete` rule.** If the delete automation is left
 unfiltered, deleting *any* accounting analytic line (or *any* partner) POSTs to
-the `/delete` endpoint. For a record the bot never tracked that resolves to a
-harmless "already gone locally" no-op — but for `hr.attendance` /
+the `/delete` endpoint. For a record the bot never tracked that just does nothing
+(it's "already gone locally") — but for `hr.attendance` /
 `account.analytic.line` it still posts an **admin approval prompt** in the
 timecard channel before the bot works out it doesn't apply. Matching the Domain
 keeps delete approvals scoped to real timesheets/attendances and avoids that
@@ -196,9 +207,10 @@ edit stays in sync instead of silently diverging. What's reconciled today:
 
 Attribution is still **Discord-first** — the normal flow is that work is assigned
 on the clock and pushed *out* to Odoo. This inbound mirroring is the safety net
-for the cases where a change originates in Odoo instead. Because every reconcile
-re-fetches the authoritative record and is idempotent, a redundant webhook is a
-harmless no-op. (Employee **name/phone/address** are the exception to
+for the cases where a change originates in Odoo instead. Every time a webhook
+fires, the bot re-fetches the current record and applies it; if nothing actually
+changed it simply does nothing, so a duplicate or unnecessary webhook does no harm.
+(Employee **name/phone/address** are the exception to
 Discord-first: HR owns those, so they're pulled **one-way from Odoo** — the bot
 never pushes them back.)
 
