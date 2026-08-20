@@ -30,8 +30,9 @@ from .reports import (
     is_saturday,
 )
 from .views import (
-    ApprovePunch, DeleteApproval, DeletePunchFlow, delete_punch_cascade,
-    delete_worktime_local, reassign_worktime, render_clock,
+    ApprovePunch, DeleteApproval, DeletePunchFlow, TimecardWeekView,
+    build_timecard_embed, delete_punch_cascade, delete_worktime_local,
+    reassign_worktime, render_clock,
 )
 
 WORKTYPES = ["Construction", "Service", "Office"]
@@ -1290,6 +1291,37 @@ class TimeTracking(commands.Cog):
                 employee_data[name] = tuple(emp)
             punch_data[name].append((punch_tuple, work_punches))
         return list(punch_data.keys()), punch_data, employee_data
+
+    @discord.slash_command(name="viewtimecard", description="View an employee's week of punches + worktime (with ids) to decide what to edit.")
+    @commands.has_permissions(administrator=True)
+    async def viewtimecard(
+        self, ctx: discord.ApplicationContext,
+        employee: discord.Option(str, description="The employee", autocomplete=employee_autocomplete),  # type: ignore
+        week_end_date: discord.Option(str, default=None, description="Week-ending SATURDAY [YYYY-MM-DD]; defaults to the current week.", autocomplete=week_ending_autocomplete),  # type: ignore
+    ):
+        from datetime import datetime, timedelta
+        db = await self._ensure_db()
+        try:
+            emp_id = int(employee[2:-1])
+        except (ValueError, IndexError):
+            await ctx.respond(f"'{employee}' is not a valid user mention.", ephemeral=True)
+            return
+        erow = await db.fetchone("SELECT name FROM employee WHERE id = ?", (emp_id,))
+        if erow is None:
+            await ctx.respond(f"{employee} isn't in the employee system.", ephemeral=True)
+            return
+        if week_end_date:
+            try:
+                d = datetime.strptime(week_end_date, "%Y-%m-%d")
+            except ValueError:
+                await ctx.respond("Invalid date — use YYYY-MM-DD.", ephemeral=True)
+                return
+        else:
+            d = datetime.now()
+        eow = d + timedelta(days=(5 - d.weekday()) % 7)  # snap to that week's ending Saturday
+        embed = await build_timecard_embed(self, emp_id, erow["name"], eow)
+        view = TimecardWeekView(self, emp_id, erow["name"], eow, ctx.user.id)
+        await ctx.respond(embed=embed, view=view, ephemeral=True)
 
     @discord.slash_command(name="timecardreport", description="Generate a weekly punch report given an end date.")
     @commands.has_permissions(administrator=True)

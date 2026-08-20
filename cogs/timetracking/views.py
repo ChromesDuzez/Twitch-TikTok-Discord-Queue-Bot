@@ -10,7 +10,7 @@ string-matching embed text (the cause of views desyncing on restart).
 from __future__ import annotations
 
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import discord
 
@@ -946,3 +946,114 @@ class DeleteRejectButton(discord.ui.Button):
         timecard_log.info(
             f"[Delete] {interaction.user} rejected Odoo deletion of {view.model}:{view.odoo_id}; queued restore.")
         await interaction.response.send_message("Kept locally; queued restore to Odoo.", ephemeral=True)
+
+
+# ---- read-only week viewer (decide what to edit) ----------------------------
+
+def _hm(ts) -> str:
+    """'HH:MM' out of a stored 'YYYY-MM-DD HH:MM:SS' string."""
+    return (ts or "")[11:16] or "??:??"
+
+
+async def build_timecard_embed(cog, emp_id: int, ename: str, week_end_dt: datetime) -> discord.Embed:
+    """A read-only embed of one employee's week: each punch (with its id, times,
+    approval + Odoo status) and its worktime entries nested beneath (id, type,
+    hours, customer, sync status). Surfaces the ids the edit commands key off of,
+    and unlike the reports it *shows* detached worktime so it can be spotted."""
+    db = cog.db
+    week_start = week_end_dt - timedelta(days=6)
+    lo = week_start.strftime("%Y-%m-%d")
+    hi = (week_end_dt + timedelta(days=1)).strftime("%Y-%m-%d")
+    punches = await db.fetchall(
+        "SELECT id, punchInTime, punchOutTime, punchInApproval, punchOutApproval, odooId, legacy "
+        "FROM punch_clock WHERE employeeID = ? AND punchInTime >= ? AND punchInTime < ? "
+        "ORDER BY punchInTime",
+        (emp_id, lo, hi),
+    )
+    lines, week_minutes = [], 0
+    for p in punches:
+        try:
+            day = datetime.strptime(p["punchInTime"][:19], "%Y-%m-%d %H:%M:%S").strftime("%a %m-%d")
+        except (ValueError, TypeError):
+            day = (p["punchInTime"] or "?")[:10]
+        pout = _hm(p["punchOutTime"]) if p["punchOutTime"] else "open"
+        marks = []
+        if not p["punchOutTime"]:
+            marks.append("🟡")
+        marks.append("✅" if (p["punchInApproval"] and p["punchOutApproval"]) else "🕓")
+        if p["legacy"]:
+            marks.append("🗄️")
+        elif p["odooId"]:
+            marks.append("☁️")
+        lines.append(f"**▸ #{p['id']} · {day}  {_hm(p['punchInTime'])}→{pout}**  {' '.join(marks)}")
+        wts = await db.fetchall(
+            "SELECT wt.id, wt.punchType, wt.timeSpent, wt.odooId, wt.detached, c.name AS cname "
+            "FROM work_time wt LEFT JOIN customer c ON wt.customerID = c.id "
+            "WHERE wt.punchID = ? ORDER BY wt.timeStarted, wt.id",
+            (p["id"],),
+        )
+        if not wts:
+            lines.append("　• _no worktime_")
+        for w in wts:
+            hrs = (w["timeSpent"] or 0) / 60
+            cust = f" · {w['cname']}" if w["cname"] else ""
+            if w["detached"]:
+                tag = "⛔ detached"
+            elif w["odooId"]:
+                tag = "☁️"
+            else:
+                tag = "local"
+            if not w["detached"]:
+                week_minutes += (w["timeSpent"] or 0)
+            lines.append(f"　• #{w['id']} {w['punchType']} {hrs:g}h{cust}  ({tag})")
+    if not punches:
+        lines.append("_No punches this week._")
+    desc = "\n".join(lines)
+    if len(desc) > 4000:
+        desc = desc[:3980] + "\n… _(truncated — narrow the week)_"
+    embed = discord.Embed(
+        title=f"{ename} — week ending {week_end_dt.strftime('%Y-%m-%d')}",
+        description=desc,
+        color=0x5865F2,
+    )
+    embed.set_footer(
+        text=f"{len(punches)} punch(es) · {week_minutes / 60:g}h worktime   |   "
+             "✅approved 🕓pending 🟡open ☁️synced ⛔detached 🗄️legacy   |   edit by the #ids"
+    )
+    return embed
+
+
+class TimecardWeekView(discord.ui.View):
+    """Prev/Next/Refresh paging around build_timecard_embed for /viewtimecard."""
+
+    def __init__(self, cog, emp_id: int, ename: str, week_end_dt: datetime, author_id: int):
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.emp_id = emp_id
+        self.ename = ename
+        self.week_end_dt = week_end_dt
+        self.author_id = author_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("This isn't your view.", ephemeral=True)
+            return False
+        return True
+
+    async def _rerender(self, interaction: discord.Interaction):
+        embed = await build_timecard_embed(self.cog, self.emp_id, self.ename, self.week_end_dt)
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="◀ Prev week", style=discord.ButtonStyle.secondary)
+    async def prev_week(self, button: discord.ui.Button, interaction: discord.Interaction):
+        self.week_end_dt -= timedelta(days=7)
+        await self._rerender(interaction)
+
+    @discord.ui.button(label="Next week ▶", style=discord.ButtonStyle.secondary)
+    async def next_week(self, button: discord.ui.Button, interaction: discord.Interaction):
+        self.week_end_dt += timedelta(days=7)
+        await self._rerender(interaction)
+
+    @discord.ui.button(label="🔄 Refresh", style=discord.ButtonStyle.secondary)
+    async def refresh(self, button: discord.ui.Button, interaction: discord.Interaction):
+        await self._rerender(interaction)
