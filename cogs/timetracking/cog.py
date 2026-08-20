@@ -922,6 +922,11 @@ class TimeTracking(commands.Cog):
         office: discord.Option(str, default=None, description="Odoo project for Office work", autocomplete=project_autocomplete),  # type: ignore
     ):
         await self._ensure_db()
+        # Validating the projects + reading their names below makes several Odoo
+        # calls; defer first so we acknowledge within Discord's 3s window (else
+        # the interaction expires -> 404 Unknown interaction). The ephemeral flag
+        # carries through to the eventual reply.
+        await ctx.defer(ephemeral=self._eph(ctx))
         changed = []
         for value, key, label in ((field_service, "ODOO_FIELD_SERVICE_PROJECT_ID", "Field Service"),
                                   (office, "ODOO_OFFICE_PROJECT_ID", "Office")):
@@ -1152,6 +1157,8 @@ class TimeTracking(commands.Cog):
         task: discord.Option(str, default=None, description="Odoo task to link (customer tasks, nearest planned start first)", autocomplete=task_autocomplete),  # type: ignore
     ):
         db = await self._ensure_db()
+        # An Odoo task lookup + clock refresh can exceed Discord's 3s window; defer first.
+        await ctx.defer(ephemeral=self._eph(ctx))
         punch, customer, task = _opt_int(punch), _opt_int(customer), _opt_int(task)
         if punch is None:
             await ctx.respond("Pick a punch from the autocomplete list.", ephemeral=self._eph(ctx))
@@ -1216,6 +1223,8 @@ class TimeTracking(commands.Cog):
         task: discord.Option(str, default=None, description="Odoo task to (re)link", autocomplete=task_autocomplete),  # type: ignore
     ):
         db = await self._ensure_db()
+        # An Odoo task lookup + clock refresh can exceed Discord's 3s window; defer first.
+        await ctx.defer(ephemeral=self._eph(ctx))
         worktime, customer, task = _opt_int(worktime), _opt_int(customer), _opt_int(task)
         if worktime is None:
             await ctx.respond("Pick a worktime from the autocomplete list.", ephemeral=self._eph(ctx))
