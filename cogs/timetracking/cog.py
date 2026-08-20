@@ -37,6 +37,20 @@ from .views import (
 
 WORKTYPES = ["Construction", "Service", "Office"]
 
+# Admin management commands: their results are shown publicly in the timecard
+# admin/log channels and ephemerally (decluttered, + mirrored to the log channel)
+# elsewhere. Self-service (mytimecard, refreshclock) and report/DM commands are
+# intentionally excluded.
+_MANAGEMENT_COMMANDS = {
+    "addpunch", "editpunch", "deletepunch",
+    "addworktime", "editworktime", "deleteworktime", "reassignworktime",
+    "viewtimecard",
+    "synccustomers", "linkcustomer", "unlinkcustomer", "unlinkedcustomers",
+    "addcustomer", "editcustomer",
+    "addemployee", "linkemployee", "unlinkemployee",
+    "createclock", "deleteclock",
+}
+
 
 def _parse_punch_time(raw: str) -> str:
     """Accept 'YYYY-MM-DD HH:MM' or '...:SS' -> normalized 'YYYY-MM-DD HH:MM:SS'."""
@@ -249,6 +263,33 @@ class TimeTracking(commands.Cog):
         await render_clock(self, message, employee_id)
         return message
 
+    def _admin_visible_channels(self) -> set[int]:
+        """Channels where admin/management command results are shown to everyone
+        (not ephemeral): the timecard admin channel and the timecard log channel."""
+        ids = set()
+        for var in ("TIMECARD_ADMIN_CHANNEL_ID", "TIMECARD_LOG_ID"):
+            v = os.getenv(var)
+            if v and v.isdigit():
+                ids.add(int(v))
+        return ids
+
+    def _eph(self, ctx) -> bool:
+        """Whether an admin command should reply ephemerally. False in the
+        timecard admin/log channels (show everyone); True elsewhere (declutter)."""
+        return ctx.channel_id not in self._admin_visible_channels()
+
+    async def cog_after_invoke(self, ctx):
+        """When an admin management command runs *outside* the timecard admin/log
+        channels its reply is ephemeral, so mirror a one-line record to the
+        timecard log channel — the per-command logs carry the detailed result."""
+        try:
+            cmd = getattr(ctx, "command", None)
+            if cmd and cmd.name in _MANAGEMENT_COMMANDS and self._eph(ctx):
+                where = f"#{ctx.channel}" if getattr(ctx, "channel", None) else "a DM"
+                timecard_log.info(f"[Cmd] {ctx.author} ran /{cmd.qualified_name} in {where}.")
+        except Exception:  # noqa: BLE001 - logging must never break a command
+            pass
+
     async def _refresh_clock(self, employee_id: int):
         """Re-render an employee's clock message if they have one (best-effort)."""
         row = await self.db.fetchone(
@@ -349,11 +390,11 @@ class TimeTracking(commands.Cog):
         db = await self._ensure_db()
         existing = await db.fetchall("SELECT id FROM customer WHERE name = ?", (name,))
         if existing:
-            await ctx.respond(f"'{name}' already exists in the customer table.", ephemeral=True)
+            await ctx.respond(f"'{name}' already exists in the customer table.", ephemeral=self._eph(ctx))
             return
         customer_id = await db.execute("INSERT INTO customer (name) VALUES (?)", (name,))
         await sync.enqueue(db, "customer", customer_id, "create")
-        await ctx.respond(f"Successfully inserted {name} into the customer table.", ephemeral=True)
+        await ctx.respond(f"Successfully inserted {name} into the customer table.", ephemeral=self._eph(ctx))
 
     @discord.slash_command(name="editcustomer", description="Edit an existing Customer in the customer table.")
     @commands.has_permissions(administrator=True)
@@ -365,21 +406,21 @@ class TimeTracking(commands.Cog):
     ):
         db = await self._ensure_db()
         if id is None and name is None:
-            await ctx.respond("You must provide either id or name.", ephemeral=True)
+            await ctx.respond("You must provide either id or name.", ephemeral=self._eph(ctx))
             return
         if id is not None:
             row = await db.fetchone("SELECT id, name FROM customer WHERE id = ?", (id,))
         else:
             rows = await db.fetchall("SELECT id, name FROM customer WHERE name = ?", (name,))
             if len(rows) != 1:
-                await ctx.respond(f"Search for '{name}' returned {len(rows)} results; be more specific.", ephemeral=True)
+                await ctx.respond(f"Search for '{name}' returned {len(rows)} results; be more specific.", ephemeral=self._eph(ctx))
                 return
             row = rows[0]
         if row is None:
-            await ctx.respond("Could not find that customer.", ephemeral=True)
+            await ctx.respond("Could not find that customer.", ephemeral=self._eph(ctx))
             return
         await db.execute("UPDATE customer SET name = ? WHERE id = ?", (newname, row["id"]))
-        await ctx.respond(f"Updated customer {row['id']} ({row['name']}) to {newname}.", ephemeral=True)
+        await ctx.respond(f"Updated customer {row['id']} ({row['name']}) to {newname}.", ephemeral=self._eph(ctx))
 
     async def resolve_customer(self, name: str) -> int:
         """Find (or create) a local customer row by name; return its id.
@@ -638,19 +679,19 @@ class TimeTracking(commands.Cog):
             try:
                 emp_id = int(user.strip()[2:-1])
             except (ValueError, IndexError):
-                await ctx.respond("User override was improperly formatted.", ephemeral=True)
+                await ctx.respond("User override was improperly formatted.", ephemeral=self._eph(ctx))
                 return
 
         existing = await db.fetchall("SELECT id FROM employee WHERE id = ?", (emp_id,))
         if existing:
-            await ctx.respond(f"{name} (<@{emp_id}>) already exists in the database.", ephemeral=True)
+            await ctx.respond(f"{name} (<@{emp_id}>) already exists in the database.", ephemeral=self._eph(ctx))
             return
         if odoo_employee is not None:
             clash = await db.fetchone("SELECT id, name FROM employee WHERE odooId = ?", (odoo_employee,))
             if clash is not None:
                 await ctx.respond(
                     f"Odoo employee {odoo_employee} is already linked to {clash['name']} (<@{clash['id']}>). "
-                    f"Unlink them first with /unlinkemployee.", ephemeral=True,
+                    f"Unlink them first with /unlinkemployee.", ephemeral=self._eph(ctx),
                 )
                 return
         try:
@@ -661,9 +702,9 @@ class TimeTracking(commands.Cog):
                 (emp_id, name, phonenumber, addressline1, addressline2, city, state, zip,
                  payrate, employeetype, odoo_employee),
             )
-            await ctx.respond(f"Added new employee {name} (<@{emp_id}>).")
+            await ctx.respond(f"Added new employee {name} (<@{emp_id}>).", ephemeral=self._eph(ctx))
         except Exception as e:  # noqa: BLE001
-            await ctx.respond(f"Error adding employee {name}: {e}", ephemeral=True)
+            await ctx.respond(f"Error adding employee {name}: {e}", ephemeral=self._eph(ctx))
 
     @addemployee.error
     async def addemployee_error(self, ctx, error):
@@ -681,11 +722,11 @@ class TimeTracking(commands.Cog):
         try:
             emp_id = int(user[2:-1])
         except (ValueError, IndexError):
-            await ctx.respond(f"'{user}' is not a valid user mention.", ephemeral=True)
+            await ctx.respond(f"'{user}' is not a valid user mention.", ephemeral=self._eph(ctx))
             return
         row = await db.fetchone("SELECT name FROM employee WHERE id = ?", (emp_id,))
         if row is None:
-            await ctx.respond(f"{user} is not in the employee database. Add them with /addemployee first.", ephemeral=True)
+            await ctx.respond(f"{user} is not in the employee database. Add them with /addemployee first.", ephemeral=self._eph(ctx))
             return
         # Linking is one-to-one: refuse an Odoo employee already linked elsewhere.
         clash = await db.fetchone(
@@ -694,12 +735,12 @@ class TimeTracking(commands.Cog):
         if clash is not None:
             await ctx.respond(
                 f"Odoo employee {odoo_employee} is already linked to {clash['name']} (<@{clash['id']}>). "
-                f"Unlink them first with /unlinkemployee.", ephemeral=True,
+                f"Unlink them first with /unlinkemployee.", ephemeral=self._eph(ctx),
             )
             return
         await db.execute("UPDATE employee SET odooId = ? WHERE id = ?", (odoo_employee, emp_id))
         timecard_log.info(f"[Employee] {ctx.author} linked employee {emp_id} to Odoo employee {odoo_employee}.")
-        await ctx.respond(f"Linked {row['name']} (<@{emp_id}>) to Odoo employee {odoo_employee}.", ephemeral=True)
+        await ctx.respond(f"Linked {row['name']} (<@{emp_id}>) to Odoo employee {odoo_employee}.", ephemeral=self._eph(ctx))
 
     @discord.slash_command(name="unlinkemployee", description="Remove an employee's link to their Odoo hr.employee record.")
     @commands.has_permissions(administrator=True)
@@ -711,21 +752,21 @@ class TimeTracking(commands.Cog):
         try:
             emp_id = int(user[2:-1])
         except (ValueError, IndexError):
-            await ctx.respond(f"'{user}' is not a valid user mention.", ephemeral=True)
+            await ctx.respond(f"'{user}' is not a valid user mention.", ephemeral=self._eph(ctx))
             return
         row = await db.fetchone("SELECT name, odooId FROM employee WHERE id = ?", (emp_id,))
         if row is None:
-            await ctx.respond(f"{user} is not in the employee database.", ephemeral=True)
+            await ctx.respond(f"{user} is not in the employee database.", ephemeral=self._eph(ctx))
             return
         if row["odooId"] is None:
-            await ctx.respond(f"{row['name']} (<@{emp_id}>) isn't linked to an Odoo employee.", ephemeral=True)
+            await ctx.respond(f"{row['name']} (<@{emp_id}>) isn't linked to an Odoo employee.", ephemeral=self._eph(ctx))
             return
         await db.execute("UPDATE employee SET odooId = NULL WHERE id = ?", (emp_id,))
         timecard_log.info(f"[Employee] {ctx.author} unlinked employee {emp_id} from Odoo employee {row['odooId']}.")
         await ctx.respond(
             f"Unlinked {row['name']} (<@{emp_id}>) from Odoo employee {row['odooId']}. "
             f"That Odoo employee is now available to link again; new punches won't sync until re-linked.",
-            ephemeral=True,
+            ephemeral=self._eph(ctx),
         )
 
     # ---- customer <-> Odoo linking -----------------------------------------
@@ -734,15 +775,15 @@ class TimeTracking(commands.Cog):
     @commands.has_permissions(administrator=True)
     async def synccustomers(self, ctx: discord.ApplicationContext):
         if not self.client.loaded:
-            await ctx.respond("Odoo isn't configured, so there's nothing to link to.", ephemeral=True)
+            await ctx.respond("Odoo isn't configured, so there's nothing to link to.", ephemeral=self._eph(ctx))
             return
-        await ctx.defer(ephemeral=True)
+        await ctx.defer(ephemeral=self._eph(ctx))
         db = await self._ensure_db()
         try:
             odoo_customers = await self.client.get_customer_list() or []
         except Exception as e:  # noqa: BLE001
             log.exception("[Customer] synccustomers: Odoo fetch failed")
-            await ctx.followup.send(f"Couldn't fetch Odoo customers: {e}", ephemeral=True)
+            await ctx.followup.send(f"Couldn't fetch Odoo customers: {e}", ephemeral=self._eph(ctx))
             return
         # Case-insensitive Odoo name -> [partner ids]. One Odoo call, match in memory.
         by_name: dict[str, list[int]] = {}
@@ -784,7 +825,7 @@ class TimeTracking(commands.Cog):
             f"**{ambiguous + nomatch}** still unlinked — **{ambiguous}** ambiguous "
             f"(the name matches more than one Odoo partner, so it can't pick one) and "
             f"**{nomatch}** no match. Link those with `/linkcustomer` (see `/unlinkedcustomers`).",
-            ephemeral=True,
+            ephemeral=self._eph(ctx),
         )
 
     @discord.slash_command(name="linkcustomer", description="Link a local customer to their Odoo partner.")
@@ -797,18 +838,18 @@ class TimeTracking(commands.Cog):
         db = await self._ensure_db()
         row = await db.fetchone("SELECT id, name FROM customer WHERE id = ?", (customer,))
         if row is None:
-            await ctx.respond("That customer isn't in the database.", ephemeral=True)
+            await ctx.respond("That customer isn't in the database.", ephemeral=self._eph(ctx))
             return
         clash = await db.fetchone("SELECT name FROM customer WHERE odooId = ? AND id != ?", (odoo_partner, customer))
         if clash is not None:
             await ctx.respond(
                 f"Odoo partner {odoo_partner} is already linked to '{clash['name']}'. "
-                f"Unlink it first with /unlinkcustomer.", ephemeral=True,
+                f"Unlink it first with /unlinkcustomer.", ephemeral=self._eph(ctx),
             )
             return
         await db.execute("UPDATE customer SET odooId = ? WHERE id = ?", (odoo_partner, customer))
         timecard_log.info(f"[Customer] {ctx.author} linked customer {customer} ({row['name']}) to Odoo partner {odoo_partner}.")
-        await ctx.respond(f"Linked '{row['name']}' to Odoo partner {odoo_partner}.", ephemeral=True)
+        await ctx.respond(f"Linked '{row['name']}' to Odoo partner {odoo_partner}.", ephemeral=self._eph(ctx))
 
     @discord.slash_command(name="unlinkcustomer", description="Remove a customer's link to their Odoo partner.")
     @commands.has_permissions(administrator=True)
@@ -819,14 +860,14 @@ class TimeTracking(commands.Cog):
         db = await self._ensure_db()
         row = await db.fetchone("SELECT name, odooId FROM customer WHERE id = ?", (customer,))
         if row is None:
-            await ctx.respond("That customer isn't in the database.", ephemeral=True)
+            await ctx.respond("That customer isn't in the database.", ephemeral=self._eph(ctx))
             return
         if row["odooId"] is None:
-            await ctx.respond(f"'{row['name']}' isn't linked to an Odoo partner.", ephemeral=True)
+            await ctx.respond(f"'{row['name']}' isn't linked to an Odoo partner.", ephemeral=self._eph(ctx))
             return
         await db.execute("UPDATE customer SET odooId = NULL WHERE id = ?", (customer,))
         timecard_log.info(f"[Customer] {ctx.author} unlinked customer {customer} ({row['name']}) from Odoo partner {row['odooId']}.")
-        await ctx.respond(f"Unlinked '{row['name']}' from Odoo partner {row['odooId']}.", ephemeral=True)
+        await ctx.respond(f"Unlinked '{row['name']}' from Odoo partner {row['odooId']}.", ephemeral=self._eph(ctx))
 
     @discord.slash_command(name="unlinkedcustomers", description="List local customers not yet linked to an Odoo partner.")
     @commands.has_permissions(administrator=True)
@@ -836,12 +877,12 @@ class TimeTracking(commands.Cog):
             "SELECT name FROM customer WHERE odooId IS NULL AND (archived IS NULL OR archived = 0) ORDER BY name"
         )
         if not rows:
-            await ctx.respond("All customers are linked to Odoo. \U0001f389", ephemeral=True)
+            await ctx.respond("All customers are linked to Odoo. \U0001f389", ephemeral=self._eph(ctx))
             return
         names = [r["name"] for r in rows]
         preview = "\n".join(f"• {n}" for n in names[:40])
         more = f"\n…and {len(names) - 40} more." if len(names) > 40 else ""
-        await ctx.respond(f"**{len(names)}** unlinked customer(s):\n{preview}{more}\n\nLink them with /linkcustomer.", ephemeral=True)
+        await ctx.respond(f"**{len(names)}** unlinked customer(s):\n{preview}{more}\n\nLink them with /linkcustomer.", ephemeral=self._eph(ctx))
 
     # ---- punch management (after-the-fact fixes, no DB browser needed) ------
 
@@ -858,20 +899,20 @@ class TimeTracking(commands.Cog):
         try:
             emp_id = int(employee[2:-1])
         except (ValueError, IndexError):
-            await ctx.respond(f"'{employee}' is not a valid user mention.", ephemeral=True)
+            await ctx.respond(f"'{employee}' is not a valid user mention.", ephemeral=self._eph(ctx))
             return
         row = await db.fetchone("SELECT name FROM employee WHERE id = ?", (emp_id,))
         if row is None:
-            await ctx.respond(f"{employee} is not in the employee database. Add them with /addemployee first.", ephemeral=True)
+            await ctx.respond(f"{employee} is not in the employee database. Add them with /addemployee first.", ephemeral=self._eph(ctx))
             return
         try:
             pin = _parse_punch_time(clock_in)
             pout = _parse_punch_time(clock_out) if clock_out else None
         except ValueError as e:
-            await ctx.respond(str(e), ephemeral=True)
+            await ctx.respond(str(e), ephemeral=self._eph(ctx))
             return
         if pout and pout < pin:
-            await ctx.respond("Clock-out is before clock-in.", ephemeral=True)
+            await ctx.respond("Clock-out is before clock-in.", ephemeral=self._eph(ctx))
             return
         appr = 1 if approved else 0
         punch_id = await db.execute(
@@ -884,7 +925,7 @@ class TimeTracking(commands.Cog):
             await sync.enqueue(db, "punch", punch_id, "out")
         await self._refresh_clock(emp_id)
         timecard_log.info(f"[Punch] {ctx.author} added punch {punch_id} for employee {emp_id} ({pin} -> {pout or 'open'}).")
-        await ctx.respond(f"Added punch #{punch_id} for {row['name']}: `{pin}` → `{pout or 'open'}`.", ephemeral=True)
+        await ctx.respond(f"Added punch #{punch_id} for {row['name']}: `{pin}` → `{pout or 'open'}`.", ephemeral=self._eph(ctx))
 
     @discord.slash_command(name="editpunch", description="Fix a punch's clock-in/out time or approval.")
     @commands.has_permissions(administrator=True)
@@ -898,13 +939,13 @@ class TimeTracking(commands.Cog):
         db = await self._ensure_db()
         punch = _opt_int(punch)
         if punch is None:
-            await ctx.respond("Pick a punch from the autocomplete list.", ephemeral=True)
+            await ctx.respond("Pick a punch from the autocomplete list.", ephemeral=self._eph(ctx))
             return
         row = await db.fetchone(
             "SELECT employeeID, punchInTime, punchOutTime FROM punch_clock WHERE id = ?", (punch,)
         )
         if row is None:
-            await ctx.respond("That punch doesn't exist.", ephemeral=True)
+            await ctx.respond("That punch doesn't exist.", ephemeral=self._eph(ctx))
             return
         sets, params = [], []
         try:
@@ -913,19 +954,19 @@ class TimeTracking(commands.Cog):
             if clock_out is not None:
                 sets.append("punchOutTime = ?"); params.append(_parse_punch_time(clock_out))
         except ValueError as e:
-            await ctx.respond(str(e), ephemeral=True)
+            await ctx.respond(str(e), ephemeral=self._eph(ctx))
             return
         if approved is not None:
             sets.append("punchInApproval = ?"); params.append(1 if approved else 0)
             sets.append("punchOutApproval = ?"); params.append(1 if approved else 0)
         if not sets:
-            await ctx.respond("Nothing to change — provide a new clock-in, clock-out, or approval.", ephemeral=True)
+            await ctx.respond("Nothing to change — provide a new clock-in, clock-out, or approval.", ephemeral=self._eph(ctx))
             return
         await db.execute(f"UPDATE punch_clock SET {', '.join(sets)} WHERE id = ?", (*params, punch))
         await sync.enqueue(db, "punch", punch, "edit")
         await self._refresh_clock(row["employeeID"])
         timecard_log.info(f"[Punch] {ctx.author} edited punch {punch} ({', '.join(sets)}).")
-        await ctx.respond(f"Updated punch #{punch}.", ephemeral=True)
+        await ctx.respond(f"Updated punch #{punch}.", ephemeral=self._eph(ctx))
 
     @discord.slash_command(name="deletepunch", description="Delete a punch — review each linked worktime first.")
     @commands.has_permissions(administrator=True)
@@ -936,14 +977,14 @@ class TimeTracking(commands.Cog):
         db = await self._ensure_db()
         punch = _opt_int(punch)
         if punch is None:
-            await ctx.respond("Pick a punch from the autocomplete list.", ephemeral=True)
+            await ctx.respond("Pick a punch from the autocomplete list.", ephemeral=self._eph(ctx))
             return
         row = await db.fetchone(
             "SELECT pc.employeeID, e.name AS ename, pc.punchInTime, pc.punchOutTime FROM punch_clock pc "
             "JOIN employee e ON pc.employeeID = e.id WHERE pc.id = ?", (punch,)
         )
         if row is None:
-            await ctx.respond("That punch doesn't exist.", ephemeral=True)
+            await ctx.respond("That punch doesn't exist.", ephemeral=self._eph(ctx))
             return
         header = (f"Delete punch #{punch} for **{row['ename']}** "
                   f"(`{row['punchInTime']}` → `{row['punchOutTime'] or 'open'}`)")
@@ -955,16 +996,16 @@ class TimeTracking(commands.Cog):
         # No worktime: a plain confirm is enough.
         if not worktimes:
             confirm = Confirm(user=ctx.user, timeout=60)
-            await ctx.respond(f"{header}?", view=confirm, ephemeral=True)
+            await ctx.respond(f"{header}?", view=confirm, ephemeral=self._eph(ctx))
             await confirm.wait()
             if not confirm.value:
-                await ctx.followup.send("Cancelled.", ephemeral=True)
+                await ctx.followup.send("Cancelled.", ephemeral=self._eph(ctx))
                 return
             emp = await delete_punch_cascade(self, punch, to_odoo=True)
             timecard_log.info(f"[Punch] {ctx.author} deleted punch {punch} via /deletepunch.")
             if emp:
                 await self._refresh_clock(emp)
-            await ctx.followup.send(f"Deleted punch #{punch}.", ephemeral=True)
+            await ctx.followup.send(f"Deleted punch #{punch}.", ephemeral=self._eph(ctx))
             return
 
         # Candidate shifts to reassign onto: the same employee's other punches.
@@ -981,17 +1022,17 @@ class TimeTracking(commands.Cog):
             await ctx.respond(
                 f"{header} and its **{len(worktimes)}** worktime entries? "
                 f"(To keep any, cancel and move them first with `/reassignworktime`.)",
-                view=confirm, ephemeral=True,
+                view=confirm, ephemeral=self._eph(ctx),
             )
             await confirm.wait()
             if not confirm.value:
-                await ctx.followup.send("Cancelled.", ephemeral=True)
+                await ctx.followup.send("Cancelled.", ephemeral=self._eph(ctx))
                 return
             emp = await delete_punch_cascade(self, punch, to_odoo=True)
             timecard_log.info(f"[Punch] {ctx.author} deleted punch {punch} (+{len(worktimes)} worktime) via /deletepunch.")
             if emp:
                 await self._refresh_clock(emp)
-            await ctx.followup.send(f"Deleted punch #{punch}.", ephemeral=True)
+            await ctx.followup.send(f"Deleted punch #{punch}.", ephemeral=self._eph(ctx))
             return
 
         flow = DeletePunchFlow(self, punch, worktimes, candidates, ctx.user.id)
@@ -1000,7 +1041,7 @@ class TimeTracking(commands.Cog):
             f"{header} has **{len(worktimes)}** worktime "
             f"entr{'y' if len(worktimes) == 1 else 'ies'}. For each, choose **delete with "
             f"the punch** or **reassign to another shift**, then Confirm.{note}",
-            view=flow, ephemeral=True,
+            view=flow, ephemeral=self._eph(ctx),
         )
         timecard_log.info(f"[Punch] {ctx.author} opened delete review for punch {punch} ({len(worktimes)} worktime).")
 
@@ -1014,23 +1055,23 @@ class TimeTracking(commands.Cog):
         db = await self._ensure_db()
         worktime, punch = _opt_int(worktime), _opt_int(punch)
         if worktime is None or punch is None:
-            await ctx.respond("Pick both the worktime and the target punch from the autocomplete lists.", ephemeral=True)
+            await ctx.respond("Pick both the worktime and the target punch from the autocomplete lists.", ephemeral=self._eph(ctx))
             return
         if await db.fetchone("SELECT 1 FROM work_time WHERE id = ?", (worktime,)) is None:
-            await ctx.respond("That worktime doesn't exist.", ephemeral=True)
+            await ctx.respond("That worktime doesn't exist.", ephemeral=self._eph(ctx))
             return
         if await db.fetchone("SELECT 1 FROM punch_clock WHERE id = ?", (punch,)) is None:
-            await ctx.respond("That target punch doesn't exist.", ephemeral=True)
+            await ctx.respond("That target punch doesn't exist.", ephemeral=self._eph(ctx))
             return
         old_emp, new_emp = await reassign_worktime(self, worktime, punch, to_odoo=True)
         if new_emp is None:
-            await ctx.respond("Couldn't reassign — it's already on that punch.", ephemeral=True)
+            await ctx.respond("Couldn't reassign — it's already on that punch.", ephemeral=self._eph(ctx))
             return
         for e in {old_emp, new_emp} - {None}:
             await self._refresh_clock(e)
         timecard_log.info(f"[Work] {ctx.author} reassigned worktime {worktime} to punch {punch}.")
         note = " (Odoo shift link updated)" if self.client.loaded else ""
-        await ctx.respond(f"Moved worktime #{worktime} onto punch #{punch}.{note}", ephemeral=True)
+        await ctx.respond(f"Moved worktime #{worktime} onto punch #{punch}.{note}", ephemeral=self._eph(ctx))
 
     # ---- worktime management -----------------------------------------------
 
@@ -1047,24 +1088,24 @@ class TimeTracking(commands.Cog):
         db = await self._ensure_db()
         punch, customer, task = _opt_int(punch), _opt_int(customer), _opt_int(task)
         if punch is None:
-            await ctx.respond("Pick a punch from the autocomplete list.", ephemeral=True)
+            await ctx.respond("Pick a punch from the autocomplete list.", ephemeral=self._eph(ctx))
             return
         prow = await db.fetchone("SELECT employeeID, punchInTime FROM punch_clock WHERE id = ?", (punch,))
         if prow is None:
-            await ctx.respond("That punch doesn't exist.", ephemeral=True)
+            await ctx.respond("That punch doesn't exist.", ephemeral=self._eph(ctx))
             return
         try:
             minutes = _hours_to_minutes(hours)
         except ValueError as e:
-            await ctx.respond(str(e), ephemeral=True)
+            await ctx.respond(str(e), ephemeral=self._eph(ctx))
             return
         cust_id = 0
         if worktype in ("Construction", "Service"):
             if not customer:
-                await ctx.respond(f"{worktype} work needs a customer.", ephemeral=True)
+                await ctx.respond(f"{worktype} work needs a customer.", ephemeral=self._eph(ctx))
                 return
             if await db.fetchone("SELECT 1 FROM customer WHERE id = ?", (customer,)) is None:
-                await ctx.respond("That customer doesn't exist.", ephemeral=True)
+                await ctx.respond("That customer doesn't exist.", ephemeral=self._eph(ctx))
                 return
             cust_id = customer
         # An Odoo task makes the entry syncable: resolve its project so the
@@ -1096,7 +1137,7 @@ class TimeTracking(commands.Cog):
             note = warn or " (local only — link an Odoo task to push it, or add it in Odoo directly)"
         else:
             note = ""
-        await ctx.respond(f"Added {worktype} worktime #{wt_id} ({hours:g}h) to punch #{punch}.{note}", ephemeral=True)
+        await ctx.respond(f"Added {worktype} worktime #{wt_id} ({hours:g}h) to punch #{punch}.{note}", ephemeral=self._eph(ctx))
 
     @discord.slash_command(name="editworktime", description="Edit a worktime entry's type, hours, or customer.")
     @commands.has_permissions(administrator=True)
@@ -1111,11 +1152,11 @@ class TimeTracking(commands.Cog):
         db = await self._ensure_db()
         worktime, customer, task = _opt_int(worktime), _opt_int(customer), _opt_int(task)
         if worktime is None:
-            await ctx.respond("Pick a worktime from the autocomplete list.", ephemeral=True)
+            await ctx.respond("Pick a worktime from the autocomplete list.", ephemeral=self._eph(ctx))
             return
         wt = await db.fetchone("SELECT punchID, odooId FROM work_time WHERE id = ?", (worktime,))
         if wt is None:
-            await ctx.respond("That worktime doesn't exist.", ephemeral=True)
+            await ctx.respond("That worktime doesn't exist.", ephemeral=self._eph(ctx))
             return
         sets, params = [], []
         if worktype is not None:
@@ -1124,11 +1165,11 @@ class TimeTracking(commands.Cog):
             try:
                 params.append(_hours_to_minutes(hours)); sets.append("timeSpent = ?")
             except ValueError as e:
-                await ctx.respond(str(e), ephemeral=True)
+                await ctx.respond(str(e), ephemeral=self._eph(ctx))
                 return
         if customer is not None:
             if await db.fetchone("SELECT 1 FROM customer WHERE id = ?", (customer,)) is None:
-                await ctx.respond("That customer doesn't exist.", ephemeral=True)
+                await ctx.respond("That customer doesn't exist.", ephemeral=self._eph(ctx))
                 return
             sets.append("customerID = ?"); params.append(customer)
         if task is not None and self.client.loaded:
@@ -1138,12 +1179,12 @@ class TimeTracking(commands.Cog):
                 log.warning(f"[Odoo] task project lookup failed: {e}")
                 pid = None
             if not pid:
-                await ctx.respond("Couldn't resolve that Odoo task's project.", ephemeral=True)
+                await ctx.respond("Couldn't resolve that Odoo task's project.", ephemeral=self._eph(ctx))
                 return
             sets.append("odooTaskId = ?"); params.append(task)
             sets.append("odooProjectId = ?"); params.append(pid)
         if not sets:
-            await ctx.respond("Nothing to change — provide a new type, hours, customer, or task.", ephemeral=True)
+            await ctx.respond("Nothing to change — provide a new type, hours, customer, or task.", ephemeral=self._eph(ctx))
             return
         await db.execute(f"UPDATE work_time SET {', '.join(sets)} WHERE id = ?", (*params, worktime))
         push = self.client.loaded and (wt["odooId"] or task is not None)
@@ -1154,7 +1195,7 @@ class TimeTracking(commands.Cog):
             await self._refresh_clock(prow["employeeID"])
         timecard_log.info(f"[Work] {ctx.author} edited worktime {worktime} ({', '.join(sets)}).")
         note = " — change queued to Odoo." if push else ""
-        await ctx.respond(f"Updated worktime #{worktime}.{note}", ephemeral=True)
+        await ctx.respond(f"Updated worktime #{worktime}.{note}", ephemeral=self._eph(ctx))
 
     @discord.slash_command(name="deleteworktime", description="Delete a single worktime entry.")
     @commands.has_permissions(administrator=True)
@@ -1165,16 +1206,16 @@ class TimeTracking(commands.Cog):
         db = await self._ensure_db()
         worktime = _opt_int(worktime)
         if worktime is None:
-            await ctx.respond("Pick a worktime from the autocomplete list.", ephemeral=True)
+            await ctx.respond("Pick a worktime from the autocomplete list.", ephemeral=self._eph(ctx))
             return
         if await db.fetchone("SELECT 1 FROM work_time WHERE id = ?", (worktime,)) is None:
-            await ctx.respond("That worktime doesn't exist.", ephemeral=True)
+            await ctx.respond("That worktime doesn't exist.", ephemeral=self._eph(ctx))
             return
         emp = await delete_worktime_local(self, worktime, to_odoo=True)
         if emp:
             await self._refresh_clock(emp)
         timecard_log.info(f"[Work] {ctx.author} deleted worktime {worktime} via /deleteworktime.")
-        await ctx.respond(f"Deleted worktime #{worktime}.", ephemeral=True)
+        await ctx.respond(f"Deleted worktime #{worktime}.", ephemeral=self._eph(ctx))
 
     # ---- clock commands ----------------------------------------------------
 
@@ -1189,29 +1230,29 @@ class TimeTracking(commands.Cog):
         try:
             employee_id = int(user[2:-1])
         except (ValueError, IndexError):
-            await ctx.respond(f"'{user}' is not a valid user mention.", ephemeral=True)
+            await ctx.respond(f"'{user}' is not a valid user mention.", ephemeral=self._eph(ctx))
             return
 
         row = await db.fetchone(
             "SELECT clockChannelId, clockMessageId, archived FROM employee WHERE id = ?", (employee_id,)
         )
         if row is None:
-            await ctx.respond(f"{user} is not in the employee database. Add them with /addemployee first.", ephemeral=True)
+            await ctx.respond(f"{user} is not in the employee database. Add them with /addemployee first.", ephemeral=self._eph(ctx))
             return
         if row["archived"]:
             await ctx.respond(
                 f"{user} is archived (terminated). Reactivate them in Odoo (unarchive the employee) before creating a clock.",
-                ephemeral=True,
+                ephemeral=self._eph(ctx),
             )
             return
         if row["clockMessageId"] is not None:
             confirm = Confirm(user=ctx.user, timeout=180)
             await ctx.response.send_message(
-                "This employee already has a time clock. Proceed and replace it?", view=confirm, ephemeral=True
+                "This employee already has a time clock. Proceed and replace it?", view=confirm, ephemeral=self._eph(ctx)
             )
             await confirm.wait()
             if not confirm.value:
-                await ctx.followup.send("Cancelled (or timed out).", ephemeral=True)
+                await ctx.followup.send("Cancelled (or timed out).", ephemeral=self._eph(ctx))
                 return
             await self._delete_clock_message(row["clockChannelId"], row["clockMessageId"])
             responded = True
@@ -1223,16 +1264,16 @@ class TimeTracking(commands.Cog):
             try:
                 channel_obj = self.bot.get_channel(int(channel[2:-1]))
             except (ValueError, IndexError):
-                await ctx.respond(f"'{channel}' is not a valid channel mention.", ephemeral=True)
+                await ctx.respond(f"'{channel}' is not a valid channel mention.", ephemeral=self._eph(ctx))
                 return
 
         await self.make_clock(employee_id, channel_obj)
 
         note = f"Clock created successfully for {user}."
         if responded:
-            await ctx.followup.send(note, ephemeral=True)
+            await ctx.followup.send(note, ephemeral=self._eph(ctx))
         else:
-            await ctx.respond(note, ephemeral=True)
+            await ctx.respond(note, ephemeral=self._eph(ctx))
 
     async def _delete_clock_message(self, channel_id, message_id):
         try:
@@ -1253,7 +1294,7 @@ class TimeTracking(commands.Cog):
         try:
             employee_id = int(user[2:-1])
         except (ValueError, IndexError):
-            await ctx.respond(f"'{user}' is not a valid user mention.", ephemeral=True)
+            await ctx.respond(f"'{user}' is not a valid user mention.", ephemeral=self._eph(ctx))
             return
         row = await db.fetchone(
             "SELECT clockChannelId, clockMessageId FROM employee WHERE id = ?", (employee_id,)
@@ -1264,7 +1305,7 @@ class TimeTracking(commands.Cog):
                 "UPDATE employee SET clockChannelId = NULL, clockMessageId = NULL WHERE id = ?",
                 (employee_id,),
             )
-        await ctx.respond(f"Clock deleted for {user}.", ephemeral=True)
+        await ctx.respond(f"Clock deleted for {user}.", ephemeral=self._eph(ctx))
 
     @discord.slash_command(name="refreshclock", description="Refresh your own time clock if the display looks stuck.")
     async def refreshclock(self, ctx: discord.ApplicationContext):
@@ -1365,24 +1406,24 @@ class TimeTracking(commands.Cog):
         try:
             emp_id = int(employee[2:-1])
         except (ValueError, IndexError):
-            await ctx.respond(f"'{employee}' is not a valid user mention.", ephemeral=True)
+            await ctx.respond(f"'{employee}' is not a valid user mention.", ephemeral=self._eph(ctx))
             return
         erow = await db.fetchone("SELECT name FROM employee WHERE id = ?", (emp_id,))
         if erow is None:
-            await ctx.respond(f"{employee} isn't in the employee system.", ephemeral=True)
+            await ctx.respond(f"{employee} isn't in the employee system.", ephemeral=self._eph(ctx))
             return
         if week_end_date:
             try:
                 d = datetime.strptime(week_end_date, "%Y-%m-%d")
             except ValueError:
-                await ctx.respond("Invalid date — use YYYY-MM-DD.", ephemeral=True)
+                await ctx.respond("Invalid date — use YYYY-MM-DD.", ephemeral=self._eph(ctx))
                 return
         else:
             d = datetime.now()
         eow = d + timedelta(days=(5 - d.weekday()) % 7)  # snap to that week's ending Saturday
         embed = await build_timecard_embed(self, emp_id, erow["name"], eow)
         view = TimecardWeekView(self, emp_id, erow["name"], eow, ctx.user.id)
-        await ctx.respond(embed=embed, view=view, ephemeral=True)
+        await ctx.respond(embed=embed, view=view, ephemeral=self._eph(ctx))
 
     @discord.slash_command(name="timecardreport", description="Generate a weekly punch report given an end date.")
     @commands.has_permissions(administrator=True)

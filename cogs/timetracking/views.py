@@ -811,6 +811,7 @@ class _ConfirmDeleteFlowButton(discord.ui.Button):
                     f"entr{'y' if reassigned == 1 else 'ies'} to another shift "
                     f"(Odoo shift links updated).")
         await interaction.edit_original_response(content=msg, view=flow)
+        timecard_log.info(f"[Punch] {interaction.user} confirmed delete review for punch {flow.punch_id}: {msg}")
         flow.stop()
 
 
