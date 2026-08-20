@@ -46,7 +46,7 @@ _MANAGEMENT_COMMANDS = {
     "addworktime", "editworktime", "deleteworktime", "reassignworktime",
     "viewtimecard",
     "synccustomers", "linkcustomer", "unlinkcustomer", "unlinkedcustomers",
-    "addcustomer", "editcustomer", "configureprojects",
+    "addcustomer", "editcustomer", "configureprojects", "configureroles",
     "addemployee", "linkemployee", "unlinkemployee",
     "createclock", "deleteclock",
 }
@@ -948,6 +948,45 @@ class TimeTracking(commands.Cog):
             timecard_log.info(f"[Config] {ctx.author} set Odoo project ids: {', '.join(changed)}.")
         cfg = await self._project_config_text()
         header = ("Updated: " + "; ".join(changed) + ".\n\n") if changed else "Current Odoo project configuration:\n\n"
+        await ctx.respond(header + cfg, ephemeral=self._eph(ctx))
+
+    def _role_config_text(self, guild) -> str:
+        """Render the current timecard admin / timeclock role assignments."""
+        lines = []
+        for label, key in (("Timecard Admin", "TIMECARD_ADMIN_ROLE"),
+                            ("Timeclock (shop)", "TIMECARD_TIMECLOCK_ROLE_ID")):
+            rid = _opt_int(os.getenv(key))
+            role = guild.get_role(rid) if (rid and guild) else None
+            if role:
+                shown = f"@{role.name} (id {role.id})"
+            elif rid:
+                shown = f"id {rid} — ⚠️ no such role in this server"
+            else:
+                shown = "_not set_"
+            lines.append(f"• **{label}**: {shown}")
+        return "\n".join(lines)
+
+    @discord.slash_command(name="configureroles", description="Set which Discord roles are the timecard-admin and shop timeclock roles.")
+    @is_timecard_admin()
+    async def configureroles(
+        self, ctx: discord.ApplicationContext,
+        admin_role: discord.Option(discord.Role, default=None, description="Role that can run all timecard admin commands"),  # type: ignore
+        timeclock_role: discord.Option(discord.Role, default=None, description="Shop role that can clock anyone in/out without approval"),  # type: ignore
+    ):
+        await self._ensure_db()
+        changed = []
+        for role, key, label in ((admin_role, "TIMECARD_ADMIN_ROLE", "Timecard Admin"),
+                                 (timeclock_role, "TIMECARD_TIMECLOCK_ROLE_ID", "Timeclock (shop)")):
+            if role is None:
+                continue
+            # Persist the role id to .env + the live env (immediate, no restart) --
+            # same mechanism as /configureprojects.
+            config.set_env(key, str(role.id))
+            changed.append(f"{label} → @{role.name}")
+        if changed:
+            timecard_log.info(f"[Config] {ctx.author} set timecard roles: {', '.join(changed)}.")
+        cfg = self._role_config_text(ctx.guild)
+        header = ("Updated: " + "; ".join(changed) + ".\n\n") if changed else "Current timecard role configuration:\n\n"
         await ctx.respond(header + cfg, ephemeral=self._eph(ctx))
 
     # ---- punch management (after-the-fact fixes, no DB browser needed) ------
