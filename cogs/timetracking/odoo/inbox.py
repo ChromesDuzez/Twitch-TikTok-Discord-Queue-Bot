@@ -26,7 +26,7 @@ import asyncio
 import os
 
 from botlog import timecard_log as log  # inbound reconcile activity -> TIMECARD_LOG_ID
-from ..db import Database
+from ..db import Database, resolve_project_id
 from . import sync
 from .client import OdooClient, shift_field
 
@@ -43,11 +43,12 @@ def _project_env(name: str) -> int | None:
         return None
 
 
-def _punch_type_for_project(project_id) -> str:
-    """Map an Odoo project id to a local worktime category."""
-    if project_id and project_id == _project_env("ODOO_OFFICE_PROJECT_ID"):
+async def _punch_type_for_project(db, project_id) -> str:
+    """Map an Odoo project id to a local worktime category, using the
+    Discord-configured project ids (env fallback)."""
+    if project_id and project_id == await resolve_project_id(db, "ODOO_OFFICE_PROJECT_ID"):
         return "Office"
-    if project_id and project_id == _project_env("ODOO_FIELD_SERVICE_PROJECT_ID"):
+    if project_id and project_id == await resolve_project_id(db, "ODOO_FIELD_SERVICE_PROJECT_ID"):
         return "Service"
     return "Construction"
 
@@ -388,7 +389,7 @@ class InboxWorker:
         task = rec.get("task_id")
         task_id = task[0] if isinstance(task, (list, tuple)) else None
         partner = rec.get("partner_id")
-        punch_type = _punch_type_for_project(proj_id)
+        punch_type = await _punch_type_for_project(self.db, proj_id)
         work_date = str(rec.get("date") or sync.now_local_str())[:10]
 
         # Resolve which punch this line is attached to via the shift link, if any.

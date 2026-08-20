@@ -46,7 +46,7 @@ _MANAGEMENT_COMMANDS = {
     "addworktime", "editworktime", "deleteworktime", "reassignworktime",
     "viewtimecard",
     "synccustomers", "linkcustomer", "unlinkcustomer", "unlinkedcustomers",
-    "addcustomer", "editcustomer",
+    "addcustomer", "editcustomer", "configureprojects",
     "addemployee", "linkemployee", "unlinkemployee",
     "createclock", "deleteclock",
 }
@@ -657,6 +657,18 @@ class TimeTracking(commands.Cog):
             out.append(_choice(label, str(t["id"]), f"Task #{t['id']}"))
         return out
 
+    async def project_autocomplete(self, ctx: discord.AutocompleteContext):
+        """Active Odoo projects (value = project id as a string)."""
+        if not self.client.loaded:
+            return []
+        try:
+            rows = await self.client.get_project_list(str(ctx.value or ""))
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"[Odoo] project autocomplete fetch failed: {e}")
+            return []
+        return [_choice(r.get("display_name"), str(r["id"]), f"Project #{r['id']}")
+                for r in (rows or [])][:25]
+
     @discord.slash_command(name="addemployee", description="Add a new Employee to the system.")
     @commands.has_permissions(administrator=True)
     async def addemployee(
@@ -883,6 +895,60 @@ class TimeTracking(commands.Cog):
         preview = "\n".join(f"• {n}" for n in names[:40])
         more = f"\n…and {len(names) - 40} more." if len(names) > 40 else ""
         await ctx.respond(f"**{len(names)}** unlinked customer(s):\n{preview}{more}\n\nLink them with /linkcustomer.", ephemeral=self._eph(ctx))
+
+    # ---- Odoo project configuration ----------------------------------------
+
+    async def _project_config_text(self, db) -> str:
+        """Render the current Field Service / Office project config (id + name)."""
+        lines = []
+        for label, key in (("Field Service", "ODOO_FIELD_SERVICE_PROJECT_ID"),
+                            ("Office", "ODOO_OFFICE_PROJECT_ID")):
+            pid = await resolve_project_id(db, key)
+            name, src = "", ""
+            if pid:
+                src = " _(set here)_" if await db.get_setting(key) else " _(from .env)_"
+                if self.client.loaded:
+                    try:
+                        rec = await self.client.read_record("project.project", pid, ["display_name"])
+                        name = f" — {rec['display_name']}" if rec else " — ⚠️ not found in Odoo"
+                    except Exception:  # noqa: BLE001
+                        name = ""
+            lines.append(f"• **{label}**: {pid if pid else '_not set_'}{name}{src}")
+        return "\n".join(lines)
+
+    @discord.slash_command(name="configureprojects", description="Set the Odoo Field Service / Office project ids used to categorize worktime.")
+    @commands.has_permissions(administrator=True)
+    async def configureprojects(
+        self, ctx: discord.ApplicationContext,
+        field_service: discord.Option(str, default=None, description="Odoo project for Field Service (Service) work", autocomplete=project_autocomplete),  # type: ignore
+        office: discord.Option(str, default=None, description="Odoo project for Office work", autocomplete=project_autocomplete),  # type: ignore
+    ):
+        db = await self._ensure_db()
+        changed = []
+        for value, key, label in ((field_service, "ODOO_FIELD_SERVICE_PROJECT_ID", "Field Service"),
+                                  (office, "ODOO_OFFICE_PROJECT_ID", "Office")):
+            if value is None:
+                continue
+            pid = _opt_int(value)
+            if pid is None:
+                await ctx.respond(f"'{value}' isn't a valid project id for {label}.", ephemeral=self._eph(ctx))
+                return
+            if self.client.loaded:  # validate the project exists when Odoo is online
+                try:
+                    rec = await self.client.read_record("project.project", pid, ["id"])
+                except Exception as e:  # noqa: BLE001
+                    await ctx.respond(f"Couldn't reach Odoo to verify the {label} project: {e}", ephemeral=self._eph(ctx))
+                    return
+                if rec is None:
+                    await ctx.respond(f"No Odoo project has id {pid} (for {label}). Pick one from the list.", ephemeral=self._eph(ctx))
+                    return
+            await db.set_setting(key, pid)
+            changed.append(f"{label} → {pid}")
+        if changed:
+            timecard_log.info(f"[Config] {ctx.author} set Odoo project ids: {', '.join(changed)}.")
+        cfg = await self._project_config_text(db)
+        header = ("Updated: " + "; ".join(changed) + ".\n\n") if changed else "Current Odoo project configuration:\n\n"
+        await ctx.respond(header + cfg, ephemeral=self._eph(ctx))
 
     # ---- punch management (after-the-fact fixes, no DB browser needed) ------
 

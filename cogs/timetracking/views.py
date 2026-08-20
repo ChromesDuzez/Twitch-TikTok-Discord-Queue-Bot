@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 import discord
 
 from botlog import timecard_log
-from .db import Database
+from .db import Database, resolve_project_id
 from .modals import Confirm, CustomerInputModal, CustomerSelectMenu, EditPunchTimeModal, GetTimeSpent
 from .perms import CLOCK_ROLES, has_perms
 from .odoo import sync
@@ -284,7 +284,7 @@ class StartWorkButton(discord.ui.Button):
             # Office desk work: no customer/task. Link to the dedicated Office
             # project when configured (else it stays local-only).
             await interaction.response.defer()
-            office_pid = _project_env("ODOO_OFFICE_PROJECT_ID") if view.cog.client.loaded else None
+            office_pid = await resolve_project_id(view.cog.db, "ODOO_OFFICE_PROJECT_ID") if view.cog.client.loaded else None
             await self._create_worktime(interaction, customer_id=0, task_id=None, project_id=office_pid)
             return
 
@@ -304,8 +304,8 @@ class StartWorkButton(discord.ui.Button):
 
         if self.punch_type == "Construction":
             rows = await client.search_construction_projects(
-                term, exclude_ids=[_project_env("ODOO_FIELD_SERVICE_PROJECT_ID"),
-                                    _project_env("ODOO_OFFICE_PROJECT_ID")],
+                term, exclude_ids=[await resolve_project_id(view.cog.db, "ODOO_FIELD_SERVICE_PROJECT_ID"),
+                                    await resolve_project_id(view.cog.db, "ODOO_OFFICE_PROJECT_ID")],
             ) or []
             for r in rows:
                 partner = r.get("partner_id")
@@ -315,11 +315,11 @@ class StartWorkButton(discord.ui.Button):
                 }
             noun = "construction projects"
         else:  # Service
-            fs_id = _project_env("ODOO_FIELD_SERVICE_PROJECT_ID")
+            fs_id = await resolve_project_id(view.cog.db, "ODOO_FIELD_SERVICE_PROJECT_ID")
             if not fs_id:
                 await interaction.response.send_message(
-                    "The Field Service project id is not configured. Ask an admin to set "
-                    "ODOO_FIELD_SERVICE_PROJECT_ID.", ephemeral=True)
+                    "The Field Service project isn't configured yet. Ask an admin to set it "
+                    "with `/configureprojects`.", ephemeral=True)
                 return
             months = _project_env("ODOO_TASK_WINDOW_MONTHS") or 6
             rows = await client.search_service_tasks(term, fs_id, months=months) or []

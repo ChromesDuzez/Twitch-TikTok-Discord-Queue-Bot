@@ -369,6 +369,17 @@ class OdooClient:
             },
         )
 
+    async def get_project_list(self, name: str = "", limit: int = 25):
+        """Active Odoo projects (id + display_name), for the /configureprojects
+        picker. Filters on the stored ``name``; reads display_name for the label."""
+        domain = [["active", "=", True]]
+        if name:
+            domain.append(["name", "ilike", name])
+        return await self.call(
+            "/project.project/search_read",
+            {"domain": domain, "fields": ["id", "display_name"], "order": "name asc", "limit": limit},
+        )
+
     # ---- timesheets --------------------------------------------------------
 
     async def add_timesheet(
