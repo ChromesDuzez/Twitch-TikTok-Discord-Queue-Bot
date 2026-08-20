@@ -183,6 +183,49 @@ class OdooClient:
             },
         )
 
+    async def get_partner_name_history(self, limit: int = 5000):
+        """Former names of ``res.partner`` records, from the chatter
+        (``mail.tracking.value`` rows for the tracked ``name`` field). Returns
+        ``{former_name_lower: [partner_id, ...]}`` so a local customer whose name
+        matches a *previous* Odoo name (the partner was later renamed) can still
+        be auto-linked. Best-effort: returns ``{}`` if the chatter models/fields
+        aren't available. All fields used are stored (see the Odoo Field Reference).
+        """
+        try:
+            tvs = await self.call(
+                "/mail.tracking.value/search_read",
+                {
+                    "domain": [
+                        ["field_id.name", "=", "name"],
+                        ["mail_message_id.model", "=", "res.partner"],
+                    ],
+                    "fields": ["old_value_char", "mail_message_id"],
+                    "limit": limit,
+                },
+            )
+        except Exception as e:  # noqa: BLE001 - chatter is optional
+            log.warning(f"[Odoo] partner name-history fetch failed: {e}")
+            return {}
+        if not tvs:
+            return {}
+        msg_ids = list({tv["mail_message_id"][0] for tv in tvs
+                        if isinstance(tv.get("mail_message_id"), (list, tuple))})
+        if not msg_ids:
+            return {}
+        msgs = await self.call(
+            "/mail.message/search_read",
+            {"domain": [["id", "in", msg_ids]], "fields": ["id", "res_id"], "limit": len(msg_ids)},
+        ) or []
+        msg_to_partner = {m["id"]: m["res_id"] for m in msgs}
+        history: dict[str, list[int]] = {}
+        for tv in tvs:
+            mm = tv.get("mail_message_id")
+            pid = msg_to_partner.get(mm[0]) if isinstance(mm, (list, tuple)) else None
+            old = (tv.get("old_value_char") or "").strip().lower()
+            if pid and old and pid not in history.setdefault(old, []):
+                history[old].append(pid)
+        return history
+
     async def create_partner(self, name: str, block_duplicate: bool = True):
         if block_duplicate:
             existing = await self.search_partners_by_name(name)

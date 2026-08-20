@@ -58,6 +58,14 @@ def _hours_to_minutes(hours: float) -> int:
     return minutes
 
 
+def _choice(name, value, fallback="(unnamed)"):
+    """Build an OptionChoice with a Discord-legal name (1..100 chars). Odoo/DB
+    rows occasionally have a blank display name — an empty choice name 400s the
+    whole autocomplete ('Must be between 1 and 100 in length')."""
+    label = (str(name).strip() if name is not None else "") or fallback
+    return discord.OptionChoice(name=label[:100], value=value)
+
+
 def _opt_int(raw) -> int | None:
     """Parse an id chosen from an autocomplete (a string value) to int, or None
     if blank/unparseable. Id-based options are string-typed so users can type a
@@ -414,8 +422,8 @@ class TimeTracking(commands.Cog):
                       await self.db.fetchall("SELECT odooId FROM employee WHERE odooId IS NOT NULL")}
         term = str(ctx.value or "").lower()
         matches = [e for e in self._odoo_employees
-                   if e["id"] not in linked and term in e["display_name"].lower()]
-        return [discord.OptionChoice(name=e["display_name"], value=e["id"]) for e in matches[:25]]
+                   if e["id"] not in linked and term in str(e.get("display_name") or "").lower()]
+        return [_choice(e.get("display_name"), e["id"], f"Employee #{e['id']}") for e in matches[:25]]
 
     async def linked_employee_autocomplete(self, ctx: discord.AutocompleteContext):
         """Local employees currently linked to an Odoo employee (for /unlinkemployee).
@@ -428,9 +436,8 @@ class TimeTracking(commands.Cog):
         term = str(ctx.value or "").lower()
         out = []
         for r in rows:
-            if term in r["name"].lower() or term in str(r["odooId"]):
-                out.append(discord.OptionChoice(name=f"{r['name']} (Odoo #{r['odooId']})"[:100],
-                                                value=f"<@{r['id']}>"))
+            if term in str(r["name"] or "").lower() or term in str(r["odooId"]):
+                out.append(_choice(f"{r['name']} (Odoo #{r['odooId']})", f"<@{r['id']}>"))
         return out[:25]
 
     async def unlinked_employee_autocomplete(self, ctx: discord.AutocompleteContext):
@@ -442,8 +449,8 @@ class TimeTracking(commands.Cog):
             "SELECT id, name FROM employee WHERE odooId IS NULL ORDER BY name"
         )
         term = str(ctx.value or "").lower()
-        out = [discord.OptionChoice(name=r["name"][:100], value=f"<@{r['id']}>")
-               for r in rows if term in r["name"].lower()]
+        out = [_choice(r["name"], f"<@{r['id']}>")
+               for r in rows if term in str(r["name"] or "").lower()]
         return out[:25]
 
     async def unlinked_customer_autocomplete(self, ctx: discord.AutocompleteContext):
@@ -455,8 +462,8 @@ class TimeTracking(commands.Cog):
             "AND (archived IS NULL OR archived = 0) ORDER BY name"
         )
         term = str(ctx.value or "").lower()
-        return [discord.OptionChoice(name=r["name"][:100], value=r["id"])
-                for r in rows if term in r["name"].lower()][:25]
+        return [_choice(r["name"], r["id"])
+                for r in rows if term in str(r["name"] or "").lower()][:25]
 
     async def linked_customer_autocomplete(self, ctx: discord.AutocompleteContext):
         """Local customers currently linked to an Odoo partner (value = local id)."""
@@ -466,8 +473,8 @@ class TimeTracking(commands.Cog):
             "SELECT id, name, odooId FROM customer WHERE odooId IS NOT NULL ORDER BY name"
         )
         term = str(ctx.value or "").lower()
-        return [discord.OptionChoice(name=f"{r['name']} (Odoo #{r['odooId']})"[:100], value=r["id"])
-                for r in rows if term in r["name"].lower() or term in str(r["odooId"])][:25]
+        return [_choice(f"{r['name']} (Odoo #{r['odooId']})", r["id"])
+                for r in rows if term in str(r["name"] or "").lower() or term in str(r["odooId"])][:25]
 
     async def odoo_customer_autocomplete(self, ctx: discord.AutocompleteContext):
         """Suggest **unlinked** Odoo customers (res.partner). Cached per run; the
@@ -486,8 +493,8 @@ class TimeTracking(commands.Cog):
                       await self.db.fetchall("SELECT odooId FROM customer WHERE odooId IS NOT NULL")}
         term = str(ctx.value or "").lower()
         matches = [c for c in self._odoo_customers
-                   if c["id"] not in linked and term in c["display_name"].lower()]
-        return [discord.OptionChoice(name=c["display_name"][:100], value=c["id"]) for c in matches[:25]]
+                   if c["id"] not in linked and term in str(c.get("display_name") or "").lower()]
+        return [_choice(c.get("display_name"), c["id"], f"Partner #{c['id']}") for c in matches[:25]]
 
     async def employee_autocomplete(self, ctx: discord.AutocompleteContext):
         """All active employees (value = a mention, so it parses like a typed user)."""
@@ -497,8 +504,8 @@ class TimeTracking(commands.Cog):
             "SELECT id, name FROM employee WHERE archived = 0 OR archived IS NULL ORDER BY name"
         )
         term = str(ctx.value or "").lower()
-        return [discord.OptionChoice(name=r["name"][:100], value=f"<@{r['id']}>")
-                for r in rows if term in r["name"].lower()][:25]
+        return [_choice(r["name"], f"<@{r['id']}>")
+                for r in rows if term in str(r["name"] or "").lower()][:25]
 
     async def punch_autocomplete(self, ctx: discord.AutocompleteContext):
         """Recent punches, shown as 'Name · MM-DD HH:MM→out (#id)' (value = punch id
@@ -529,8 +536,8 @@ class TimeTracking(commands.Cog):
             "SELECT id, name FROM customer WHERE archived = 0 OR archived IS NULL ORDER BY name"
         )
         term = str(ctx.value or "").lower()
-        return [discord.OptionChoice(name=r["name"][:100], value=str(r["id"]))
-                for r in rows if term in r["name"].lower()][:25]
+        return [_choice(r["name"], str(r["id"]))
+                for r in rows if term in str(r["name"] or "").lower()][:25]
 
     async def worktime_autocomplete(self, ctx: discord.AutocompleteContext):
         """Recent worktime entries, shown as 'Name · Type Nh Customer (#id)'."""
@@ -605,8 +612,8 @@ class TimeTracking(commands.Cog):
         out = []
         for t in tasks[:25]:
             pd = str(t.get("planned_date_begin") or "")[:10]
-            label = f"{t['display_name']}{(' · ' + pd) if pd else ''}"
-            out.append(discord.OptionChoice(name=label[:100], value=str(t["id"])))
+            label = f"{t.get('display_name') or ''}{(' · ' + pd) if pd else ''}"
+            out.append(_choice(label, str(t["id"]), f"Task #{t['id']}"))
         return out
 
     @discord.slash_command(name="addemployee", description="Add a new Employee to the system.")
@@ -745,21 +752,38 @@ class TimeTracking(commands.Cog):
         unlinked = await db.fetchall(
             "SELECT id, name FROM customer WHERE odooId IS NULL AND (archived IS NULL OR archived = 0)"
         )
-        linked = ambiguous = nomatch = 0
+        linked = ambiguous = nomatch = via_history = 0
+        history = None  # {former_name_lower: [partner_id]}, lazy-loaded on first no-match
         for c in unlinked:
-            candidates = [i for i in by_name.get((c["name"] or "").strip().lower(), []) if i not in already]
+            key = (c["name"] or "").strip().lower()
+            candidates = [i for i in by_name.get(key, []) if i not in already]
             if len(candidates) == 1:
                 await db.execute("UPDATE customer SET odooId = ? WHERE id = ?", (candidates[0], c["id"]))
                 already.add(candidates[0]); linked += 1
-            elif len(candidates) > 1:
+                continue
+            if len(candidates) > 1:
                 ambiguous += 1
+                continue
+            # No current-name match — try former names from the Odoo chatter, so a
+            # customer renamed on one side still links (fetched once, then cached).
+            if history is None:
+                history = await self.client.get_partner_name_history() or {}
+            hist = [i for i in history.get(key, []) if i not in already]
+            if len(hist) == 1:
+                await db.execute("UPDATE customer SET odooId = ? WHERE id = ?", (hist[0], c["id"]))
+                already.add(hist[0]); via_history += 1
             else:
                 nomatch += 1
-        timecard_log.info(f"[Customer] {ctx.author} synccustomers: {linked} linked, {ambiguous} ambiguous, {nomatch} no-match.")
+        timecard_log.info(
+            f"[Customer] {ctx.author} synccustomers: {linked} linked, {via_history} via rename-history, "
+            f"{ambiguous} ambiguous, {nomatch} no-match."
+        )
+        via = f", **{via_history}** by a previous (renamed) Odoo name" if via_history else ""
         await ctx.followup.send(
-            f"Auto-link complete: **{linked}** linked by exact name. "
-            f"**{ambiguous + nomatch}** still unlinked ({ambiguous} ambiguous, {nomatch} no match) — "
-            f"link those with `/linkcustomer` (see `/unlinkedcustomers`).",
+            f"Auto-link complete: **{linked}** linked by exact name{via}. "
+            f"**{ambiguous + nomatch}** still unlinked — **{ambiguous}** ambiguous "
+            f"(the name matches more than one Odoo partner, so it can't pick one) and "
+            f"**{nomatch}** no match. Link those with `/linkcustomer` (see `/unlinkedcustomers`).",
             ephemeral=True,
         )
 

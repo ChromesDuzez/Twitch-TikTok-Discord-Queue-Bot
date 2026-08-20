@@ -106,6 +106,17 @@ standard Odoo 19 private-address fields.
 | `partner_id` | R | ✅ | read during inbound reconcile. |
 | **shift field** (`x_studio_shift`) | R/W | ✅ custom | See below. |
 
+### `mail.tracking.value` + `mail.message` — chatter (rename history)
+Used by `get_partner_name_history()` so `/synccustomers` can match a local
+customer against a partner's **former** name (renamed since). All stored.
+| Model.Field | Use | Stored | Notes |
+| --- | --- | --- | --- |
+| `mail.tracking.value.field_id` | F | ✅ | m2o → `ir.model.fields`; filter `field_id.name = 'name'`. |
+| `mail.tracking.value.old_value_char` | R | ✅ | the previous name text. |
+| `mail.tracking.value.mail_message_id` | R/F | ✅ | m2o → `mail.message`; filter `mail_message_id.model = 'res.partner'`. |
+| `mail.message.model` | F | ✅ | restrict to `res.partner`. |
+| `mail.message.res_id` | R | ✅ | the partner id the change belongs to. |
+
 ### `ir.model.fields` — introspection only
 | Field | Use | Stored | Notes |
 | --- | --- | --- | --- |
