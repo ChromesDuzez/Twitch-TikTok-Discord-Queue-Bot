@@ -152,7 +152,9 @@ class OdooClient:
             {
                 "domain": [["customer_rank", ">", 0], ["active", "=", True]],
                 "fields": ["id", "display_name"],
-                "order": "display_name asc",
+                # display_name is a non-stored computed field in Odoo 19, so it
+                # can't be used in ORDER BY (SQL). Sort by the stored name.
+                "order": "name asc",
             },
         )
 
@@ -219,7 +221,7 @@ class OdooClient:
         """
         domain = [["partner_id", "=", partner_id], ["is_closed", "=", False]]
         if name:
-            domain.append(["display_name", "ilike", name])
+            domain.append(["name", "ilike", name])  # stored field (display_name isn't)
         return await self.call(
             "/project.task/search_read",
             {

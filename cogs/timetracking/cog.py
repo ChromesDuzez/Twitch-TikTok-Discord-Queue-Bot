@@ -58,6 +58,18 @@ def _hours_to_minutes(hours: float) -> int:
     return minutes
 
 
+def _opt_int(raw) -> int | None:
+    """Parse an id chosen from an autocomplete (a string value) to int, or None
+    if blank/unparseable. Id-based options are string-typed so users can type a
+    name to filter (Discord only lets you type digits into an integer option)."""
+    if raw is None or raw == "":
+        return None
+    try:
+        return int(raw)
+    except (ValueError, TypeError):
+        return None
+
+
 class TimeTracking(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -400,7 +412,7 @@ class TimeTracking(commands.Cog):
         if self.db is not None:
             linked = {r["odooId"] for r in
                       await self.db.fetchall("SELECT odooId FROM employee WHERE odooId IS NOT NULL")}
-        term = ctx.value.lower()
+        term = str(ctx.value or "").lower()
         matches = [e for e in self._odoo_employees
                    if e["id"] not in linked and term in e["display_name"].lower()]
         return [discord.OptionChoice(name=e["display_name"], value=e["id"]) for e in matches[:25]]
@@ -413,7 +425,7 @@ class TimeTracking(commands.Cog):
         rows = await self.db.fetchall(
             "SELECT id, name, odooId FROM employee WHERE odooId IS NOT NULL ORDER BY name"
         )
-        term = ctx.value.lower()
+        term = str(ctx.value or "").lower()
         out = []
         for r in rows:
             if term in r["name"].lower() or term in str(r["odooId"]):
@@ -429,7 +441,7 @@ class TimeTracking(commands.Cog):
         rows = await self.db.fetchall(
             "SELECT id, name FROM employee WHERE odooId IS NULL ORDER BY name"
         )
-        term = ctx.value.lower()
+        term = str(ctx.value or "").lower()
         out = [discord.OptionChoice(name=r["name"][:100], value=f"<@{r['id']}>")
                for r in rows if term in r["name"].lower()]
         return out[:25]
@@ -442,7 +454,7 @@ class TimeTracking(commands.Cog):
             "SELECT id, name FROM customer WHERE odooId IS NULL "
             "AND (archived IS NULL OR archived = 0) ORDER BY name"
         )
-        term = ctx.value.lower()
+        term = str(ctx.value or "").lower()
         return [discord.OptionChoice(name=r["name"][:100], value=r["id"])
                 for r in rows if term in r["name"].lower()][:25]
 
@@ -453,7 +465,7 @@ class TimeTracking(commands.Cog):
         rows = await self.db.fetchall(
             "SELECT id, name, odooId FROM customer WHERE odooId IS NOT NULL ORDER BY name"
         )
-        term = ctx.value.lower()
+        term = str(ctx.value or "").lower()
         return [discord.OptionChoice(name=f"{r['name']} (Odoo #{r['odooId']})"[:100], value=r["id"])
                 for r in rows if term in r["name"].lower() or term in str(r["odooId"])][:25]
 
@@ -472,7 +484,7 @@ class TimeTracking(commands.Cog):
         if self.db is not None:
             linked = {r["odooId"] for r in
                       await self.db.fetchall("SELECT odooId FROM customer WHERE odooId IS NOT NULL")}
-        term = ctx.value.lower()
+        term = str(ctx.value or "").lower()
         matches = [c for c in self._odoo_customers
                    if c["id"] not in linked and term in c["display_name"].lower()]
         return [discord.OptionChoice(name=c["display_name"][:100], value=c["id"]) for c in matches[:25]]
@@ -484,26 +496,27 @@ class TimeTracking(commands.Cog):
         rows = await self.db.fetchall(
             "SELECT id, name FROM employee WHERE archived = 0 OR archived IS NULL ORDER BY name"
         )
-        term = ctx.value.lower()
+        term = str(ctx.value or "").lower()
         return [discord.OptionChoice(name=r["name"][:100], value=f"<@{r['id']}>")
                 for r in rows if term in r["name"].lower()][:25]
 
     async def punch_autocomplete(self, ctx: discord.AutocompleteContext):
-        """Recent punches, shown as 'Name · MM-DD HH:MM→out (#id)' (value = punch id)."""
+        """Recent punches, shown as 'Name · MM-DD HH:MM→out (#id)' (value = punch id
+        as a string, so the option is text-typed and filterable by employee name)."""
         if self.db is None:
             return []
         rows = await self.db.fetchall(
             "SELECT pc.id, e.name, pc.punchInTime, pc.punchOutTime FROM punch_clock pc "
             "JOIN employee e ON pc.employeeID = e.id ORDER BY pc.id DESC LIMIT 300"
         )
-        term = ctx.value.lower()
+        term = str(ctx.value or "").lower()
         out = []
         for r in rows:
             pin = (r["punchInTime"] or "")[5:16] or "?"
             pout = (r["punchOutTime"] or "")[5:16] or "open"
             label = f"{r['name']} · {pin}→{pout} (#{r['id']})"
             if term in label.lower():
-                out.append(discord.OptionChoice(name=label[:100], value=r["id"]))
+                out.append(discord.OptionChoice(name=label[:100], value=str(r["id"])))
             if len(out) >= 25:
                 break
         return out
@@ -515,8 +528,8 @@ class TimeTracking(commands.Cog):
         rows = await self.db.fetchall(
             "SELECT id, name FROM customer WHERE archived = 0 OR archived IS NULL ORDER BY name"
         )
-        term = ctx.value.lower()
-        return [discord.OptionChoice(name=r["name"][:100], value=r["id"])
+        term = str(ctx.value or "").lower()
+        return [discord.OptionChoice(name=r["name"][:100], value=str(r["id"]))
                 for r in rows if term in r["name"].lower()][:25]
 
     async def worktime_autocomplete(self, ctx: discord.AutocompleteContext):
@@ -529,13 +542,13 @@ class TimeTracking(commands.Cog):
             "JOIN employee e ON pc.employeeID = e.id LEFT JOIN customer c ON wt.customerID = c.id "
             "ORDER BY wt.id DESC LIMIT 300"
         )
-        term = ctx.value.lower()
+        term = str(ctx.value or "").lower()
         out = []
         for r in rows:
             label = f"{r['ename']} · {r['punchType']} {r['timeSpent'] / 60:g}h" \
                     f"{(' ' + r['cname']) if r['cname'] else ''} (#{r['id']})"
             if term in label.lower():
-                out.append(discord.OptionChoice(name=label[:100], value=r["id"]))
+                out.append(discord.OptionChoice(name=label[:100], value=str(r["id"])))
             if len(out) >= 25:
                 break
         return out
@@ -546,9 +559,9 @@ class TimeTracking(commands.Cog):
         if self.db is None or not self.client.loaded:
             return []
         opts = ctx.options or {}
-        customer_id = opts.get("customer")
+        customer_id = _opt_int(opts.get("customer"))
         punch_in = None
-        wt_id = opts.get("worktime")  # /editworktime: derive customer + punch from the entry
+        wt_id = _opt_int(opts.get("worktime"))  # /editworktime: derive customer + punch from the entry
         if wt_id:
             wt = await self.db.fetchone(
                 "SELECT wt.customerID, pc.punchInTime FROM work_time wt "
@@ -557,7 +570,7 @@ class TimeTracking(commands.Cog):
             if wt:
                 customer_id = customer_id or wt["customerID"]
                 punch_in = wt["punchInTime"]
-        punch_id = opts.get("punch")  # /addworktime
+        punch_id = _opt_int(opts.get("punch"))  # /addworktime
         if punch_id and punch_in is None:
             prow = await self.db.fetchone("SELECT punchInTime FROM punch_clock WHERE id = ?", (punch_id,))
             punch_in = prow["punchInTime"] if prow else None
@@ -567,7 +580,7 @@ class TimeTracking(commands.Cog):
         if not crow or not crow["odooId"]:
             return []  # customer isn't linked to Odoo -> no tasks to link
         try:
-            tasks = await self.client.search_tasks_for_partner(crow["odooId"], ctx.value)
+            tasks = await self.client.search_tasks_for_partner(crow["odooId"], str(ctx.value or ""))
         except Exception as e:  # noqa: BLE001
             log.warning(f"[Odoo] task autocomplete fetch failed: {e}")
             return []
@@ -593,7 +606,7 @@ class TimeTracking(commands.Cog):
         for t in tasks[:25]:
             pd = str(t.get("planned_date_begin") or "")[:10]
             label = f"{t['display_name']}{(' · ' + pd) if pd else ''}"
-            out.append(discord.OptionChoice(name=label[:100], value=t["id"]))
+            out.append(discord.OptionChoice(name=label[:100], value=str(t["id"])))
         return out
 
     @discord.slash_command(name="addemployee", description="Add a new Employee to the system.")
@@ -853,12 +866,16 @@ class TimeTracking(commands.Cog):
     @commands.has_permissions(administrator=True)
     async def editpunch(
         self, ctx: discord.ApplicationContext,
-        punch: discord.Option(int, description="The punch to edit", autocomplete=punch_autocomplete),  # type: ignore
+        punch: discord.Option(str, description="The punch to edit", autocomplete=punch_autocomplete),  # type: ignore
         clock_in: discord.Option(str, default=None, description="New clock-in time [YYYY-MM-DD HH:MM]"),  # type: ignore
         clock_out: discord.Option(str, default=None, description="New clock-out time [YYYY-MM-DD HH:MM]"),  # type: ignore
         approved: discord.Option(bool, default=None, description="Set approval (leave blank to keep as-is)"),  # type: ignore
     ):
         db = await self._ensure_db()
+        punch = _opt_int(punch)
+        if punch is None:
+            await ctx.respond("Pick a punch from the autocomplete list.", ephemeral=True)
+            return
         row = await db.fetchone(
             "SELECT employeeID, punchInTime, punchOutTime FROM punch_clock WHERE id = ?", (punch,)
         )
@@ -890,9 +907,13 @@ class TimeTracking(commands.Cog):
     @commands.has_permissions(administrator=True)
     async def deletepunch(
         self, ctx: discord.ApplicationContext,
-        punch: discord.Option(int, description="The punch to delete", autocomplete=punch_autocomplete),  # type: ignore
+        punch: discord.Option(str, description="The punch to delete", autocomplete=punch_autocomplete),  # type: ignore
     ):
         db = await self._ensure_db()
+        punch = _opt_int(punch)
+        if punch is None:
+            await ctx.respond("Pick a punch from the autocomplete list.", ephemeral=True)
+            return
         row = await db.fetchone(
             "SELECT pc.employeeID, e.name AS ename, pc.punchInTime, pc.punchOutTime FROM punch_clock pc "
             "JOIN employee e ON pc.employeeID = e.id WHERE pc.id = ?", (punch,)
@@ -963,10 +984,14 @@ class TimeTracking(commands.Cog):
     @commands.has_permissions(administrator=True)
     async def reassignworktime(
         self, ctx: discord.ApplicationContext,
-        worktime: discord.Option(int, description="The worktime to move", autocomplete=worktime_autocomplete),  # type: ignore
-        punch: discord.Option(int, description="The punch/shift to move it onto", autocomplete=punch_autocomplete),  # type: ignore
+        worktime: discord.Option(str, description="The worktime to move", autocomplete=worktime_autocomplete),  # type: ignore
+        punch: discord.Option(str, description="The punch/shift to move it onto", autocomplete=punch_autocomplete),  # type: ignore
     ):
         db = await self._ensure_db()
+        worktime, punch = _opt_int(worktime), _opt_int(punch)
+        if worktime is None or punch is None:
+            await ctx.respond("Pick both the worktime and the target punch from the autocomplete lists.", ephemeral=True)
+            return
         if await db.fetchone("SELECT 1 FROM work_time WHERE id = ?", (worktime,)) is None:
             await ctx.respond("That worktime doesn't exist.", ephemeral=True)
             return
@@ -989,13 +1014,17 @@ class TimeTracking(commands.Cog):
     @commands.has_permissions(administrator=True)
     async def addworktime(
         self, ctx: discord.ApplicationContext,
-        punch: discord.Option(int, description="The punch/shift", autocomplete=punch_autocomplete),  # type: ignore
+        punch: discord.Option(str, description="The punch/shift", autocomplete=punch_autocomplete),  # type: ignore
         worktype: discord.Option(str, description="Type of work", choices=WORKTYPES),  # type: ignore
         hours: discord.Option(float, description="Hours on the quarter hour (e.g. 1.5)"),  # type: ignore
-        customer: discord.Option(int, default=None, description="Customer (required for Construction/Service)", autocomplete=customer_autocomplete),  # type: ignore
-        task: discord.Option(int, default=None, description="Odoo task to link (customer tasks, nearest planned start first)", autocomplete=task_autocomplete),  # type: ignore
+        customer: discord.Option(str, default=None, description="Customer (required for Construction/Service)", autocomplete=customer_autocomplete),  # type: ignore
+        task: discord.Option(str, default=None, description="Odoo task to link (customer tasks, nearest planned start first)", autocomplete=task_autocomplete),  # type: ignore
     ):
         db = await self._ensure_db()
+        punch, customer, task = _opt_int(punch), _opt_int(customer), _opt_int(task)
+        if punch is None:
+            await ctx.respond("Pick a punch from the autocomplete list.", ephemeral=True)
+            return
         prow = await db.fetchone("SELECT employeeID, punchInTime FROM punch_clock WHERE id = ?", (punch,))
         if prow is None:
             await ctx.respond("That punch doesn't exist.", ephemeral=True)
@@ -1049,13 +1078,17 @@ class TimeTracking(commands.Cog):
     @commands.has_permissions(administrator=True)
     async def editworktime(
         self, ctx: discord.ApplicationContext,
-        worktime: discord.Option(int, description="The worktime to edit", autocomplete=worktime_autocomplete),  # type: ignore
+        worktime: discord.Option(str, description="The worktime to edit", autocomplete=worktime_autocomplete),  # type: ignore
         worktype: discord.Option(str, default=None, description="New type", choices=WORKTYPES),  # type: ignore
         hours: discord.Option(float, default=None, description="New hours (quarter-hour)"),  # type: ignore
-        customer: discord.Option(int, default=None, description="New customer", autocomplete=customer_autocomplete),  # type: ignore
-        task: discord.Option(int, default=None, description="Odoo task to (re)link", autocomplete=task_autocomplete),  # type: ignore
+        customer: discord.Option(str, default=None, description="New customer", autocomplete=customer_autocomplete),  # type: ignore
+        task: discord.Option(str, default=None, description="Odoo task to (re)link", autocomplete=task_autocomplete),  # type: ignore
     ):
         db = await self._ensure_db()
+        worktime, customer, task = _opt_int(worktime), _opt_int(customer), _opt_int(task)
+        if worktime is None:
+            await ctx.respond("Pick a worktime from the autocomplete list.", ephemeral=True)
+            return
         wt = await db.fetchone("SELECT punchID, odooId FROM work_time WHERE id = ?", (worktime,))
         if wt is None:
             await ctx.respond("That worktime doesn't exist.", ephemeral=True)
@@ -1103,9 +1136,13 @@ class TimeTracking(commands.Cog):
     @commands.has_permissions(administrator=True)
     async def deleteworktime(
         self, ctx: discord.ApplicationContext,
-        worktime: discord.Option(int, description="The worktime to delete", autocomplete=worktime_autocomplete),  # type: ignore
+        worktime: discord.Option(str, description="The worktime to delete", autocomplete=worktime_autocomplete),  # type: ignore
     ):
         db = await self._ensure_db()
+        worktime = _opt_int(worktime)
+        if worktime is None:
+            await ctx.respond("Pick a worktime from the autocomplete list.", ephemeral=True)
+            return
         if await db.fetchone("SELECT 1 FROM work_time WHERE id = ?", (worktime,)) is None:
             await ctx.respond("That worktime doesn't exist.", ephemeral=True)
             return
@@ -1235,18 +1272,18 @@ class TimeTracking(commands.Cog):
     # ---- reports -----------------------------------------------------------
 
     async def week_ending_autocomplete(self, ctx: discord.AutocompleteContext):
-        date_object = autofill_incomplete_date(ctx.value.lower())
+        date_object = autofill_incomplete_date(str(ctx.value or "").lower())
         if not date_object:
             return []
         saturdays = get_closest_saturdays(date_object)
-        filtered = [d for d in saturdays if ctx.value.lower() in d]
+        filtered = [d for d in saturdays if str(ctx.value or "").lower() in d]
         return [discord.OptionChoice(d, value=d) for d in filtered[:25]]
 
     async def employee_group_autocomplete(self, ctx: discord.AutocompleteContext):
         if self.db is None:
             return []
         rows = await self.db.fetchall("SELECT name FROM employee_group")
-        return [r["name"] for r in rows if ctx.value.lower() in r["name"].lower()]
+        return [r["name"] for r in rows if str(ctx.value or "").lower() in r["name"].lower()]
 
     async def _gather_timecard(self, db, employee_ids, start, end):
         """Build (employees, punch_data, employee_data) for the given employees whose
