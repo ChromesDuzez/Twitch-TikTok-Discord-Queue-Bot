@@ -1472,6 +1472,7 @@ class TimeTracking(commands.Cog):
             reports_channel = self.bot.get_channel(int(os.getenv("TIMECARD_REPORTS_CHANNEL_ID")))
             if reports_channel:
                 await reports_channel.send(file=discord.File(file_path))
+                timecard_log.info(f"[Report] {ctx.author} generated the weekly report for {week_end_date} ('{employee_group}') → reports channel.")
                 await ctx.respond(f"Weekly report for {week_end_date} sent to the reports channel.", ephemeral=True)
             else:
                 await ctx.respond("Report generated, but the reports channel was not found.", ephemeral=True)
@@ -1515,6 +1516,7 @@ class TimeTracking(commands.Cog):
         try:
             await ctx.author.send(content=f"Here's your timecard for the week ending {week_end_date}.",
                                   file=discord.File(file_path))
+            timecard_log.info(f"[Report] {ctx.author} requested their own timecard for the week ending {week_end_date} (DM'd).")
             await ctx.followup.send("I've DM'd you your timecard. \U0001f4ec", ephemeral=True)
         except discord.Forbidden:  # DMs closed -> deliver ephemerally instead
             await ctx.followup.send(content="Your DMs are closed, so here it is (only you can see this):",
@@ -1574,6 +1576,7 @@ class TimeTracking(commands.Cog):
         if reports_channel:
             await reports_channel.send(content=f"Timecard report: **{label_group}**, {period_label}.",
                                        file=discord.File(file_path))
+            timecard_log.info(f"[Report] {ctx.author} generated a range report for {period_label} ('{label_group}') → reports channel.")
             await ctx.followup.send(f"Report for {period_label} sent to the reports channel.", ephemeral=True)
         else:
             await ctx.followup.send(content=f"Report for {period_label} (reports channel not set):",
@@ -1585,6 +1588,7 @@ class TimeTracking(commands.Cog):
         if not has_perms(ctx.author, accepted_roles=("TIMECARD_ADMIN_ROLE",)):
             await ctx.respond("You do not have permission to run this command.", ephemeral=True)
             return
+        timecard_log.info(f"[Report] {ctx.author} exported the timecard database file.")
         await ctx.respond("Here you go!", file=discord.File(self.db_path), ephemeral=True)
 
     # Inbound Odoo changes are handled by the pull-based inbox worker
