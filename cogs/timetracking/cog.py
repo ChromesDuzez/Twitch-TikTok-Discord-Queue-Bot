@@ -718,11 +718,6 @@ class TimeTracking(commands.Cog):
         except Exception as e:  # noqa: BLE001
             await ctx.respond(f"Error adding employee {name}: {e}", ephemeral=self._eph(ctx))
 
-    @addemployee.error
-    async def addemployee_error(self, ctx, error):
-        if isinstance(error, commands.MissingPermissions):
-            await ctx.respond("You do not have permission to use this command.", ephemeral=True)
-
     @discord.slash_command(name="linkemployee", description="Link an existing employee to their Odoo hr.employee record.")
     @commands.has_permissions(administrator=True)
     async def linkemployee(

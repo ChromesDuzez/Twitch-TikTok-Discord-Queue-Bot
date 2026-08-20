@@ -139,15 +139,28 @@ async def setup_bot():
 
 
 async def on_application_command_error(ctx, error):
-    """Log any slash-command exception through our logger (so it lands in the log
-    file) and let the user know, instead of py-cord dumping it to stderr only."""
+    """Central handler for slash-command errors: log through our logger (so it
+    lands in the log file) and tell the user, instead of py-cord dumping it to
+    stderr only."""
     cmd = ctx.command.qualified_name if getattr(ctx, "command", None) else "unknown"
+    # Permission / check failures are expected, not crashes: a plain notice and a
+    # single info line (no traceback), rather than the generic "something broke".
+    if isinstance(error, commands.CheckFailure):
+        who = getattr(ctx, "author", None) or getattr(ctx, "user", None)
+        log.info("[Bot] %s was denied /%s (%s).", who, cmd, type(error).__name__)
+        await _notify_command_error(ctx, "You don't have permission to use this command.")
+        return
     log.error("[Bot] Error in command '/%s'", cmd, exc_info=error)
+    await _notify_command_error(ctx, "Something went wrong running that command — it's been logged.")
+
+
+async def _notify_command_error(ctx, message):
+    """Best-effort ephemeral notice, whether or not the interaction was deferred."""
     try:
-        await ctx.respond("Something went wrong running that command — it's been logged.", ephemeral=True)
+        await ctx.respond(message, ephemeral=True)
     except Exception:
         try:
-            await ctx.followup.send("Something went wrong running that command — it's been logged.", ephemeral=True)
+            await ctx.followup.send(message, ephemeral=True)
         except Exception:
             pass
 

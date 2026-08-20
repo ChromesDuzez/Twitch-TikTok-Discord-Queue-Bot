@@ -31,11 +31,6 @@ class WebhookAdmin(commands.Cog):
             ephemeral=True,
         )
 
-    @regenwebhooktoken.error
-    async def regen_error(self, ctx, error):
-        if isinstance(error, commands.MissingPermissions):
-            await ctx.respond("You do not have permission to use this command.", ephemeral=True)
-
     @discord.slash_command(
         name="webhookallowlist",
         description="Enable/disable or inspect the webhook IP allowlist.",
@@ -63,11 +58,6 @@ class WebhookAdmin(commands.Cog):
                 f"Webhook IP allowlist is **{'enabled' if enabled else 'disabled'}**.\nKnown IPs: {body}",
                 ephemeral=True,
             )
-
-    @webhookallowlist.error
-    async def allowlist_error(self, ctx, error):
-        if isinstance(error, commands.MissingPermissions):
-            await ctx.respond("You do not have permission to use this command.", ephemeral=True)
 
 
 def setup(bot):
