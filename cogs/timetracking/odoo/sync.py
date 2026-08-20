@@ -131,6 +131,8 @@ class SyncWorker:
             return await self._sync_punch_edit(entity_id)
         if entity_type == "worktime" and op == "create":
             return await self._sync_worktime(entity_id)
+        if entity_type == "worktime" and op == "edit":
+            return await self._sync_worktime_edit(entity_id)
         # deletions (Discord -> Odoo): odoo id is carried in the payload because
         # the local row is already gone by the time this drains.
         if entity_type in ("punch", "worktime") and op == "delete":
@@ -259,6 +261,30 @@ class SyncWorker:
             await self.client.attendance_write(
                 punch["odooId"], check_out_utc=check_out, check_in_utc=check_in
             )
+        return True
+
+    async def _sync_worktime_edit(self, worktime_id: int):
+        """Push an admin edit of a worktime to its Odoo timesheet line. If the
+        line isn't in Odoo yet but now has a work item + hours, create it."""
+        wt = await self.db.fetchone(
+            "SELECT punchType, timeSpent, odooId, odooProjectId, odooTaskId FROM work_time WHERE id = ?",
+            (worktime_id,),
+        )
+        if wt is None:
+            return True
+        if wt["odooId"] is None:
+            # Not synced yet -- create it if it now has a work item and hours.
+            if wt["odooProjectId"] and wt["timeSpent"]:
+                return await self._sync_worktime(worktime_id)
+            return True  # local-only worktime; nothing in Odoo to edit
+        await self.client.update_timesheet(
+            wt["odooId"],
+            hours=(wt["timeSpent"] or 0) / 60,
+            project_id=wt["odooProjectId"] or None,
+            task_id=wt["odooTaskId"],
+            description=f"{wt['punchType']} work (Discord timecard)",
+        )
+        log.info(f"[Sync] Updated timesheet {wt['odooId']} (worktime {worktime_id}) in Odoo.")
         return True
 
     async def _sync_worktime(self, worktime_id: int):

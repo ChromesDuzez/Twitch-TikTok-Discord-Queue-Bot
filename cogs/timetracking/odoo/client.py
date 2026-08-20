@@ -210,6 +210,34 @@ class OdooClient:
 
     # ---- work-item search (task / project) --------------------------------
 
+    async def search_tasks_for_partner(self, partner_id: int, name: str = "", limit: int = 40):
+        """Open project tasks belonging to a customer (res.partner), for linking
+        a manually-added worktime to Odoo.
+
+        Returns rows with id, display_name, project_id, planned_date_begin. The
+        caller ranks them by planned-start proximity to the punch time.
+        """
+        domain = [["partner_id", "=", partner_id], ["is_closed", "=", False]]
+        if name:
+            domain.append(["display_name", "ilike", name])
+        return await self.call(
+            "/project.task/search_read",
+            {
+                "domain": domain,
+                "fields": ["id", "display_name", "project_id", "planned_date_begin"],
+                "order": "planned_date_begin asc",
+                "limit": limit,
+            },
+        )
+
+    async def get_task_project(self, task_id: int):
+        """The project_id (int) a task belongs to, or None."""
+        rec = await self.read_record("project.task", task_id, ["project_id"])
+        if rec and rec.get("project_id"):
+            pid = rec["project_id"]
+            return pid[0] if isinstance(pid, (list, tuple)) else pid
+        return None
+
     async def search_service_tasks(self, name: str, project_id: int, months: int = 6, limit: int = 15):
         """Open Field Service tasks for a customer whose deadline is within
         ``months`` months (past or future) of today.
@@ -313,3 +341,23 @@ class OdooClient:
         if isinstance(result, list) and result:
             return result[0]
         return result
+
+    async def update_timesheet(self, line_id: int, hours=None, project_id=None,
+                               task_id=None, description=None):
+        """Update an existing account.analytic.line (timesheet). Only the passed
+        fields are written; ``task_id=None`` leaves the task untouched. Returns
+        the line id."""
+        vals = {}
+        if hours is not None:
+            vals["unit_amount"] = hours
+            vals["product_uom_id"] = 4  # Hours
+        if project_id:
+            vals["project_id"] = project_id
+        if task_id is not None:
+            vals["task_id"] = task_id or False
+        if description is not None:
+            vals["name"] = description
+        if not vals:
+            return line_id
+        await self.call("/account.analytic.line/write", {"ids": [line_id], "vals": vals})
+        return line_id

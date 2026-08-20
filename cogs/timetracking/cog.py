@@ -7,6 +7,7 @@ sync jobs after local commits.
 
 import asyncio
 import os
+from datetime import datetime
 
 import discord
 from discord.ext import commands
@@ -537,6 +538,62 @@ class TimeTracking(commands.Cog):
                 break
         return out
 
+    async def task_autocomplete(self, ctx: discord.AutocompleteContext):
+        """Odoo tasks for the chosen customer, ranked by planned-start proximity
+        to the punch time (used to link a manually-added worktime to Odoo)."""
+        if self.db is None or not self.client.loaded:
+            return []
+        opts = ctx.options or {}
+        customer_id = opts.get("customer")
+        punch_in = None
+        wt_id = opts.get("worktime")  # /editworktime: derive customer + punch from the entry
+        if wt_id:
+            wt = await self.db.fetchone(
+                "SELECT wt.customerID, pc.punchInTime FROM work_time wt "
+                "JOIN punch_clock pc ON wt.punchID = pc.id WHERE wt.id = ?", (wt_id,)
+            )
+            if wt:
+                customer_id = customer_id or wt["customerID"]
+                punch_in = wt["punchInTime"]
+        punch_id = opts.get("punch")  # /addworktime
+        if punch_id and punch_in is None:
+            prow = await self.db.fetchone("SELECT punchInTime FROM punch_clock WHERE id = ?", (punch_id,))
+            punch_in = prow["punchInTime"] if prow else None
+        if not customer_id:
+            return []
+        crow = await self.db.fetchone("SELECT odooId FROM customer WHERE id = ?", (customer_id,))
+        if not crow or not crow["odooId"]:
+            return []  # customer isn't linked to Odoo -> no tasks to link
+        try:
+            tasks = await self.client.search_tasks_for_partner(crow["odooId"], ctx.value)
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"[Odoo] task autocomplete fetch failed: {e}")
+            return []
+        ref = None
+        if punch_in:
+            try:
+                ref = datetime.strptime(sync.local_str_to_utc_str(punch_in), "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                ref = None
+
+        def proximity(t):
+            pd = t.get("planned_date_begin")
+            if not pd or ref is None:
+                return (1, 0.0)  # undated / no reference -> rank after the dated ones
+            try:
+                dt = datetime.strptime(str(pd)[:19], "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                return (1, 0.0)
+            return (0, abs((dt - ref).total_seconds()))
+
+        tasks.sort(key=proximity)
+        out = []
+        for t in tasks[:25]:
+            pd = str(t.get("planned_date_begin") or "")[:10]
+            label = f"{t['display_name']}{(' · ' + pd) if pd else ''}"
+            out.append(discord.OptionChoice(name=label[:100], value=t["id"]))
+        return out
+
     @discord.slash_command(name="addemployee", description="Add a new Employee to the system.")
     @commands.has_permissions(administrator=True)
     async def addemployee(
@@ -869,6 +926,7 @@ class TimeTracking(commands.Cog):
         worktype: discord.Option(str, description="Type of work", choices=WORKTYPES),  # type: ignore
         hours: discord.Option(float, description="Hours on the quarter hour (e.g. 1.5)"),  # type: ignore
         customer: discord.Option(int, default=None, description="Customer (required for Construction/Service)", autocomplete=customer_autocomplete),  # type: ignore
+        task: discord.Option(int, default=None, description="Odoo task to link (customer tasks, nearest planned start first)", autocomplete=task_autocomplete),  # type: ignore
     ):
         db = await self._ensure_db()
         prow = await db.fetchone("SELECT employeeID, punchInTime FROM punch_clock WHERE id = ?", (punch,))
@@ -889,14 +947,35 @@ class TimeTracking(commands.Cog):
                 await ctx.respond("That customer doesn't exist.", ephemeral=True)
                 return
             cust_id = customer
+        # An Odoo task makes the entry syncable: resolve its project so the
+        # background worker can post the timesheet (with the shift link).
+        odoo_task_id = odoo_project_id = None
+        warn = ""
+        if task and self.client.loaded:
+            try:
+                odoo_project_id = await self.client.get_task_project(task)
+            except Exception as e:  # noqa: BLE001
+                log.warning(f"[Odoo] task project lookup failed: {e}")
+            if odoo_project_id:
+                odoo_task_id = task
+            else:
+                warn = " (couldn't resolve the Odoo task — saved locally only)"
         started = prow["punchInTime"] or sync.now_local_str()
         wt_id = await db.execute(
-            "INSERT INTO work_time (punchID, customerID, punchType, timeSpent, timeStarted) VALUES (?, ?, ?, ?, ?)",
-            (punch, cust_id, worktype, minutes, started),
+            "INSERT INTO work_time (punchID, customerID, punchType, timeSpent, timeStarted, odooTaskId, odooProjectId) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (punch, cust_id, worktype, minutes, started, odoo_task_id, odoo_project_id),
         )
+        if odoo_project_id:
+            await sync.enqueue(db, "worktime", wt_id, "create")
         await self._refresh_clock(prow["employeeID"])
         timecard_log.info(f"[Work] {ctx.author} added worktime {wt_id} to punch {punch} ({worktype}, {minutes}min).")
-        note = " (local only — it isn't pushed to Odoo; add it in Odoo directly if you need it there)" if self.client.loaded else ""
+        if odoo_project_id:
+            note = " — queued to Odoo."
+        elif self.client.loaded:
+            note = warn or " (local only — link an Odoo task to push it, or add it in Odoo directly)"
+        else:
+            note = ""
         await ctx.respond(f"Added {worktype} worktime #{wt_id} ({hours:g}h) to punch #{punch}.{note}", ephemeral=True)
 
     @discord.slash_command(name="editworktime", description="Edit a worktime entry's type, hours, or customer.")
@@ -907,6 +986,7 @@ class TimeTracking(commands.Cog):
         worktype: discord.Option(str, default=None, description="New type", choices=WORKTYPES),  # type: ignore
         hours: discord.Option(float, default=None, description="New hours (quarter-hour)"),  # type: ignore
         customer: discord.Option(int, default=None, description="New customer", autocomplete=customer_autocomplete),  # type: ignore
+        task: discord.Option(int, default=None, description="Odoo task to (re)link", autocomplete=task_autocomplete),  # type: ignore
     ):
         db = await self._ensure_db()
         wt = await db.fetchone("SELECT punchID, odooId FROM work_time WHERE id = ?", (worktime,))
@@ -927,15 +1007,29 @@ class TimeTracking(commands.Cog):
                 await ctx.respond("That customer doesn't exist.", ephemeral=True)
                 return
             sets.append("customerID = ?"); params.append(customer)
+        if task is not None and self.client.loaded:
+            try:
+                pid = await self.client.get_task_project(task)
+            except Exception as e:  # noqa: BLE001
+                log.warning(f"[Odoo] task project lookup failed: {e}")
+                pid = None
+            if not pid:
+                await ctx.respond("Couldn't resolve that Odoo task's project.", ephemeral=True)
+                return
+            sets.append("odooTaskId = ?"); params.append(task)
+            sets.append("odooProjectId = ?"); params.append(pid)
         if not sets:
-            await ctx.respond("Nothing to change — provide a new type, hours, or customer.", ephemeral=True)
+            await ctx.respond("Nothing to change — provide a new type, hours, customer, or task.", ephemeral=True)
             return
         await db.execute(f"UPDATE work_time SET {', '.join(sets)} WHERE id = ?", (*params, worktime))
+        push = self.client.loaded and (wt["odooId"] or task is not None)
+        if push:
+            await sync.enqueue(db, "worktime", worktime, "edit")
         prow = await db.fetchone("SELECT employeeID FROM punch_clock WHERE id = ?", (wt["punchID"],))
         if prow:
             await self._refresh_clock(prow["employeeID"])
         timecard_log.info(f"[Work] {ctx.author} edited worktime {worktime} ({', '.join(sets)}).")
-        note = " (Odoo copy not changed — edit it in Odoo if it needs to match)" if wt["odooId"] else ""
+        note = " — change queued to Odoo." if push else ""
         await ctx.respond(f"Updated worktime #{worktime}.{note}", ephemeral=True)
 
     @discord.slash_command(name="deleteworktime", description="Delete a single worktime entry.")
