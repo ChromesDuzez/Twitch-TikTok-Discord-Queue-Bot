@@ -718,6 +718,135 @@ async def delete_worktime_local(cog, worktime_id: int, to_odoo: bool = True) -> 
     return punch["employeeID"] if punch else None
 
 
+async def reassign_worktime(cog, worktime_id: int, new_punch_id: int, to_odoo: bool = True):
+    """Move a worktime to a different punch/shift, keeping Odoo's shift link
+    correct. A synced line has its ``x_studio_shift`` repointed at the new
+    attendance; an unsynced one is (re)posted so its create links to the new
+    attendance. Returns (old_employee_id, new_employee_id) for clock refreshes."""
+    db = cog.db
+    wt = await db.fetchone("SELECT punchID, odooId FROM work_time WHERE id = ?", (worktime_id,))
+    if wt is None:
+        return (None, None)
+    old = await db.fetchone("SELECT employeeID FROM punch_clock WHERE id = ?", (wt["punchID"],))
+    new = await db.fetchone("SELECT employeeID FROM punch_clock WHERE id = ?", (new_punch_id,))
+    old_emp = old["employeeID"] if old else None
+    if new is None or new_punch_id == wt["punchID"]:
+        return (old_emp, None)  # no-op / bad target
+    # Re-attach it (clears any soft-detach) onto the new punch.
+    await db.execute(
+        "UPDATE work_time SET punchID = ?, detached = 0 WHERE id = ?", (new_punch_id, worktime_id)
+    )
+    if to_odoo:
+        if wt["odooId"]:
+            await sync.enqueue(db, "worktime", worktime_id, "reassign")
+        else:
+            # Never synced: cancel any stale pending push, then let create link
+            # it to the new attendance (its punchID now points there).
+            await db.execute(
+                "UPDATE odoo_outbox SET status = 'skipped' WHERE status = 'pending' "
+                "AND op != 'delete' AND entity_type = 'worktime' AND entity_id = ?", (worktime_id,))
+            await sync.enqueue(db, "worktime", worktime_id, "create")
+    return (old_emp, new["employeeID"])
+
+
+def _punch_label(row) -> str:
+    """'MM-DD HH:MM->out (#id)' for a punch row (id/punchInTime/punchOutTime)."""
+    pin = (row["punchInTime"] or "")[5:16] or "?"
+    pout = (row["punchOutTime"] or "")[5:16] or "open"
+    return f"{pin}→{pout} (#{row['id']})"
+
+
+class _WorktimeDecisionSelect(discord.ui.Select):
+    """Per-worktime dropdown: delete it with the punch, or reassign to another."""
+
+    def __init__(self, flow, wt, candidates):
+        self.flow = flow
+        self.wt_id = wt["id"]
+        hrs = (wt["timeSpent"] or 0) / 60
+        cust = f" {wt['cname']}" if wt["cname"] else ""
+        options = [discord.SelectOption(
+            label="Delete with punch", value="delete", default=True,
+            description=f"{wt['punchType']} {hrs:g}h{cust}"[:100], emoji="\U0001f5d1️")]
+        for c in candidates[:24]:
+            options.append(discord.SelectOption(
+                label=f"Reassign to #{c['id']}"[:100], value=f"punch:{c['id']}",
+                description=_punch_label(c)[:100], emoji="➡️"))
+        super().__init__(
+            placeholder=f"#{wt['id']}: {wt['punchType']} {hrs:g}h{cust} — delete or reassign"[:150],
+            min_values=1, max_values=1, options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        self.flow.decisions[self.wt_id] = self.values[0]
+        for o in self.options:
+            o.default = (o.value == self.values[0])
+        await interaction.response.edit_message(view=self.flow)
+
+
+class _ConfirmDeleteFlowButton(discord.ui.Button):
+    def __init__(self, flow):
+        super().__init__(label="Confirm", style=discord.ButtonStyle.danger, row=4)
+        self.flow = flow
+
+    async def callback(self, interaction: discord.Interaction):
+        flow = self.flow
+        await interaction.response.defer()
+        emps, reassigned = set(), 0
+        for wt_id, decision in flow.decisions.items():
+            if isinstance(decision, str) and decision.startswith("punch:"):
+                old_e, new_e = await reassign_worktime(flow.cog, wt_id, int(decision.split(":")[1]))
+                emps.update(e for e in (old_e, new_e) if e)
+                reassigned += 1
+        # Whatever is still marked "delete" remains on the punch and is removed
+        # by the cascade; reassigned rows now hang off their new punch instead.
+        emp = await delete_punch_cascade(flow.cog, flow.punch_id, to_odoo=True)
+        if emp:
+            emps.add(emp)
+        for e in emps:
+            await _refresh_clock_for_employee(flow.cog, e)
+        flow.disable_all_items()
+        msg = f"Deleted punch #{flow.punch_id}."
+        if reassigned:
+            msg += (f" Reassigned {reassigned} worktime "
+                    f"entr{'y' if reassigned == 1 else 'ies'} to another shift "
+                    f"(Odoo shift links updated).")
+        await interaction.edit_original_response(content=msg, view=flow)
+        flow.stop()
+
+
+class _CancelDeleteFlowButton(discord.ui.Button):
+    def __init__(self, flow):
+        super().__init__(label="Cancel", style=discord.ButtonStyle.secondary, row=4)
+        self.flow = flow
+
+    async def callback(self, interaction: discord.Interaction):
+        self.flow.disable_all_items()
+        await interaction.response.edit_message(content="Cancelled — nothing was deleted.", view=self.flow)
+        self.flow.stop()
+
+
+class DeletePunchFlow(discord.ui.View):
+    """Interactive /deletepunch review: decide each linked worktime's fate
+    (delete with the punch or reassign to another shift) before deleting."""
+
+    def __init__(self, cog, punch_id, worktimes, candidates, author_id):
+        super().__init__(timeout=180)
+        self.cog = cog
+        self.punch_id = punch_id
+        self.author_id = author_id
+        self.decisions = {wt["id"]: "delete" for wt in worktimes}
+        for wt in worktimes:  # up to 4 (Discord row limit; the 5th row is the buttons)
+            self.add_item(_WorktimeDecisionSelect(self, wt, candidates))
+        self.add_item(_ConfirmDeleteFlowButton(self))
+        self.add_item(_CancelDeleteFlowButton(self))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("This isn't your prompt.", ephemeral=True)
+            return False
+        return True
+
+
 class DeleteShiftButton(discord.ui.Button):
     """Admin-only: delete an accidental shift from the approval message."""
 

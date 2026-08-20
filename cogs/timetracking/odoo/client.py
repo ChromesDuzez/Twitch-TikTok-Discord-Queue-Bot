@@ -361,3 +361,15 @@ class OdooClient:
             return line_id
         await self.call("/account.analytic.line/write", {"ids": [line_id], "vals": vals})
         return line_id
+
+    async def set_timesheet_shift(self, line_id: int, attendance_id: int):
+        """Point a timesheet line's Studio shift field at a different attendance
+        (used when a worktime is reassigned to another punch). No-op when the
+        shift field isn't available in this Odoo."""
+        if not self.shift_field_available:
+            return line_id
+        await self.call(
+            "/account.analytic.line/write",
+            {"ids": [line_id], "vals": {shift_field(): attendance_id}},
+        )
+        return line_id

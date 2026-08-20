@@ -30,7 +30,8 @@ from .reports import (
     is_saturday,
 )
 from .views import (
-    ApprovePunch, DeleteApproval, delete_punch_cascade, delete_worktime_local, render_clock,
+    ApprovePunch, DeleteApproval, DeletePunchFlow, delete_punch_cascade,
+    delete_worktime_local, reassign_worktime, render_clock,
 )
 
 WORKTYPES = ["Construction", "Service", "Office"]
@@ -884,7 +885,7 @@ class TimeTracking(commands.Cog):
         timecard_log.info(f"[Punch] {ctx.author} edited punch {punch} ({', '.join(sets)}).")
         await ctx.respond(f"Updated punch #{punch}.", ephemeral=True)
 
-    @discord.slash_command(name="deletepunch", description="Delete a punch and its worktime (FK-safe).")
+    @discord.slash_command(name="deletepunch", description="Delete a punch — review each linked worktime first.")
     @commands.has_permissions(administrator=True)
     async def deletepunch(
         self, ctx: discord.ApplicationContext,
@@ -892,29 +893,94 @@ class TimeTracking(commands.Cog):
     ):
         db = await self._ensure_db()
         row = await db.fetchone(
-            "SELECT e.name AS ename, pc.punchInTime, pc.punchOutTime FROM punch_clock pc "
+            "SELECT pc.employeeID, e.name AS ename, pc.punchInTime, pc.punchOutTime FROM punch_clock pc "
             "JOIN employee e ON pc.employeeID = e.id WHERE pc.id = ?", (punch,)
         )
         if row is None:
             await ctx.respond("That punch doesn't exist.", ephemeral=True)
             return
-        n = (await db.fetchone("SELECT count(*) c FROM work_time WHERE punchID = ?", (punch,)))["c"]
-        extra = f" and its **{n}** worktime entr{'y' if n == 1 else 'ies'}" if n else ""
-        confirm = Confirm(user=ctx.user, timeout=60)
-        await ctx.respond(
-            f"Delete punch #{punch} for **{row['ename']}** "
-            f"(`{row['punchInTime']}` → `{row['punchOutTime'] or 'open'}`){extra}?",
-            view=confirm, ephemeral=True,
+        header = (f"Delete punch #{punch} for **{row['ename']}** "
+                  f"(`{row['punchInTime']}` → `{row['punchOutTime'] or 'open'}`)")
+        worktimes = await db.fetchall(
+            "SELECT wt.id, wt.punchType, wt.timeSpent, c.name AS cname FROM work_time wt "
+            "LEFT JOIN customer c ON wt.customerID = c.id WHERE wt.punchID = ? ORDER BY wt.id", (punch,)
         )
-        await confirm.wait()
-        if not confirm.value:
-            await ctx.followup.send("Cancelled.", ephemeral=True)
+
+        # No worktime: a plain confirm is enough.
+        if not worktimes:
+            confirm = Confirm(user=ctx.user, timeout=60)
+            await ctx.respond(f"{header}?", view=confirm, ephemeral=True)
+            await confirm.wait()
+            if not confirm.value:
+                await ctx.followup.send("Cancelled.", ephemeral=True)
+                return
+            emp = await delete_punch_cascade(self, punch, to_odoo=True)
+            timecard_log.info(f"[Punch] {ctx.author} deleted punch {punch} via /deletepunch.")
+            if emp:
+                await self._refresh_clock(emp)
+            await ctx.followup.send(f"Deleted punch #{punch}.", ephemeral=True)
             return
-        emp = await delete_punch_cascade(self, punch, to_odoo=True)
-        timecard_log.info(f"[Punch] {ctx.author} deleted punch {punch} via /deletepunch.")
-        if emp:
-            await self._refresh_clock(emp)
-        await ctx.followup.send(f"Deleted punch #{punch}.", ephemeral=True)
+
+        # Candidate shifts to reassign onto: the same employee's other punches.
+        candidates = await db.fetchall(
+            "SELECT id, punchInTime, punchOutTime FROM punch_clock WHERE employeeID = ? "
+            "AND id != ? ORDER BY id DESC LIMIT 24", (row["employeeID"], punch)
+        )
+
+        # Discord shows at most 4 per-worktime dropdowns (row 5 is the buttons).
+        # For a punch with more, keep it to a delete-all / cancel confirm and
+        # point the admin at /reassignworktime for any they want to keep.
+        if len(worktimes) > 4:
+            confirm = Confirm(user=ctx.user, timeout=60)
+            await ctx.respond(
+                f"{header} and its **{len(worktimes)}** worktime entries? "
+                f"(To keep any, cancel and move them first with `/reassignworktime`.)",
+                view=confirm, ephemeral=True,
+            )
+            await confirm.wait()
+            if not confirm.value:
+                await ctx.followup.send("Cancelled.", ephemeral=True)
+                return
+            emp = await delete_punch_cascade(self, punch, to_odoo=True)
+            timecard_log.info(f"[Punch] {ctx.author} deleted punch {punch} (+{len(worktimes)} worktime) via /deletepunch.")
+            if emp:
+                await self._refresh_clock(emp)
+            await ctx.followup.send(f"Deleted punch #{punch}.", ephemeral=True)
+            return
+
+        flow = DeletePunchFlow(self, punch, worktimes, candidates, ctx.user.id)
+        note = "" if candidates else "\n(No other shifts for this employee, so reassignment isn't available.)"
+        await ctx.respond(
+            f"{header} has **{len(worktimes)}** worktime "
+            f"entr{'y' if len(worktimes) == 1 else 'ies'}. For each, choose **delete with "
+            f"the punch** or **reassign to another shift**, then Confirm.{note}",
+            view=flow, ephemeral=True,
+        )
+        timecard_log.info(f"[Punch] {ctx.author} opened delete review for punch {punch} ({len(worktimes)} worktime).")
+
+    @discord.slash_command(name="reassignworktime", description="Move a worktime to a different punch/shift (keeps Odoo's shift link correct).")
+    @commands.has_permissions(administrator=True)
+    async def reassignworktime(
+        self, ctx: discord.ApplicationContext,
+        worktime: discord.Option(int, description="The worktime to move", autocomplete=worktime_autocomplete),  # type: ignore
+        punch: discord.Option(int, description="The punch/shift to move it onto", autocomplete=punch_autocomplete),  # type: ignore
+    ):
+        db = await self._ensure_db()
+        if await db.fetchone("SELECT 1 FROM work_time WHERE id = ?", (worktime,)) is None:
+            await ctx.respond("That worktime doesn't exist.", ephemeral=True)
+            return
+        if await db.fetchone("SELECT 1 FROM punch_clock WHERE id = ?", (punch,)) is None:
+            await ctx.respond("That target punch doesn't exist.", ephemeral=True)
+            return
+        old_emp, new_emp = await reassign_worktime(self, worktime, punch, to_odoo=True)
+        if new_emp is None:
+            await ctx.respond("Couldn't reassign — it's already on that punch.", ephemeral=True)
+            return
+        for e in {old_emp, new_emp} - {None}:
+            await self._refresh_clock(e)
+        timecard_log.info(f"[Work] {ctx.author} reassigned worktime {worktime} to punch {punch}.")
+        note = " (Odoo shift link updated)" if self.client.loaded else ""
+        await ctx.respond(f"Moved worktime #{worktime} onto punch #{punch}.{note}", ephemeral=True)
 
     # ---- worktime management -----------------------------------------------
 

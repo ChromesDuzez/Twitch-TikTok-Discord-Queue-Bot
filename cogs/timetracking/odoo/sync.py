@@ -133,6 +133,8 @@ class SyncWorker:
             return await self._sync_worktime(entity_id)
         if entity_type == "worktime" and op == "edit":
             return await self._sync_worktime_edit(entity_id)
+        if entity_type == "worktime" and op == "reassign":
+            return await self._reassign_worktime(entity_id)
         # deletions (Discord -> Odoo): odoo id is carried in the payload because
         # the local row is already gone by the time this drains.
         if entity_type in ("punch", "worktime") and op == "delete":
@@ -261,6 +263,27 @@ class SyncWorker:
             await self.client.attendance_write(
                 punch["odooId"], check_out_utc=check_out, check_in_utc=check_in
             )
+        return True
+
+    async def _reassign_worktime(self, worktime_id: int):
+        """A worktime moved to a different punch: repoint its Odoo timesheet
+        line's shift link at the new punch's attendance. (An unsynced worktime
+        needs no action here -- the create path links it to the new attendance
+        via its updated punchID.)"""
+        wt = await self.db.fetchone(
+            "SELECT punchID, odooId FROM work_time WHERE id = ?", (worktime_id,)
+        )
+        if wt is None or wt["odooId"] is None:
+            return True
+        punch = await self.db.fetchone(
+            "SELECT odooId, legacy FROM punch_clock WHERE id = ?", (wt["punchID"],)
+        )
+        if punch is None or punch["legacy"]:
+            return True
+        if punch["odooId"] is None:
+            return "retry"  # new attendance not synced yet -- link once it is
+        await self.client.set_timesheet_shift(wt["odooId"], punch["odooId"])
+        log.info(f"[Sync] Repointed timesheet {wt['odooId']} shift link to attendance {punch['odooId']}.")
         return True
 
     async def _sync_worktime_edit(self, worktime_id: int):
