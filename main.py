@@ -145,7 +145,11 @@ async def on_application_command_error(ctx, error):
     cmd = ctx.command.qualified_name if getattr(ctx, "command", None) else "unknown"
     # Permission / check failures are expected, not crashes: a plain notice and a
     # single info line (no traceback), rather than the generic "something broke".
-    if isinstance(error, commands.CheckFailure):
+    # NOTE: py-cord raises discord.errors.CheckFailure when an application-command
+    # check predicate returns False (e.g. our is_timecard_admin), which is a
+    # DIFFERENT class from discord.ext.commands.CheckFailure (raised by
+    # has_permissions et al.) — catch both.
+    if isinstance(error, (commands.CheckFailure, discord.CheckFailure)):
         who = getattr(ctx, "author", None) or getattr(ctx, "user", None)
         log.info("[Bot] %s was denied /%s (%s).", who, cmd, type(error).__name__)
         await _notify_command_error(ctx, "You don't have permission to use this command.")
