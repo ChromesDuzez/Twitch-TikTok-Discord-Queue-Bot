@@ -129,6 +129,10 @@ class ClockView(discord.ui.View):
     # shared guard
     async def _guard(self, interaction: discord.Interaction) -> bool:
         if not _can_operate(interaction.user, self.employee_id):
+            timecard_log.info(
+                f"[Clock] {interaction.user} pressed a button on employee "
+                f"{self.employee_id}'s clock — denied (not theirs)."
+            )
             await interaction.response.send_message("This is not for you!", ephemeral=True)
             return False
         return True
@@ -147,6 +151,7 @@ class RefreshButton(discord.ui.Button):
             return
         await interaction.response.defer()
         await render_clock(view.cog, view.message, view.employee_id)
+        timecard_log.info(f"[Clock] {interaction.user} refreshed employee {view.employee_id}'s clock.")
 
 
 class ClockInButton(discord.ui.Button):
