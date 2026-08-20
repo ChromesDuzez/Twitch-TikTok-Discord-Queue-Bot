@@ -12,6 +12,29 @@ differences from the prototype:
 SQLite remains authoritative. This client is best-effort: when Odoo is not
 configured (``loaded is False``) or a call fails, the caller degrades
 gracefully rather than breaking the bot.
+
+------------------------------------------------------------------------------
+ODOO FIELD REFERENCE  (keep this and the wiki page in sync)
+
+Every Odoo model + field the bot reads, filters (``domain``), sorts (``order``),
+or writes is catalogued in the wiki: **Odoo-Field-Reference**
+(repo mirror: ``docs/ODOO-FIELDS.md``). Update it whenever you add or change a
+call here.
+
+The one rule that prevents the recurring "Cannot convert X to SQL because it is
+not stored" (HTTP 500) bug:
+
+  * Reading a computed/non-stored field in ``fields`` is always fine.
+  * NEVER put a non-stored computed field in ``order`` (it becomes SQL ORDER BY).
+  * Avoid non-stored fields in ``domain`` too, unless the field has a search
+    method. In practice: prefer the stored ``name`` over the computed
+    ``display_name`` for filtering; read ``display_name`` only for labels.
+
+Known stored-vs-computed gotchas on Odoo 19:
+  * res.partner.display_name  -> COMPUTED, not stored (use ``name`` to sort/filter)
+  * project.task.planned_date_begin -> stored, but only exists with project
+    planning enabled (search_tasks_for_partner falls back if it's absent).
+------------------------------------------------------------------------------
 """
 
 from __future__ import annotations
@@ -136,10 +159,12 @@ class OdooClient:
     # ---- partners / customers ---------------------------------------------
 
     async def search_partners_by_name(self, name: str, limit: int = 10):
+        # Filter on the stored `name` (not the computed display_name); read
+        # display_name for the label. See the Odoo Field Reference wiki page.
         return await self.call(
             "/res.partner/search_read",
             {
-                "domain": [["display_name", "ilike", name]],
+                "domain": [["name", "ilike", name]],
                 "fields": ["id", "company_type", "display_name"],
                 "limit": limit,
             },
@@ -222,15 +247,26 @@ class OdooClient:
         domain = [["partner_id", "=", partner_id], ["is_closed", "=", False]]
         if name:
             domain.append(["name", "ilike", name])  # stored field (display_name isn't)
-        return await self.call(
-            "/project.task/search_read",
-            {
-                "domain": domain,
-                "fields": ["id", "display_name", "project_id", "planned_date_begin"],
-                "order": "planned_date_begin asc",
-                "limit": limit,
-            },
-        )
+        try:
+            return await self.call(
+                "/project.task/search_read",
+                {
+                    "domain": domain,
+                    "fields": ["id", "display_name", "project_id", "planned_date_begin"],
+                    "order": "planned_date_begin asc",
+                    "limit": limit,
+                },
+            )
+        except Exception as e:  # noqa: BLE001
+            # planned_date_begin needs the project planning feature; if it's not
+            # present on this Odoo the sort/field 500s. Fall back to an unsorted
+            # list (the caller then ranks everything as "undated") so the task
+            # picker still works. See the Odoo Field Reference wiki page.
+            log.warning(f"[Odoo] task search with planned_date_begin failed ({e}); retrying without it.")
+            return await self.call(
+                "/project.task/search_read",
+                {"domain": domain, "fields": ["id", "display_name", "project_id"], "limit": limit},
+            )
 
     async def get_task_project(self, task_id: int):
         """The project_id (int) a task belongs to, or None."""
@@ -255,7 +291,7 @@ class OdooClient:
             "/project.task/search_read",
             {
                 "domain": [
-                    ["partner_id.display_name", "ilike", name],
+                    ["partner_id.name", "ilike", name],  # stored (not display_name)
                     ["project_id", "=", project_id],
                     ["is_closed", "=", False],
                     ["date_deadline", ">=", low],
@@ -275,7 +311,7 @@ class OdooClient:
         """
         domain = [
             ["active", "=", True],
-            ["partner_id.display_name", "ilike", name],
+            ["partner_id.name", "ilike", name],  # stored (not display_name)
         ]
         exclude_ids = [i for i in exclude_ids if i]
         if exclude_ids:
