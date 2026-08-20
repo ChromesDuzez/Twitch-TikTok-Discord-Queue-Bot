@@ -898,22 +898,20 @@ class TimeTracking(commands.Cog):
 
     # ---- Odoo project configuration ----------------------------------------
 
-    async def _project_config_text(self, db) -> str:
+    async def _project_config_text(self) -> str:
         """Render the current Field Service / Office project config (id + name)."""
         lines = []
         for label, key in (("Field Service", "ODOO_FIELD_SERVICE_PROJECT_ID"),
                             ("Office", "ODOO_OFFICE_PROJECT_ID")):
-            pid = await resolve_project_id(db, key)
-            name, src = "", ""
-            if pid:
-                src = " _(set here)_" if await db.get_setting(key) else " _(from .env)_"
-                if self.client.loaded:
-                    try:
-                        rec = await self.client.read_record("project.project", pid, ["display_name"])
-                        name = f" — {rec['display_name']}" if rec else " — ⚠️ not found in Odoo"
-                    except Exception:  # noqa: BLE001
-                        name = ""
-            lines.append(f"• **{label}**: {pid if pid else '_not set_'}{name}{src}")
+            pid = _opt_int(os.getenv(key))
+            name = ""
+            if pid and self.client.loaded:
+                try:
+                    rec = await self.client.read_record("project.project", pid, ["display_name"])
+                    name = f" — {rec['display_name']}" if rec else " — ⚠️ not found in Odoo"
+                except Exception:  # noqa: BLE001
+                    name = ""
+            lines.append(f"• **{label}**: {pid if pid else '_not set_'}{name}")
         return "\n".join(lines)
 
     @discord.slash_command(name="configureprojects", description="Set the Odoo Field Service / Office project ids used to categorize worktime.")
@@ -923,7 +921,7 @@ class TimeTracking(commands.Cog):
         field_service: discord.Option(str, default=None, description="Odoo project for Field Service (Service) work", autocomplete=project_autocomplete),  # type: ignore
         office: discord.Option(str, default=None, description="Odoo project for Office work", autocomplete=project_autocomplete),  # type: ignore
     ):
-        db = await self._ensure_db()
+        await self._ensure_db()
         changed = []
         for value, key, label in ((field_service, "ODOO_FIELD_SERVICE_PROJECT_ID", "Field Service"),
                                   (office, "ODOO_OFFICE_PROJECT_ID", "Office")):
@@ -942,11 +940,13 @@ class TimeTracking(commands.Cog):
                 if rec is None:
                     await ctx.respond(f"No Odoo project has id {pid} (for {label}). Pick one from the list.", ephemeral=self._eph(ctx))
                     return
-            await db.set_setting(key, pid)
+            # Persist to .env AND the live process env (takes effect immediately,
+            # no restart) -- same mechanism as the webhook token / IP allowlist.
+            config.set_env(key, str(pid))
             changed.append(f"{label} → {pid}")
         if changed:
             timecard_log.info(f"[Config] {ctx.author} set Odoo project ids: {', '.join(changed)}.")
-        cfg = await self._project_config_text(db)
+        cfg = await self._project_config_text()
         header = ("Updated: " + "; ".join(changed) + ".\n\n") if changed else "Current Odoo project configuration:\n\n"
         await ctx.respond(header + cfg, ephemeral=self._eph(ctx))
 

@@ -137,8 +137,8 @@ customer against a partner's **former** name (renamed since). All stored.
 
 | Env var | Meaning |
 | --- | --- |
-| `ODOO_OFFICE_PROJECT_ID` | `project.project` id for Office work → punchType "Office". **Overridable in-app** via `/configureprojects` (stored in the `setting` table; env is the fallback). |
-| `ODOO_FIELD_SERVICE_PROJECT_ID` | `project.project` id for Field Service → "Service"; anything else → "Construction". **Overridable in-app** via `/configureprojects`. |
+| `ODOO_OFFICE_PROJECT_ID` | `project.project` id for Office work → punchType "Office". Settable in-app via `/configureprojects` (writes this `.env` var + applies live). |
+| `ODOO_FIELD_SERVICE_PROJECT_ID` | `project.project` id for Field Service → "Service"; anything else → "Construction". Settable in-app via `/configureprojects`. |
 | `ODOO_BOT_UID` | the bot's Odoo user id; inbound webhooks whose `write_uid` matches are treated as our own echo and skipped. |
 
 ---

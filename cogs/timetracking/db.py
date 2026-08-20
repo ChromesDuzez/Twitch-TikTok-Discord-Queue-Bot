@@ -35,20 +35,6 @@ TARGET_VERSION = 2
 PUNCH_TYPES = ("Construction", "Service", "Office")
 
 
-async def resolve_project_id(db, key: str) -> int | None:
-    """The Odoo project id for a category setting (``ODOO_FIELD_SERVICE_PROJECT_ID``
-    or ``ODOO_OFFICE_PROJECT_ID``): the value configured from Discord (in the
-    ``setting`` table) if present, otherwise the environment variable as a
-    fallback. Returns an int, or None if neither is set / not an integer."""
-    raw = await db.get_setting(key) if db is not None else None
-    if not raw:
-        raw = os.getenv(key)
-    try:
-        return int(raw) if raw else None
-    except (ValueError, TypeError):
-        return None
-
-
 class Database:
     """A thin async wrapper around a single shared aiosqlite connection."""
 
@@ -218,11 +204,6 @@ class Database:
                 message_id  UNSIGNED BIG INT NULL,
                 created_at  DATETIME NOT NULL
             );
-
-            CREATE TABLE setting (
-                key   TEXT PRIMARY KEY,
-                value TEXT
-            );
             """
         )
         await c.executemany(
@@ -273,29 +254,7 @@ class Database:
         # was stamped at the current version BEFORE a column was later introduced
         # (e.g. a dev/test db created before `legacy` existed) without a recreate.
         await self._ensure_columns()
-        await self._ensure_tables()
         log.info(f"[DB] Schema at version {TARGET_VERSION}.")
-
-    async def _ensure_tables(self):
-        """Idempotently create tables added after the v2 stamp (so a database
-        stamped before they existed self-heals). Currently: the settings kv store."""
-        await self._conn.execute(
-            "CREATE TABLE IF NOT EXISTS setting (key TEXT PRIMARY KEY, value TEXT)"
-        )
-        await self._conn.commit()
-
-    # ---- settings (kv store; e.g. Discord-configured Odoo project ids) --------
-
-    async def get_setting(self, key: str):
-        row = await self.fetchone("SELECT value FROM setting WHERE key = ?", (key,))
-        return row["value"] if row and row["value"] is not None else None
-
-    async def set_setting(self, key: str, value):
-        await self.execute(
-            "INSERT INTO setting (key, value) VALUES (?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (key, None if value is None else str(value)),
-        )
 
     # Columns that must exist on the current schema. Kept idempotent so a db
     # stamped before a column was added self-heals on the next startup.
