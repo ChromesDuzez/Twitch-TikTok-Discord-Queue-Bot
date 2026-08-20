@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 
 import discord
+from discord.ext import commands
 
 # Default roles (by env-var name) that are allowed to operate a clock.
 CLOCK_ROLES = ("TIMECARD_ADMIN_ROLE", "TIMECARD_TIMECLOCK_ROLE_ID")
@@ -55,3 +56,21 @@ def has_perms(
             return True
 
     return False
+
+
+def is_timecard_admin_member(user) -> bool:
+    """True if ``user`` may run timecard admin commands: a guild Administrator
+    (owner, admin role, etc.) or a holder of ``TIMECARD_ADMIN_ROLE``."""
+    perms = getattr(user, "guild_permissions", None)
+    if perms is not None and perms.administrator:
+        return True
+    return has_perms(user, accepted_roles=("TIMECARD_ADMIN_ROLE",))
+
+
+def is_timecard_admin():
+    """Slash-command check granting guild Administrators and TIMECARD_ADMIN_ROLE
+    holders. On failure py-cord raises CheckFailure -> the global handler replies
+    'You don't have permission to use this command.'"""
+    async def predicate(ctx):
+        return is_timecard_admin_member(ctx.author)
+    return commands.check(predicate)

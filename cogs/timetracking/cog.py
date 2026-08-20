@@ -21,7 +21,7 @@ from .db import (
 from .modals import Confirm
 from .odoo import inbox, sync
 from .odoo.client import OdooClient
-from .perms import has_perms
+from .perms import has_perms, is_timecard_admin
 from .reports import (
     autofill_incomplete_date,
     generate_timecard_report,
@@ -382,7 +382,7 @@ class TimeTracking(commands.Cog):
     # ---- customer commands -------------------------------------------------
 
     @discord.slash_command(name="addcustomer", description="Add a new Customer to the customer table.")
-    @commands.has_permissions(administrator=True)
+    @is_timecard_admin()
     async def addcustomer(
         self, ctx: discord.ApplicationContext,
         name: discord.Option(str, description="Full Name of Customer"),  # type: ignore
@@ -397,7 +397,7 @@ class TimeTracking(commands.Cog):
         await ctx.respond(f"Successfully inserted {name} into the customer table.", ephemeral=self._eph(ctx))
 
     @discord.slash_command(name="editcustomer", description="Edit an existing Customer in the customer table.")
-    @commands.has_permissions(administrator=True)
+    @is_timecard_admin()
     async def editcustomer(
         self, ctx: discord.ApplicationContext,
         newname: discord.Option(str, description="New name for Customer"),  # type: ignore
@@ -670,7 +670,7 @@ class TimeTracking(commands.Cog):
                 for r in (rows or [])][:25]
 
     @discord.slash_command(name="addemployee", description="Add a new Employee to the system.")
-    @commands.has_permissions(administrator=True)
+    @is_timecard_admin()
     async def addemployee(
         self, ctx: discord.ApplicationContext,
         name: discord.Option(str, description="Full Name of Employee"),  # type: ignore
@@ -719,7 +719,7 @@ class TimeTracking(commands.Cog):
             await ctx.respond(f"Error adding employee {name}: {e}", ephemeral=self._eph(ctx))
 
     @discord.slash_command(name="linkemployee", description="Link an existing employee to their Odoo hr.employee record.")
-    @commands.has_permissions(administrator=True)
+    @is_timecard_admin()
     async def linkemployee(
         self, ctx: discord.ApplicationContext,
         user: discord.Option(str, description="The employee to link", autocomplete=unlinked_employee_autocomplete),  # type: ignore
@@ -750,7 +750,7 @@ class TimeTracking(commands.Cog):
         await ctx.respond(f"Linked {row['name']} (<@{emp_id}>) to Odoo employee {odoo_employee}.", ephemeral=self._eph(ctx))
 
     @discord.slash_command(name="unlinkemployee", description="Remove an employee's link to their Odoo hr.employee record.")
-    @commands.has_permissions(administrator=True)
+    @is_timecard_admin()
     async def unlinkemployee(
         self, ctx: discord.ApplicationContext,
         user: discord.Option(str, description="The linked employee to unlink", autocomplete=linked_employee_autocomplete),  # type: ignore
@@ -779,7 +779,7 @@ class TimeTracking(commands.Cog):
     # ---- customer <-> Odoo linking -----------------------------------------
 
     @discord.slash_command(name="synccustomers", description="Auto-link local customers to Odoo partners by exact name.")
-    @commands.has_permissions(administrator=True)
+    @is_timecard_admin()
     async def synccustomers(self, ctx: discord.ApplicationContext):
         if not self.client.loaded:
             await ctx.respond("Odoo isn't configured, so there's nothing to link to.", ephemeral=self._eph(ctx))
@@ -836,7 +836,7 @@ class TimeTracking(commands.Cog):
         )
 
     @discord.slash_command(name="linkcustomer", description="Link a local customer to their Odoo partner.")
-    @commands.has_permissions(administrator=True)
+    @is_timecard_admin()
     async def linkcustomer(
         self, ctx: discord.ApplicationContext,
         customer: discord.Option(int, description="Local customer", autocomplete=unlinked_customer_autocomplete),  # type: ignore
@@ -859,7 +859,7 @@ class TimeTracking(commands.Cog):
         await ctx.respond(f"Linked '{row['name']}' to Odoo partner {odoo_partner}.", ephemeral=self._eph(ctx))
 
     @discord.slash_command(name="unlinkcustomer", description="Remove a customer's link to their Odoo partner.")
-    @commands.has_permissions(administrator=True)
+    @is_timecard_admin()
     async def unlinkcustomer(
         self, ctx: discord.ApplicationContext,
         customer: discord.Option(int, description="Linked customer", autocomplete=linked_customer_autocomplete),  # type: ignore
@@ -877,7 +877,7 @@ class TimeTracking(commands.Cog):
         await ctx.respond(f"Unlinked '{row['name']}' from Odoo partner {row['odooId']}.", ephemeral=self._eph(ctx))
 
     @discord.slash_command(name="unlinkedcustomers", description="List local customers not yet linked to an Odoo partner.")
-    @commands.has_permissions(administrator=True)
+    @is_timecard_admin()
     async def unlinkedcustomers(self, ctx: discord.ApplicationContext):
         db = await self._ensure_db()
         rows = await db.fetchall(
@@ -910,7 +910,7 @@ class TimeTracking(commands.Cog):
         return "\n".join(lines)
 
     @discord.slash_command(name="configureprojects", description="Set the Odoo Field Service / Office project ids used to categorize worktime.")
-    @commands.has_permissions(administrator=True)
+    @is_timecard_admin()
     async def configureprojects(
         self, ctx: discord.ApplicationContext,
         field_service: discord.Option(str, default=None, description="Odoo project for Field Service (Service) work", autocomplete=project_autocomplete),  # type: ignore
@@ -953,7 +953,7 @@ class TimeTracking(commands.Cog):
     # ---- punch management (after-the-fact fixes, no DB browser needed) ------
 
     @discord.slash_command(name="addpunch", description="Manually add a punch for an employee (e.g. a missed clock-in).")
-    @commands.has_permissions(administrator=True)
+    @is_timecard_admin()
     async def addpunch(
         self, ctx: discord.ApplicationContext,
         employee: discord.Option(str, description="The employee", autocomplete=employee_autocomplete),  # type: ignore
@@ -994,7 +994,7 @@ class TimeTracking(commands.Cog):
         await ctx.respond(f"Added punch #{punch_id} for {row['name']}: `{pin}` → `{pout or 'open'}`.", ephemeral=self._eph(ctx))
 
     @discord.slash_command(name="editpunch", description="Fix a punch's clock-in/out time or approval.")
-    @commands.has_permissions(administrator=True)
+    @is_timecard_admin()
     async def editpunch(
         self, ctx: discord.ApplicationContext,
         punch: discord.Option(str, description="The punch to edit", autocomplete=punch_autocomplete),  # type: ignore
@@ -1035,7 +1035,7 @@ class TimeTracking(commands.Cog):
         await ctx.respond(f"Updated punch #{punch}.", ephemeral=self._eph(ctx))
 
     @discord.slash_command(name="deletepunch", description="Delete a punch — review each linked worktime first.")
-    @commands.has_permissions(administrator=True)
+    @is_timecard_admin()
     async def deletepunch(
         self, ctx: discord.ApplicationContext,
         punch: discord.Option(str, description="The punch to delete", autocomplete=punch_autocomplete),  # type: ignore
@@ -1112,7 +1112,7 @@ class TimeTracking(commands.Cog):
         timecard_log.info(f"[Punch] {ctx.author} opened delete review for punch {punch} ({len(worktimes)} worktime).")
 
     @discord.slash_command(name="reassignworktime", description="Move a worktime to a different punch/shift (keeps Odoo's shift link correct).")
-    @commands.has_permissions(administrator=True)
+    @is_timecard_admin()
     async def reassignworktime(
         self, ctx: discord.ApplicationContext,
         worktime: discord.Option(str, description="The worktime to move", autocomplete=worktime_autocomplete),  # type: ignore
@@ -1142,7 +1142,7 @@ class TimeTracking(commands.Cog):
     # ---- worktime management -----------------------------------------------
 
     @discord.slash_command(name="addworktime", description="Add a worktime entry to a punch.")
-    @commands.has_permissions(administrator=True)
+    @is_timecard_admin()
     async def addworktime(
         self, ctx: discord.ApplicationContext,
         punch: discord.Option(str, description="The punch/shift", autocomplete=punch_autocomplete),  # type: ignore
@@ -1208,7 +1208,7 @@ class TimeTracking(commands.Cog):
         await ctx.respond(f"Added {worktype} worktime #{wt_id} ({hours:g}h) to punch #{punch}.{note}", ephemeral=self._eph(ctx))
 
     @discord.slash_command(name="editworktime", description="Edit a worktime entry's type, hours, or customer.")
-    @commands.has_permissions(administrator=True)
+    @is_timecard_admin()
     async def editworktime(
         self, ctx: discord.ApplicationContext,
         worktime: discord.Option(str, description="The worktime to edit", autocomplete=worktime_autocomplete),  # type: ignore
@@ -1268,7 +1268,7 @@ class TimeTracking(commands.Cog):
         await ctx.respond(f"Updated worktime #{worktime}.{note}", ephemeral=self._eph(ctx))
 
     @discord.slash_command(name="deleteworktime", description="Delete a single worktime entry.")
-    @commands.has_permissions(administrator=True)
+    @is_timecard_admin()
     async def deleteworktime(
         self, ctx: discord.ApplicationContext,
         worktime: discord.Option(str, description="The worktime to delete", autocomplete=worktime_autocomplete),  # type: ignore
@@ -1290,7 +1290,7 @@ class TimeTracking(commands.Cog):
     # ---- clock commands ----------------------------------------------------
 
     @discord.slash_command(name="createclock", description="Create a time clock embed for a user.")
-    @commands.has_permissions(administrator=True)
+    @is_timecard_admin()
     async def createclock(
         self, ctx: discord.ApplicationContext,
         user: discord.Option(str, description="The user to create a time clock for."),  # type: ignore
@@ -1355,7 +1355,7 @@ class TimeTracking(commands.Cog):
             log.warning(f"[Clock] Could not delete old clock message: {e}")
 
     @discord.slash_command(name="deleteclock", description="Delete a clock embed for a user.")
-    @commands.has_permissions(administrator=True)
+    @is_timecard_admin()
     async def deleteclock(
         self, ctx: discord.ApplicationContext,
         user: discord.Option(str, description="The user whose time clock to delete"),  # type: ignore
@@ -1465,7 +1465,7 @@ class TimeTracking(commands.Cog):
         return list(punch_data.keys()), punch_data, employee_data
 
     @discord.slash_command(name="viewtimecard", description="View an employee's week of punches + worktime (with ids) to decide what to edit.")
-    @commands.has_permissions(administrator=True)
+    @is_timecard_admin()
     async def viewtimecard(
         self, ctx: discord.ApplicationContext,
         employee: discord.Option(str, description="The employee", autocomplete=employee_autocomplete),  # type: ignore
@@ -1496,7 +1496,7 @@ class TimeTracking(commands.Cog):
         await ctx.respond(embed=embed, view=view, ephemeral=self._eph(ctx))
 
     @discord.slash_command(name="timecardreport", description="Generate a weekly punch report given an end date.")
-    @commands.has_permissions(administrator=True)
+    @is_timecard_admin()
     async def timecardreport(
         self, ctx: discord.ApplicationContext,
         week_end_date: discord.Option(str, description="End of Week [SATURDAY, YYYY-MM-DD]", autocomplete=week_ending_autocomplete),  # type: ignore
@@ -1593,7 +1593,7 @@ class TimeTracking(commands.Cog):
                                     file=discord.File(file_path), ephemeral=True)
 
     @discord.slash_command(name="timecardrange", description="Report over a custom date range (up to 1 year).")
-    @commands.has_permissions(administrator=True)
+    @is_timecard_admin()
     async def timecardrange(
         self, ctx: discord.ApplicationContext,
         start_date: discord.Option(str, description="Start date [YYYY-MM-DD]"),  # type: ignore
