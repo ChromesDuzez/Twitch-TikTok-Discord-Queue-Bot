@@ -47,6 +47,9 @@ sys.excepthook = _log_unhandled_exception
 # On first run, create .env from .env.example so the bot can start.
 ENV_CREATED = config.ensure_env_file()
 load_dotenv()
+# In TESTING mode, overlay TESTING_* channel ids onto the live env so the bot uses
+# the test guild's channels without touching production's ids in the shared .env.
+config.apply_testing_channel_overrides()
 # Configure logging now that .env is loaded (honors LOG_FILE / DEBUGGING /
 # LOG_FILE_LEVEL) and before anything else that can fail, so startup errors --
 # including cog import failures -- are captured in the log file.
@@ -83,8 +86,35 @@ bot_ready_event = asyncio.Event()
 session = None
 bot_task = None  # module-level so cli_shutdown() can cancel it
 
+def _managed_guild():
+    """The guild whose managed channels we resolve at startup: the test guild in
+    test mode, else the configured primary guild, else the only/first guild."""
+    gid = config.testing_guild_id() if config.is_testing() else config.primary_guild_id()
+    if gid:
+        g = bot.get_guild(gid)
+        if g is not None:
+            return g
+    return bot.guilds[0] if bot.guilds else None
+
+
 async def on_ready():
     await synced()
+    # Resolve (and in test mode create) the managed channels BEFORE attaching the
+    # Discord log handlers, which read BOT_LOG_ID/TIMECARD_LOG_ID. Runs once.
+    if not getattr(bot, "_channels_resolved", False):
+        bot._channels_resolved = True
+        try:
+            import channelsetup
+            guild = _managed_guild()
+            if guild is None:
+                log.warning("[Setup] Bot isn't in any guild yet; skipping channel resolution.")
+            elif not await channelsetup.resolve_channels(guild):
+                log.critical("[Bot] Halting: a required channel is missing (see above).")
+                await bot.close()
+                return
+        except Exception:
+            # Never let channel setup crash startup — degrade to whatever's configured.
+            log.exception("[Setup] Channel resolution failed; continuing with configured ids.")
     # Start Discord-channel logging now that the bot (and its channel cache) is up.
     attach_discord(bot)
     log.info("[Bot] Hello! Chromes Py-Bot is ready!")

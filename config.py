@@ -192,6 +192,36 @@ def is_testing() -> bool:
     return os.getenv("TESTING", "false").strip().lower() in ("1", "true", "yes")
 
 
+# Base channel keys that get a TESTING_<KEY> override so the test bot can point at
+# test-guild channels without overwriting the production ids in the shared .env.
+MANAGED_CHANNEL_KEYS = (
+    "BOT_LOG_ID",
+    "TIMECARD_LOG_ID",
+    "TIMECARD_ADMIN_CHANNEL_ID",
+    "TIMECARD_REPORTS_CHANNEL_ID",
+)
+
+
+def apply_testing_channel_overrides() -> None:
+    """In TESTING mode, overlay any ``TESTING_<KEY>`` channel id onto the live
+    process env for its base key, so the rest of the bot reads the test-guild
+    channels while the production ids in ``.env`` stay untouched. No-op in prod."""
+    if not is_testing():
+        return
+    for base in MANAGED_CHANNEL_KEYS:
+        val = os.getenv(f"TESTING_{base}")
+        if val:
+            os.environ[base] = val
+
+
+def persist_channel_id(base_key: str, channel_id: int) -> None:
+    """Set a managed channel id on the live env and persist it — to the
+    ``TESTING_<KEY>`` field in test mode (leaving prod's value alone), or the base
+    key in production."""
+    os.environ[base_key] = str(channel_id)
+    set_env(f"TESTING_{base_key}" if is_testing() else base_key, str(channel_id))
+
+
 def _int_env(key: str) -> int | None:
     raw = os.getenv(key)
     try:
