@@ -117,6 +117,24 @@ async def on_ready():
             log.exception("[Setup] Channel resolution failed; continuing with configured ids.")
     # Start Discord-channel logging now that the bot (and its channel cache) is up.
     attach_discord(bot)
+    # Test-db bootstrap prompt: post the Yes/No to the (now-resolved) admin channel;
+    # the console side + execution happen in the CLI loop (whichever answers wins).
+    if getattr(bot, "_needs_test_bootstrap", False) and not getattr(bot, "_bootstrap_posted", False):
+        bot._bootstrap_posted = True
+        bot._bootstrap_guild = _managed_guild()
+        bot._test_decision = asyncio.get_event_loop().create_future()
+        try:
+            import testboot
+            aid = os.getenv("TIMECARD_ADMIN_CHANNEL_ID")
+            ch = bot.get_channel(int(aid)) if aid and aid.isdigit() else None
+            if ch is not None:
+                await ch.send(
+                    "**No test database found.** Pull data from **production** (copy + "
+                    "sanitize) or start from **scratch**? You can also answer y/n in the "
+                    "console. No answer in 5 minutes → scratch.",
+                    view=testboot.TestBootstrapView(bot._test_decision))
+        except Exception:
+            log.exception("[Setup] Could not post the test-bootstrap prompt.")
     log.info("[Bot] Hello! Chromes Py-Bot is ready!")
     bot_ready_event.set()
 
@@ -205,11 +223,51 @@ async def cli_shutdown():
     if bot and not bot.is_closed():
         await bot.close()
 
+async def _run_test_bootstrap_if_needed(session):
+    """When the test db is fresh, race a console y/n against the admin-channel
+    buttons (and a 5-minute timeout → scratch), then run the chosen bootstrap."""
+    if not getattr(bot, "_needs_test_bootstrap", False):
+        return
+    import testboot
+    fut = getattr(bot, "_test_decision", None)
+    if fut is None:
+        fut = asyncio.get_event_loop().create_future()
+        bot._test_decision = fut
+    session.output.write(
+        "[Setup] No test database. Pull data from PRODUCTION? Answer y/n here, or use "
+        "the buttons in the timecard-admin channel. No answer in 5 min → start from scratch.\n")
+    console = asyncio.ensure_future(session.prompt_async("Pull test data from prod? [y/N]: "))
+    pull = False
+    try:
+        done, pending = await asyncio.wait({console, fut}, timeout=300,
+                                           return_when=asyncio.FIRST_COMPLETED)
+        if console in done and not console.cancelled():
+            pull = (console.result() or "").strip().lower() in ("y", "yes")
+            if not fut.done():
+                fut.set_result(pull)
+        elif fut in done:
+            pull = bool(fut.result())
+        else:
+            session.output.write("[Setup] No answer in 5 minutes — starting from scratch.\n")
+            if not fut.done():
+                fut.set_result(False)
+        for t in pending:
+            t.cancel()
+    except Exception:
+        log.exception("[Setup] Bootstrap prompt failed; starting from scratch.")
+    bot._needs_test_bootstrap = False
+    try:
+        await testboot.apply_decision(bot, pull, getattr(bot, "_bootstrap_guild", None))
+    except Exception:
+        log.exception("[Setup] Test bootstrap execution failed.")
+
+
 async def cli_input_loop():
     global session
     session = PromptSession()
     bot.cli_session = session  # Store on bot instance for access by cogs
     await bot_ready_event.wait()
+    await _run_test_bootstrap_if_needed(session)
     session.output.write("[CLI] running interactive local console. Type 'shutdown' or '/shutdown' to stop the bot.\n")
     while bot and not bot.is_closed():
         try:
@@ -288,6 +346,11 @@ async def main():
     asyncio.get_running_loop().set_exception_handler(_loop_exception_handler)
     try:
         await setup_bot()
+
+        # Decide whether a test-db bootstrap is needed BEFORE the db is opened
+        # (opening it would create an empty test db and hide the "fresh" state).
+        import testboot
+        bot._needs_test_bootstrap = config.is_testing() and not testboot.test_db_present()
 
         # After an upgrade (or first-run .env creation), pause so the admin can
         # review new settings / the migrated database before the bot connects.
