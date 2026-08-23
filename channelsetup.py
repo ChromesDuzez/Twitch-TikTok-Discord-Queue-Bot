@@ -64,17 +64,33 @@ async def resolve_channels(guild) -> bool:
     testing = config.is_testing()
     resolved: dict[str, object] = {}
 
+    # Pass 1: resolve the channels that already exist (by id, then exact name).
     for base, name, _required in MANAGED:
-        ch = await _find_channel(guild, base, name)
-        if ch is None and testing:
+        resolved[base] = await _find_channel(guild, base, name)
+
+    # New test channels join the category the existing managed channels live in
+    # (e.g. an "Administration" category) instead of being dumped at the top level.
+    category = None
+    for base, _name, _req in MANAGED:
+        ch = resolved[base]
+        if ch is not None and getattr(ch, "category", None) is not None:
+            category = ch.category
+            break
+
+    # Pass 2: create any still-missing channels (test mode only), under that category.
+    for base, name, _required in MANAGED:
+        if resolved[base] is None and testing:
             try:
-                ch = await guild.create_text_channel(name)
-                log.warning("[Setup] Created missing test channel #%s (%s).", name, ch.id)
+                resolved[base] = await guild.create_text_channel(name, category=category)
+                log.warning("[Setup] Created missing test channel #%s (%s)%s.", name,
+                            resolved[base].id, f" under '{category.name}'" if category else "")
             except Exception as e:  # noqa: BLE001
                 log.error("[Setup] Could not create test channel #%s: %s", name, e)
-        if ch is not None:
-            config.persist_channel_id(base, ch.id)
-        resolved[base] = ch
+
+    # Persist every resolved id (never raises; degrades to session-only on failure).
+    for base, _name, _req in MANAGED:
+        if resolved[base] is not None:
+            config.persist_channel_id(base, resolved[base].id)
 
     # Production: required channels must exist, or we can't operate safely.
     missing_required = [name for base, name, req in MANAGED if req and resolved[base] is None]

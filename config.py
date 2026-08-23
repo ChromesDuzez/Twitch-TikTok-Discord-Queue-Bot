@@ -46,13 +46,27 @@ ENV_TARGET_VERSION = 2
 _write_lock = threading.Lock()
 
 
-def _set_env(key: str, value: str):
-    """Persist key=value to .env and to the live process environment."""
+def _set_env(key: str, value: str, retries: int = 4):
+    """Persist key=value to .env and to the live process environment.
+
+    The live env is updated first so the value is never lost even if the file
+    write fails. The ``set_key`` write is retried briefly to ride out a transient
+    file lock (common on Windows, or when two writes land back-to-back); the last
+    error is raised only if every attempt fails."""
+    import time
     with _write_lock:
+        os.environ[key] = value  # in-process first: a file failure never loses it
         if not os.path.exists(ENV_PATH):
             open(ENV_PATH, "a").close()
-        set_key(ENV_PATH, key, value, quote_mode="never")
-        os.environ[key] = value
+        last = None
+        for attempt in range(retries):
+            try:
+                set_key(ENV_PATH, key, value, quote_mode="never")
+                return
+            except Exception as e:  # noqa: BLE001 - transient file lock; retry
+                last = e
+                time.sleep(0.1 * (attempt + 1))
+        raise last
 
 
 def _remove_env(key: str):
@@ -214,12 +228,21 @@ def apply_testing_channel_overrides() -> None:
             os.environ[base] = val
 
 
-def persist_channel_id(base_key: str, channel_id: int) -> None:
+def persist_channel_id(base_key: str, channel_id: int) -> bool:
     """Set a managed channel id on the live env and persist it — to the
     ``TESTING_<KEY>`` field in test mode (leaving prod's value alone), or the base
-    key in production."""
+    key in production. Never raises: the live env is always set; if the .env write
+    fails after retries it's logged and we carry on with the id for this session.
+    Returns True if it was persisted to disk."""
     os.environ[base_key] = str(channel_id)
-    set_env(f"TESTING_{base_key}" if is_testing() else base_key, str(channel_id))
+    key = f"TESTING_{base_key}" if is_testing() else base_key
+    try:
+        set_env(key, str(channel_id))
+        return True
+    except Exception as e:  # noqa: BLE001
+        log.warning("[Config] Couldn't persist %s to .env (%s); using id %s for this session only.",
+                    key, e, channel_id)
+        return False
 
 
 def _int_env(key: str) -> int | None:
