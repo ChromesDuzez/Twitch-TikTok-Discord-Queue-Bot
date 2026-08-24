@@ -39,8 +39,9 @@ Legend — **Use:** R = read (`fields`), F = filter (`domain`), O = order, W = w
 | `name` | F/O/W | ✅ | **Filter/sort on this.** `name_create` writes it. |
 | `display_name` | R | ❌ computed | Labels only — never `order`/`domain`. |
 | `company_type` | R | ✅ | company vs person (dedup label). |
-| `customer_rank` | F | ✅ | `> 0` selects customers. |
-| `active` | F | ✅ | archived-partner handling. |
+| `customer_rank` | R/F | ✅ | `> 0` selects customers; the inbound reconcile only imports a partner as a customer when this is `> 0`. |
+| `employee` | R | ✅ | True if the partner is an employee's contact; such partners are **not** imported as customers. |
+| `active` | R/F | ✅ | archived-partner handling. |
 
 ### `hr.employee`
 | Field | Use | Stored | Notes |

@@ -219,7 +219,9 @@ class InboxWorker:
     # ---- per-model reconcilers (idempotent) --------------------------------
 
     async def _reconcile_partner(self, odoo_id: int) -> bool:
-        rec = await self.client.read_record("res.partner", odoo_id, ["id", "display_name", "active"])
+        rec = await self.client.read_record(
+            "res.partner", odoo_id, ["id", "display_name", "active", "customer_rank", "employee"]
+        )
         if rec is None:
             return False  # deleted in Odoo; the /delete webhook handles removal
         name = rec["display_name"]
@@ -228,6 +230,13 @@ class InboxWorker:
             "SELECT id, name, archived FROM customer WHERE odooId = ?", (odoo_id,)
         )
         if row is None:
+            # Odoo auto-creates a res.partner for every hr.employee (and other
+            # contacts). Only import a partner as a customer if it actually is one
+            # (customer_rank > 0 and not an employee) -- same filter get_customer_list
+            # uses -- so employee/contact records don't pollute the customer table.
+            if rec.get("employee") or (rec.get("customer_rank") or 0) <= 0:
+                log.debug(f"[Inbox] res.partner {odoo_id} ('{name}') isn't a customer; not importing.")
+                return False
             await self.db.execute(
                 "INSERT INTO customer (name, odooId, archived) VALUES (?, ?, ?)", (name, odoo_id, archived)
             )
