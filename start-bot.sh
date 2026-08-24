@@ -1,7 +1,4 @@
 #!/bin/sh
-echo "Activating the virtual environment..."
-source .venv/bin/activate
+# Run the bot using the venv's Python directly (no activation needed).
 echo "Starting the bot..."
-python main.py
-echo "Deactivating the virtual environment..."
-deactivate
+./discord-bot-venv/bin/python main.py
