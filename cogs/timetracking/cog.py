@@ -46,7 +46,8 @@ _MANAGEMENT_COMMANDS = {
     "addworktime", "editworktime", "deleteworktime", "reassignworktime",
     "viewtimecard",
     "synccustomers", "linkcustomer", "unlinkcustomer", "unlinkedcustomers",
-    "addcustomer", "editcustomer", "mergecustomers", "configureprojects", "configureroles",
+    "addcustomer", "editcustomer", "mergecustomers", "archivecustomer", "unarchivecustomer",
+    "deletecustomer", "purgeimportedcontacts", "configureprojects", "configureroles",
     "addemployee", "linkemployee", "unlinkemployee", "archiveemployee", "unarchiveemployee",
     "createclock", "deleteclock",
 }
@@ -614,6 +615,21 @@ class TimeTracking(commands.Cog):
                 break
         return out
 
+    async def archived_customer_autocomplete(self, ctx: discord.AutocompleteContext):
+        """Archived customers (for /unarchivecustomer), with id + Odoo id."""
+        if self.db is None:
+            return []
+        rows = await self.db.fetchall("SELECT id, name, odooId FROM customer WHERE archived = 1 ORDER BY name")
+        term = str(ctx.value or "").lower()
+        out = []
+        for r in rows:
+            odoo = f" · Odoo #{r['odooId']}" if r["odooId"] else ""
+            if term in str(r["name"] or "").lower() or term in str(r["id"]):
+                out.append(_choice(f"{r['name']} (#{r['id']}{odoo})", str(r["id"])))
+            if len(out) >= 25:
+                break
+        return out
+
     async def worktime_autocomplete(self, ctx: discord.AutocompleteContext):
         """Recent worktime entries, shown as 'Name · Type Nh Customer (#id)'."""
         if self.db is None:
@@ -1078,6 +1094,176 @@ class TimeTracking(commands.Cog):
             f"entr{'y' if n == 1 else 'ies'}{f' and adopted the Odoo link #{rrow['odooId']}' if adopt_odoo else ''}.",
             ephemeral=self._eph(ctx),
         )
+
+    @discord.slash_command(name="archivecustomer", description="Archive (soft-delete) a customer: hide from lists, keep all history.")
+    @is_timecard_admin()
+    async def archivecustomer(
+        self, ctx: discord.ApplicationContext,
+        customer: discord.Option(str, description="Customer to archive", autocomplete=merge_customer_autocomplete),  # type: ignore
+    ):
+        db = await self._ensure_db()
+        cid = _opt_int(customer)
+        if cid is None:
+            await ctx.respond("Pick a customer from the autocomplete list.", ephemeral=self._eph(ctx))
+            return
+        if cid == 0:
+            await ctx.respond("You can't archive the default/company customer.", ephemeral=self._eph(ctx))
+            return
+        row = await db.fetchone("SELECT name, archived FROM customer WHERE id = ?", (cid,))
+        if row is None:
+            await ctx.respond("That customer isn't in the database.", ephemeral=self._eph(ctx))
+            return
+        if row["archived"]:
+            await ctx.respond(f"'{row['name']}' (#{cid}) is already archived.", ephemeral=self._eph(ctx))
+            return
+        await db.execute("UPDATE customer SET archived = 1 WHERE id = ?", (cid,))
+        timecard_log.info(f"[Customer] {ctx.author} archived customer {cid} ('{row['name']}').")
+        await ctx.respond(
+            f"Archived **{row['name']}** (#{cid}): hidden from active lists, all history kept. "
+            f"Restore with `/unarchivecustomer`.", ephemeral=self._eph(ctx))
+
+    @discord.slash_command(name="unarchivecustomer", description="Restore an archived customer.")
+    @is_timecard_admin()
+    async def unarchivecustomer(
+        self, ctx: discord.ApplicationContext,
+        customer: discord.Option(str, description="Archived customer to restore", autocomplete=archived_customer_autocomplete),  # type: ignore
+    ):
+        db = await self._ensure_db()
+        cid = _opt_int(customer)
+        if cid is None:
+            await ctx.respond("Pick a customer from the autocomplete list.", ephemeral=self._eph(ctx))
+            return
+        row = await db.fetchone("SELECT name, archived FROM customer WHERE id = ?", (cid,))
+        if row is None:
+            await ctx.respond("That customer isn't in the database.", ephemeral=self._eph(ctx))
+            return
+        if not row["archived"]:
+            await ctx.respond(f"'{row['name']}' (#{cid}) isn't archived.", ephemeral=self._eph(ctx))
+            return
+        await db.execute("UPDATE customer SET archived = 0 WHERE id = ?", (cid,))
+        timecard_log.info(f"[Customer] {ctx.author} restored customer {cid} ('{row['name']}').")
+        await ctx.respond(f"Restored **{row['name']}** (#{cid}).", ephemeral=self._eph(ctx))
+
+    @discord.slash_command(name="deletecustomer", description="Delete a customer (or archive it if it has worktime history).")
+    @is_timecard_admin()
+    async def deletecustomer(
+        self, ctx: discord.ApplicationContext,
+        customer: discord.Option(str, description="Customer to delete", autocomplete=merge_customer_autocomplete),  # type: ignore
+    ):
+        db = await self._ensure_db()
+        cid = _opt_int(customer)
+        if cid is None:
+            await ctx.respond("Pick a customer from the autocomplete list.", ephemeral=self._eph(ctx))
+            return
+        if cid == 0:
+            await ctx.respond("You can't delete the default/company customer.", ephemeral=self._eph(ctx))
+            return
+        row = await db.fetchone("SELECT name, odooId, archived FROM customer WHERE id = ?", (cid,))
+        if row is None:
+            await ctx.respond("That customer isn't in the database.", ephemeral=self._eph(ctx))
+            return
+        n = (await db.fetchone("SELECT count(*) c FROM work_time WHERE customerID = ?", (cid,)))["c"]
+
+        if n > 0:
+            # Has history -> can't hard-delete (would lose worktime). Offer to archive.
+            if row["archived"]:
+                await ctx.respond(
+                    f"'{row['name']}' (#{cid}) has **{n}** worktime entr{'y' if n == 1 else 'ies'}, so it can't be "
+                    f"deleted without losing history — and it's already archived. Nothing to do.",
+                    ephemeral=self._eph(ctx))
+                return
+            confirm = Confirm(user=ctx.user, timeout=60)
+            await ctx.respond(
+                f"**{row['name']}** (#{cid}) has **{n}** worktime entr{'y' if n == 1 else 'ies'} — deleting would "
+                f"lose that history. **Archive** it instead (hide from lists, keep history)?",
+                view=confirm, ephemeral=self._eph(ctx))
+            await confirm.wait()
+            if not confirm.value:
+                await ctx.followup.send("Cancelled — nothing changed.", ephemeral=self._eph(ctx))
+                return
+            await db.execute("UPDATE customer SET archived = 1 WHERE id = ?", (cid,))
+            timecard_log.info(f"[Customer] {ctx.author} archived customer {cid} ('{row['name']}') (had {n} worktime; delete declined).")
+            await ctx.followup.send(f"Archived **{row['name']}** (#{cid}) instead — history kept.", ephemeral=self._eph(ctx))
+            return
+
+        # No worktime -> safe to hard-delete after confirmation.
+        confirm = Confirm(user=ctx.user, timeout=60)
+        await ctx.respond(
+            f"Permanently delete **{row['name']}** (#{cid}"
+            f"{f' · Odoo #{row['odooId']}' if row['odooId'] else ''})? It has no worktime, so nothing is lost.",
+            view=confirm, ephemeral=self._eph(ctx))
+        await confirm.wait()
+        if not confirm.value:
+            await ctx.followup.send("Cancelled — nothing was deleted.", ephemeral=self._eph(ctx))
+            return
+        await db.execute(
+            "UPDATE odoo_outbox SET status = 'skipped' WHERE status = 'pending' "
+            "AND entity_type = 'customer' AND entity_id = ?", (cid,))
+        await db.execute("DELETE FROM customer WHERE id = ?", (cid,))
+        timecard_log.info(
+            f"[Customer] {ctx.author} DELETED customer {cid} ('{row['name']}'"
+            f"{f', Odoo #{row['odooId']}' if row['odooId'] else ''}) — re-add with /addcustomer if needed.")
+        await ctx.followup.send(f"Deleted **{row['name']}** (#{cid}).", ephemeral=self._eph(ctx))
+
+    @discord.slash_command(name="purgeimportedcontacts", description="Clean up Odoo contacts wrongly imported as customers (employees/non-customers).")
+    @is_timecard_admin()
+    async def purgeimportedcontacts(self, ctx: discord.ApplicationContext):
+        if not self.client.loaded:
+            await ctx.respond("Odoo isn't configured, so there's nothing to check against.", ephemeral=self._eph(ctx))
+            return
+        await ctx.defer(ephemeral=self._eph(ctx))
+        db = await self._ensure_db()
+        try:
+            valid_ids = await self.client.get_customer_partner_ids()
+        except Exception as e:  # noqa: BLE001
+            log.exception("[Customer] purgeimportedcontacts: Odoo fetch failed")
+            await ctx.followup.send(f"Couldn't fetch the customer list from Odoo: {e}", ephemeral=self._eph(ctx))
+            return
+        linked = await db.fetchall("SELECT id, name, odooId, archived FROM customer WHERE odooId IS NOT NULL AND id != 0")
+        to_delete, to_archive = [], []
+        for c in linked:
+            if c["odooId"] in valid_ids:
+                continue  # a real customer in Odoo — keep
+            n = (await db.fetchone("SELECT count(*) c FROM work_time WHERE customerID = ?", (c["id"],)))["c"]
+            if n == 0:
+                to_delete.append(c)
+            elif not c["archived"]:
+                to_archive.append((c, n))
+        if not to_delete and not to_archive:
+            await ctx.followup.send("No imported employee/non-customer contacts found. \U0001f389", ephemeral=self._eph(ctx))
+            return
+
+        lines = [f"🗑️ delete **{c['name']}** (#{c['id']} · Odoo #{c['odooId']})" for c in to_delete[:20]]
+        lines += [f"📦 archive **{c['name']}** (#{c['id']}, {n} worktime)" for c, n in to_archive[:20]]
+        extra = (len(to_delete) - 20 if len(to_delete) > 20 else 0) + (len(to_archive) - 20 if len(to_archive) > 20 else 0)
+        summary = (f"Found **{len(to_delete)}** to delete + **{len(to_archive)}** to archive "
+                   f"(non-customer partners in Odoo):\n" + "\n".join(lines)
+                   + (f"\n…and {extra} more." if extra > 0 else "")
+                   + "\n\nEach removal is logged to the timecard log channel for recovery. Proceed?")
+        confirm = Confirm(user=ctx.user, timeout=120)
+        await ctx.followup.send(summary[:1990], view=confirm, ephemeral=self._eph(ctx))
+        await confirm.wait()
+        if not confirm.value:
+            await ctx.followup.send("Cancelled — nothing was removed.", ephemeral=self._eph(ctx))
+            return
+
+        for c in to_delete:
+            await db.execute(
+                "UPDATE odoo_outbox SET status = 'skipped' WHERE status = 'pending' "
+                "AND entity_type = 'customer' AND entity_id = ?", (c["id"],))
+            await db.execute("DELETE FROM customer WHERE id = ?", (c["id"],))
+            timecard_log.info(
+                f"[Customer] PURGE deleted '{c['name']}' (#{c['id']}, Odoo #{c['odooId']}) — "
+                f"re-add with /addcustomer + /linkcustomer if needed.")
+        for c, n in to_archive:
+            await db.execute("UPDATE customer SET archived = 1 WHERE id = ?", (c["id"],))
+            timecard_log.info(
+                f"[Customer] PURGE archived '{c['name']}' (#{c['id']}, Odoo #{c['odooId']}, {n} worktime — kept).")
+        timecard_log.info(f"[Customer] {ctx.author} purged imported contacts: {len(to_delete)} deleted, {len(to_archive)} archived.")
+        await ctx.followup.send(
+            f"Purge complete: **{len(to_delete)}** deleted, **{len(to_archive)}** archived (had worktime). "
+            f"Each is listed in the log channel — re-add or `/unarchivecustomer` to bring one back.",
+            ephemeral=self._eph(ctx))
 
     # ---- Odoo project configuration ----------------------------------------
 

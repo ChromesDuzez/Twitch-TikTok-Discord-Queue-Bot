@@ -226,6 +226,16 @@ class OdooClient:
                 history[old].append(pid)
         return history
 
+    async def get_customer_partner_ids(self) -> set:
+        """The set of res.partner ids that are real customers (customer_rank > 0,
+        active or archived). One call, ids only — used to spot local customers that
+        were wrongly imported from a non-customer partner (e.g. an employee contact)."""
+        rows = await self.call(
+            "/res.partner/search_read",
+            {"domain": [["customer_rank", ">", 0], ["active", "in", [True, False]]], "fields": ["id"]},
+        )
+        return {r["id"] for r in (rows or [])}
+
     async def create_partner(self, name: str, block_duplicate: bool = True):
         if block_duplicate:
             existing = await self.search_partners_by_name(name)
