@@ -872,13 +872,16 @@ class TimeTracking(commands.Cog):
             return
         # Case-insensitive Odoo name -> [partner ids]. One Odoo call, match in memory.
         by_name: dict[str, list[int]] = {}
+        id_to_name = {}
         for c in odoo_customers:
             by_name.setdefault((c["display_name"] or "").strip().lower(), []).append(c["id"])
+            id_to_name[c["id"]] = c["display_name"] or f"#{c['id']}"
         already = {r["odooId"] for r in await db.fetchall("SELECT odooId FROM customer WHERE odooId IS NOT NULL")}
         unlinked = await db.fetchall(
             "SELECT id, name FROM customer WHERE odooId IS NULL AND (archived IS NULL OR archived = 0)"
         )
-        linked = ambiguous = nomatch = via_history = 0
+        linked = nomatch = via_history = 0
+        ambiguous_details = []  # (local_name, [(partner_id, partner_name), ...])
         history = None  # {former_name_lower: [partner_id]}, lazy-loaded on first no-match
         for c in unlinked:
             key = (c["name"] or "").strip().lower()
@@ -888,7 +891,7 @@ class TimeTracking(commands.Cog):
                 already.add(candidates[0]); linked += 1
                 continue
             if len(candidates) > 1:
-                ambiguous += 1
+                ambiguous_details.append((c["name"], [(i, id_to_name.get(i, f"#{i}")) for i in candidates]))
                 continue
             # No current-name match — try former names from the Odoo chatter, so a
             # customer renamed on one side still links (fetched once, then cached).
@@ -900,18 +903,31 @@ class TimeTracking(commands.Cog):
                 already.add(hist[0]); via_history += 1
             else:
                 nomatch += 1
+        ambiguous = len(ambiguous_details)
         timecard_log.info(
             f"[Customer] {ctx.author} synccustomers: {linked} linked, {via_history} via rename-history, "
             f"{ambiguous} ambiguous, {nomatch} no-match."
         )
+        # Record each ambiguous customer + the partners it matched (so it's kept even
+        # if the reply below truncates a long list).
+        for local_name, matches in ambiguous_details:
+            timecard_log.info(f"[Customer]   ambiguous: '{local_name}' matches "
+                              + ", ".join(f"#{i} {nm}" for i, nm in matches))
+
         via = f", **{via_history}** by a previous (renamed) Odoo name" if via_history else ""
-        await ctx.followup.send(
-            f"Auto-link complete: **{linked}** linked by exact name{via}. "
-            f"**{ambiguous + nomatch}** still unlinked — **{ambiguous}** ambiguous "
-            f"(the name matches more than one Odoo partner, so it can't pick one) and "
-            f"**{nomatch}** no match. Link those with `/linkcustomer` (see `/unlinkedcustomers`).",
-            ephemeral=self._eph(ctx),
-        )
+        body = (f"Auto-link complete: **{linked}** linked by exact name{via}. "
+                f"**{ambiguous + nomatch}** still unlinked — **{ambiguous}** ambiguous "
+                f"(the name matches more than one Odoo partner, so it can't pick one) and "
+                f"**{nomatch}** no match. Link those with `/linkcustomer` (see `/unlinkedcustomers`).")
+        if ambiguous_details:
+            body += "\n\n__Ambiguous — each matched >1 Odoo partner:__"
+            for local_name, matches in ambiguous_details:
+                line = f"\n• **{local_name}** → " + ", ".join(f"#{i} {nm}" for i, nm in matches)
+                if len(body) + len(line) > 1900:  # Discord message cap; rest is in the log channel
+                    body += f"\n…and more — see the full list in the log channel."
+                    break
+                body += line
+        await ctx.followup.send(body, ephemeral=self._eph(ctx))
 
     @discord.slash_command(name="linkcustomer", description="Link a local customer to their Odoo partner.")
     @is_timecard_admin()
