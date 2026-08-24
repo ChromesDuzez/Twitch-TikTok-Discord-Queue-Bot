@@ -213,6 +213,8 @@ MANAGED_CHANNEL_KEYS = (
     "TIMECARD_LOG_ID",
     "TIMECARD_ADMIN_CHANNEL_ID",
     "TIMECARD_REPORTS_CHANNEL_ID",
+    "TIMECARD_CATEGORY_ID",           # active per-employee clock channels live here
+    "TIMECARD_DISABLED_CATEGORY_ID",  # archived employees' channels move here
 )
 
 

@@ -47,7 +47,7 @@ _MANAGEMENT_COMMANDS = {
     "viewtimecard",
     "synccustomers", "linkcustomer", "unlinkcustomer", "unlinkedcustomers",
     "addcustomer", "editcustomer", "mergecustomers", "archivecustomer", "unarchivecustomer",
-    "deletecustomer", "purgeimportedcontacts", "configureprojects", "configureroles",
+    "deletecustomer", "purgeimportedcontacts", "configureprojects", "configureroles", "configurecategories",
     "addemployee", "linkemployee", "unlinkemployee", "archiveemployee", "unarchiveemployee",
     "createclock", "deleteclock",
 }
@@ -322,17 +322,67 @@ class TimeTracking(commands.Cog):
             return False
         who = f"{row['name']} (employee {employee_id})"
         if archived:
+            # Remove the clock message, move their channel to the Disabled category
+            # (keep the channel id so reactivation can move it back), keep history.
             if row["clockMessageId"]:
                 await self._delete_clock_message(row["clockChannelId"], row["clockMessageId"])
+            moved = await self._move_clock_channel(employee_id, row["clockChannelId"], "TIMECARD_DISABLED_CATEGORY_ID")
             await db.execute(
-                "UPDATE employee SET archived = 1, clockChannelId = NULL, clockMessageId = NULL WHERE id = ?",
-                (employee_id,),
-            )
-            timecard_log.info(f"[Employee] Archived {who}; clock removed, history kept.")
+                "UPDATE employee SET archived = 1, clockMessageId = NULL WHERE id = ?", (employee_id,))
+            timecard_log.info(
+                f"[Employee] Archived {who}; clock removed{' + channel moved to Disabled' if moved else ''}, history kept.")
         else:
             await db.execute("UPDATE employee SET archived = 0 WHERE id = ?", (employee_id,))
-            timecard_log.info(f"[Employee] Reactivated {who}; recreate their clock with /createclock.")
+            # Move the channel back to the Timecards category and rebuild the clock in it.
+            await self._move_clock_channel(employee_id, row["clockChannelId"], "TIMECARD_CATEGORY_ID")
+            rebuilt = await self._rebuild_clock_channel(employee_id, row["clockChannelId"])
+            timecard_log.info(
+                f"[Employee] Reactivated {who}; "
+                f"{'channel moved back + clock rebuilt' if rebuilt else 'recreate their clock with /createclock'}.")
         return True
+
+    def _category_from_env(self, key: str):
+        """The configured category channel for a TIMECARD_*_CATEGORY_ID key, or None."""
+        cid = os.getenv(key)
+        return self.bot.get_channel(int(cid)) if cid and cid.isdigit() else None
+
+    async def _move_clock_channel(self, employee_id: int, channel_id, category_key: str) -> bool:
+        """Move an employee's **dedicated** clock channel into a configured category.
+        No-op (returns False) when the channel is shared with another employee, is
+        missing, or the target category isn't configured."""
+        if not channel_id:
+            return False
+        shared = await self.db.fetchone(
+            "SELECT 1 FROM employee WHERE clockChannelId = ? AND id != ? LIMIT 1", (channel_id, employee_id))
+        if shared:
+            log.debug("[Employee] Clock channel %s is shared; not moving it.", channel_id)
+            return False
+        category = self._category_from_env(category_key)
+        channel = self.bot.get_channel(int(channel_id)) if category is not None else None
+        if channel is None:
+            return False
+        try:
+            await channel.edit(category=category)
+            log.info("[Employee] Moved #%s to '%s'.", channel.name, category.name)
+            return True
+        except Exception as e:  # noqa: BLE001
+            log.warning("[Employee] Couldn't move clock channel %s: %s", channel_id, e)
+            return False
+
+    async def _rebuild_clock_channel(self, employee_id: int, channel_id) -> bool:
+        """Rebuild an employee's clock message in their existing channel (used on
+        reactivation). Returns False if the channel is gone."""
+        if not channel_id:
+            return False
+        channel = self.bot.get_channel(int(channel_id))
+        if channel is None:
+            return False
+        try:
+            await self.make_clock(employee_id, channel)
+            return True
+        except Exception as e:  # noqa: BLE001
+            log.warning("[Employee] Couldn't rebuild clock for employee %s: %s", employee_id, e)
+            return False
 
     @commands.Cog.listener()
     async def on_ready(self):
@@ -879,7 +929,8 @@ class TimeTracking(commands.Cog):
         await self.set_employee_archived(emp_id, False)
         timecard_log.info(f"[Employee] {ctx.author} reactivated {row['name']} (employee {emp_id}).")
         await ctx.respond(
-            f"Reactivated **{row['name']}** (<@{emp_id}>). Rebuild their clock with `/createclock`.",
+            f"Reactivated **{row['name']}** (<@{emp_id}>). Their channel is moved back to Timecards and "
+            f"the clock rebuilt (or run `/createclock` if the channel was removed).",
             ephemeral=self._eph(ctx),
         )
 
@@ -1377,6 +1428,30 @@ class TimeTracking(commands.Cog):
         cfg = self._role_config_text(ctx.guild)
         header = ("Updated: " + "; ".join(changed) + ".\n\n") if changed else "Current timecard role configuration:\n\n"
         await ctx.respond(header + cfg, ephemeral=self._eph(ctx))
+
+    @discord.slash_command(name="configurecategories", description="Set the Timecards + Disabled Timecards categories (archived clocks move to Disabled).")
+    @is_timecard_admin()
+    async def configurecategories(
+        self, ctx: discord.ApplicationContext,
+        timecards: discord.Option(discord.CategoryChannel, default=None, description="Category for active per-employee clock channels"),  # type: ignore
+        disabled: discord.Option(discord.CategoryChannel, default=None, description="Category archived clocks move into"),  # type: ignore
+    ):
+        await self._ensure_db()
+        changed = []
+        for cat, key, label in ((timecards, "TIMECARD_CATEGORY_ID", "Timecards"),
+                                (disabled, "TIMECARD_DISABLED_CATEGORY_ID", "Disabled Timecards")):
+            if cat is None:
+                continue
+            config.persist_channel_id(key, cat.id)  # TESTING_* in test mode, base key in prod
+            changed.append(f"{label} → {cat.name}")
+        if changed:
+            timecard_log.info(f"[Config] {ctx.author} set timecard categories: {', '.join(changed)}.")
+        lines = []
+        for label, key in (("Timecards", "TIMECARD_CATEGORY_ID"), ("Disabled Timecards", "TIMECARD_DISABLED_CATEGORY_ID")):
+            cat = self._category_from_env(key)
+            lines.append(f"• **{label}**: {cat.name if cat else '_not set_'}")
+        header = ("Updated: " + "; ".join(changed) + ".\n\n") if changed else "Current timecard categories:\n\n"
+        await ctx.respond(header + "\n".join(lines), ephemeral=self._eph(ctx))
 
     # ---- punch management (after-the-fact fixes, no DB browser needed) ------
 

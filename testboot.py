@@ -40,7 +40,9 @@ _SANITIZE_SQL = (
     "DELETE FROM odoo_inbox",
 )
 
-_CATEGORY_KEY = "TESTING_TIMECARD_CATEGORY_ID"
+# Base key for the active timecards category; in test mode TESTING_TIMECARD_CATEGORY_ID
+# is overlaid onto it at startup, and persist_channel_id writes back to TESTING_*.
+_CATEGORY_KEY = "TIMECARD_CATEGORY_ID"
 _CATEGORY_NAME = "timecards"
 
 
@@ -161,11 +163,7 @@ async def _resolve_category(guild):
     category = guild.get_channel(int(cid)) if cid and cid.isdigit() else None
     if category is None:
         category = await guild.create_category(_CATEGORY_NAME)
-        os.environ[_CATEGORY_KEY] = str(category.id)
-        try:
-            config.set_env(_CATEGORY_KEY, str(category.id))
-        except Exception as e:  # noqa: BLE001 - persistence is best-effort
-            log.warning("[Setup] Couldn't persist %s (%s); category id kept for this session.", _CATEGORY_KEY, e)
+        config.persist_channel_id(_CATEGORY_KEY, category.id)  # TESTING_* in test, base key in prod
         log.warning("[Setup] Created the '%s' category (%s).", _CATEGORY_NAME, category.id)
     return category
 
