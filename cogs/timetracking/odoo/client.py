@@ -145,14 +145,19 @@ class OdooClient:
         """Delete a record in Odoo by id."""
         return await self.call(f"/{model}/unlink", {"ids": [odoo_id]})
 
-    async def read_record(self, model: str, odoo_id: int, fields: list):
+    async def read_record(self, model: str, odoo_id: int, fields: list, include_archived: bool = False):
         """Fetch a single record's fields by id (used by inbound reconcile).
 
         Returns the record dict, or None if it no longer exists (e.g. deleted).
-        """
+        Set ``include_archived`` for models with an ``active`` field so the read
+        finds a record that was just **archived** in Odoo (a plain search_read hides
+        archived rows via Odoo's active_test — that's why an archive never synced)."""
+        domain = [["id", "=", odoo_id]]
+        if include_archived:
+            domain.append(["active", "in", [True, False]])
         data = await self.call(
             f"/{model}/search_read",
-            {"domain": [["id", "=", odoo_id]], "fields": fields, "limit": 1},
+            {"domain": domain, "fields": fields, "limit": 1},
         )
         return data[0] if data else None
 

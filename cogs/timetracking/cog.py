@@ -806,7 +806,7 @@ class TimeTracking(commands.Cog):
         # their history but hides them from active lists and removes their clock.
         note = ""
         try:
-            rec = await self.client.read_record("hr.employee", odoo_employee, ["active"])
+            rec = await self.client.read_record("hr.employee", odoo_employee, ["active"], include_archived=True)
             if rec is not None and not rec.get("active", True):
                 if await self.set_employee_archived(emp_id, True):
                     note = " They're archived in Odoo, so I archived them here too (history kept, hidden from active lists)."
@@ -821,6 +821,14 @@ class TimeTracking(commands.Cog):
         user: discord.Option(str, description="The employee to archive", autocomplete=employee_autocomplete),  # type: ignore
     ):
         db = await self._ensure_db()
+        # When Odoo is the source of truth for employees, archive there (it syncs
+        # here via the hr.employee webhook) rather than diverging the two.
+        if self.client.loaded:
+            await ctx.respond(
+                "Odoo is configured, so employees are archived **in Odoo** — archive them there and "
+                "it syncs here automatically (make sure they're linked with `/linkemployee`).",
+                ephemeral=self._eph(ctx))
+            return
         await ctx.defer(ephemeral=self._eph(ctx))  # removing the clock message is a Discord call
         try:
             emp_id = int(user[2:-1])
@@ -849,6 +857,12 @@ class TimeTracking(commands.Cog):
         user: discord.Option(str, description="The archived employee to reactivate", autocomplete=archived_employee_autocomplete),  # type: ignore
     ):
         db = await self._ensure_db()
+        if self.client.loaded:
+            await ctx.respond(
+                "Odoo is configured, so employees are reactivated **in Odoo** (unarchive them there and "
+                "it syncs here). Then rebuild their clock with `/createclock`.",
+                ephemeral=self._eph(ctx))
+            return
         try:
             emp_id = int(user[2:-1])
         except (ValueError, IndexError):

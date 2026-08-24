@@ -220,7 +220,8 @@ class InboxWorker:
 
     async def _reconcile_partner(self, odoo_id: int) -> bool:
         rec = await self.client.read_record(
-            "res.partner", odoo_id, ["id", "display_name", "active", "customer_rank", "employee"]
+            "res.partner", odoo_id, ["id", "display_name", "active", "customer_rank", "employee"],
+            include_archived=True,  # so an archived-in-Odoo partner is still found
         )
         if rec is None:
             return False  # deleted in Odoo; the /delete webhook handles removal
@@ -283,7 +284,9 @@ class InboxWorker:
         """
         fmap = _employee_field_map()
         fields = list(dict.fromkeys(["id", "active", "name", *fmap.values()]))
-        rec = await self.client.read_record("hr.employee", odoo_id, fields)
+        # include_archived so an employee ARCHIVED in Odoo is still found (a plain
+        # read hides archived rows -> the archive would never sync here).
+        rec = await self.client.read_record("hr.employee", odoo_id, fields, include_archived=True)
         if rec is None:
             return False  # deleted in Odoo; employees are archived, not deleted
         emp = await self.db.fetchone(
