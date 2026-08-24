@@ -315,11 +315,12 @@ class TimeTracking(commands.Cog):
         """
         db = await self._ensure_db()
         row = await db.fetchone(
-            "SELECT archived, clockChannelId, clockMessageId FROM employee WHERE id = ?",
+            "SELECT name, archived, clockChannelId, clockMessageId FROM employee WHERE id = ?",
             (employee_id,),
         )
         if row is None or bool(row["archived"]) == archived:
             return False
+        who = f"{row['name']} (employee {employee_id})"
         if archived:
             if row["clockMessageId"]:
                 await self._delete_clock_message(row["clockChannelId"], row["clockMessageId"])
@@ -327,10 +328,10 @@ class TimeTracking(commands.Cog):
                 "UPDATE employee SET archived = 1, clockChannelId = NULL, clockMessageId = NULL WHERE id = ?",
                 (employee_id,),
             )
-            timecard_log.info(f"[Employee] Archived employee {employee_id}; clock removed, history kept.")
+            timecard_log.info(f"[Employee] Archived {who}; clock removed, history kept.")
         else:
             await db.execute("UPDATE employee SET archived = 0 WHERE id = ?", (employee_id,))
-            timecard_log.info(f"[Employee] Reactivated employee {employee_id}; recreate their clock with /createclock.")
+            timecard_log.info(f"[Employee] Reactivated {who}; recreate their clock with /createclock.")
         return True
 
     @commands.Cog.listener()
@@ -843,7 +844,7 @@ class TimeTracking(commands.Cog):
             await ctx.respond(f"{row['name']} (<@{emp_id}>) is already archived.", ephemeral=self._eph(ctx))
             return
         await self.set_employee_archived(emp_id, True)
-        timecard_log.info(f"[Employee] {ctx.author} archived employee {emp_id}.")
+        timecard_log.info(f"[Employee] {ctx.author} archived {row['name']} (employee {emp_id}).")
         await ctx.respond(
             f"Archived **{row['name']}** (<@{emp_id}>): clock removed, history kept, and they're "
             f"hidden from active lists. Reactivate with `/unarchiveemployee`.",
@@ -876,7 +877,7 @@ class TimeTracking(commands.Cog):
             await ctx.respond(f"{row['name']} (<@{emp_id}>) isn't archived.", ephemeral=self._eph(ctx))
             return
         await self.set_employee_archived(emp_id, False)
-        timecard_log.info(f"[Employee] {ctx.author} reactivated employee {emp_id}.")
+        timecard_log.info(f"[Employee] {ctx.author} reactivated {row['name']} (employee {emp_id}).")
         await ctx.respond(
             f"Reactivated **{row['name']}** (<@{emp_id}>). Rebuild their clock with `/createclock`.",
             ephemeral=self._eph(ctx),

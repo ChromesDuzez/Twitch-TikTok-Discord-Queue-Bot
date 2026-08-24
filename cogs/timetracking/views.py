@@ -477,8 +477,12 @@ class EndWorkButton(discord.ui.Button):
         # Enqueue the Odoo timesheet now that the final hours are known.
         await sync.enqueue(view.db, "worktime", worktime_id, "create")
         await render_clock(view.cog, view.message, view.employee_id)
+        crow = await view.db.fetchone(
+            "SELECT c.name FROM work_time wt LEFT JOIN customer c ON wt.customerID = c.id WHERE wt.id = ?",
+            (worktime_id,))
+        cust = f" for {crow['name']}" if crow and crow["name"] else ""
         timecard_log.info(
-            f"[Work] {interaction.user} ended {self.punch_type} worktime {worktime_id} ({hours}h)."
+            f"[Work] {interaction.user} ended {self.punch_type} worktime {worktime_id} ({hours}h){cust}."
         )
         text = f"You completed your work at the jobsite in {hours} hour(s)."
         if already_deferred:

@@ -72,6 +72,37 @@ def _employee_field_map() -> dict:
     }
 
 
+async def _local_descriptor(db: Database, model: str, odoo_id: int) -> str:
+    """A human name for the LOCAL record an Odoo webhook refers to (best-effort, by
+    odooId), so log lines read 'account.analytic.line:15793 (Brad Larson · Acme
+    Pools)' instead of a bare id. Empty when there's no local match yet."""
+    try:
+        if model == "hr.employee":
+            r = await db.fetchone("SELECT name FROM employee WHERE odooId = ?", (odoo_id,))
+            return r["name"] if r else ""
+        if model == "res.partner":
+            r = await db.fetchone("SELECT name FROM customer WHERE odooId = ?", (odoo_id,))
+            return r["name"] if r else ""
+        if model == "hr.attendance":
+            r = await db.fetchone(
+                "SELECT e.name FROM punch_clock pc JOIN employee e ON pc.employeeID = e.id WHERE pc.odooId = ?",
+                (odoo_id,))
+            return r["name"] if r else ""
+        if model == "account.analytic.line":
+            r = await db.fetchone(
+                "SELECT e.name AS ename, c.name AS cname FROM work_time wt "
+                "JOIN punch_clock pc ON wt.punchID = pc.id JOIN employee e ON pc.employeeID = e.id "
+                "LEFT JOIN customer c ON wt.customerID = c.id WHERE wt.odooId = ?", (odoo_id,))
+            return (f"{r['ename']}" + (f" · {r['cname']}" if r["cname"] else "")) if r else ""
+    except Exception:  # noqa: BLE001 - a logging aid must never break the reconcile
+        return ""
+    return ""
+
+
+def _desc_suffix(desc: str) -> str:
+    return f" ({desc})" if desc else ""
+
+
 async def enqueue_inbound(db: Database, model: str, odoo_id: int,
                           action: str | None = None, write_uid: int | None = None):
     """Queue an inbound change. De-dupes against any pending row for the same
@@ -88,7 +119,8 @@ async def enqueue_inbound(db: Database, model: str, odoo_id: int,
         "VALUES (?, ?, ?, ?, 'pending', ?)",
         (model, odoo_id, action, write_uid, sync.now_local_str()),
     )
-    log.info(f"[Inbox] Queued {action or 'update'} for {model}:{odoo_id}")
+    log.info(f"[Inbox] Queued {action or 'update'} for {model}:{odoo_id}"
+             f"{_desc_suffix(await _local_descriptor(db, model, odoo_id))}")
 
 
 async def enqueue_inbound_delete(db: Database, model: str, odoo_id: int):
@@ -105,7 +137,8 @@ async def enqueue_inbound_delete(db: Database, model: str, odoo_id: int):
         "VALUES (?, ?, 'delete', 'pending', ?)",
         (model, odoo_id, sync.now_local_str()),
     )
-    log.info(f"[Inbox] Queued DELETE for {model}:{odoo_id}")
+    log.info(f"[Inbox] Queued DELETE for {model}:{odoo_id}"
+             f"{_desc_suffix(await _local_descriptor(db, model, odoo_id))}")
 
 
 class InboxWorker:
@@ -160,7 +193,9 @@ class InboxWorker:
                 return  # dependency not ready yet; leave pending, try next pass
             await self.db.execute("UPDATE odoo_inbox SET status = 'done' WHERE id = ?", (row["id"],))
             if result:
-                log.info(f"[Inbox] {row['action'] or 'update'} {row['model']}:{row['odoo_id']} applied.")
+                desc = await _local_descriptor(self.db, row["model"], row["odoo_id"])
+                log.info(f"[Inbox] {row['action'] or 'update'} {row['model']}:{row['odoo_id']}"
+                         f"{_desc_suffix(desc)} applied.")
             else:
                 log.debug(f"[Inbox] {row['model']}:{row['odoo_id']} no-op.")
         except Exception as e:  # noqa: BLE001
