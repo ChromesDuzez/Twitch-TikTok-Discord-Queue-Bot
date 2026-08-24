@@ -115,16 +115,9 @@ async def _prepare_sanitized_copy(src: str) -> tuple[str, list[int], int, int]:
     return tmp, active, emps, punches
 
 
-async def pull_prod_into_test(tt) -> tuple[list[int], int, int]:
-    """Copy + sanitize the prod db and swap it in as the test db. Returns
-    (active_employee_ids, employee_count, punch_count). Raises if no prod db."""
+async def _swap_in_test_db(tt, tmp: str) -> None:
+    """Close the test db, replace its file (+ sidecars) with ``tmp``, reopen."""
     base = os.getcwd()
-    src = prod_db_file(base)
-    if not src or not os.path.exists(src):
-        raise FileNotFoundError("No production database file found to copy from.")
-
-    tmp, active, emps, punches = await _prepare_sanitized_copy(src)
-
     target = os.path.join(db_dir(base), db_filename(TARGET_VERSION, "timetracker.test"))
     await tt.close_db()
     os.makedirs(db_dir(base), exist_ok=True)
@@ -136,9 +129,28 @@ async def pull_prod_into_test(tt) -> tuple[list[int], int, int]:
         if os.path.exists(tmp + suffix):
             shutil.move(tmp + suffix, target + suffix)
     await tt._ensure_db()
-    log.warning("[Setup] Pulled prod into the test db: %d employees, %d punches (%d active).",
+
+
+async def import_source_into_test(tt, src: str) -> tuple[list[int], int, int]:
+    """Sanitize any db file at ``src`` and swap it in as the test db. Returns
+    (active_employee_ids, employee_count, punch_count). Shared by the prod pull
+    and /testimport (uploaded snapshot)."""
+    if not src or not os.path.exists(src):
+        raise FileNotFoundError("No source database file found to import.")
+    tmp, active, emps, punches = await _prepare_sanitized_copy(src)
+    await _swap_in_test_db(tt, tmp)
+    log.warning("[Setup] Imported into the test db: %d employees, %d punches (%d active).",
                 emps, punches, len(active))
     return active, emps, punches
+
+
+async def pull_prod_into_test(tt) -> tuple[list[int], int, int]:
+    """Copy + sanitize the prod db and swap it in as the test db. Raises if no
+    prod db is present."""
+    src = prod_db_file(os.getcwd())
+    if not src or not os.path.exists(src):
+        raise FileNotFoundError("No production database file found to copy from.")
+    return await import_source_into_test(tt, src)
 
 
 # ---- build the category + per-employee clocks ------------------------------
@@ -157,20 +169,25 @@ async def _resolve_category(guild):
     return category
 
 
-async def build_employee_clocks(tt, guild, active_ids) -> tuple[int, list[str]]:
+async def build_employee_clocks(tt, guild, employee_ids, skip_existing: bool = True) -> tuple[int, list[str]]:
     """Create/reuse the ``timecards`` category and build one clock channel per
-    active employee. Returns (made, skipped_names)."""
+    employee in ``employee_ids``. When ``skip_existing`` is set, employees who
+    already have a clock pointer are left alone (so it's safe to re-run). Returns
+    (made, skipped_names)."""
     db = await tt._ensure_db()
-    if not active_ids:
+    if not employee_ids:
         return 0, []
     category = await _resolve_category(guild)
-    placeholders = ",".join("?" for _ in active_ids)
+    placeholders = ",".join("?" for _ in employee_ids)
     rows = await db.fetchall(
-        f"SELECT id, name FROM employee WHERE id IN ({placeholders}) ORDER BY name",
-        tuple(active_ids))
-    names = channel_names([(r["id"], r["name"]) for r in rows])
+        f"SELECT id, name, clockChannelId, clockMessageId FROM employee "
+        f"WHERE id IN ({placeholders}) ORDER BY name",
+        tuple(employee_ids))
+    todo = [r for r in rows
+            if not (skip_existing and r["clockChannelId"] and r["clockMessageId"])]
+    names = channel_names([(r["id"], r["name"]) for r in todo])
     made, skipped = 0, []
-    for r in rows:
+    for r in todo:
         try:
             ch = await guild.create_text_channel(names[r["id"]], category=category)
             await tt.make_clock(r["id"], ch)

@@ -20,6 +20,9 @@ mode, the base key in prod) so the rest of the bot reads them normally.
 
 from __future__ import annotations
 
+import asyncio
+import sys
+
 import config
 from botlog import log
 
@@ -50,11 +53,31 @@ async def _find_channel(guild, base: str, name: str):
     if len(matches) == 1:
         return matches[0]
     if len(matches) > 1:
-        # Phase 2 will prompt to disambiguate; for now use the first, loudly.
-        log.warning("[Setup] %d channels named #%s; using the first (id %s). "
-                    "Set %s explicitly to choose.", len(matches), name, matches[0].id, base)
-        return matches[0]
+        return await _disambiguate(base, name, matches)
     return None
+
+
+async def _disambiguate(base: str, name: str, matches):
+    """Ask (console, TTY only) which channel to use when several share a name.
+    Runs the blocking input() in an executor so the event loop keeps ticking, and
+    falls back to the first match when there's no interactive console."""
+    if not sys.stdin.isatty():
+        log.warning("[Setup] %d channels named #%s and no console to pick; using the first "
+                    "(id %s). Set %s to choose.", len(matches), name, matches[0].id, base)
+        return matches[0]
+    listing = "\n".join(f"  [{i + 1}] #{c.name} (id {c.id})" for i, c in enumerate(matches))
+    prompt = (f"[Setup] Multiple channels named #{name}:\n{listing}\n"
+              f"Which one should the bot use? [1-{len(matches)}]: ")
+    try:
+        ans = await asyncio.get_event_loop().run_in_executor(None, input, prompt)
+        idx = int(ans.strip()) - 1
+        if 0 <= idx < len(matches):
+            log.info("[Setup] Using #%s id %s for the duplicate name.", name, matches[idx].id)
+            return matches[idx]
+        log.warning("[Setup] Choice out of range; using the first #%s.", name)
+    except Exception as e:  # noqa: BLE001
+        log.warning("[Setup] Couldn't read a choice (%s); using the first #%s.", e, name)
+    return matches[0]
 
 
 async def resolve_channels(guild) -> bool:
