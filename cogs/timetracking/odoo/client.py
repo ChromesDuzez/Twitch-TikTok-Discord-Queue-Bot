@@ -247,13 +247,24 @@ class OdooClient:
         return data[0] if data else None
 
     async def get_employee_list(self):
-        # Include archived (active=False) employees too so a terminated Odoo
-        # employee can still be linked; an explicit `active` clause disables Odoo's
-        # default active-only filter. `active` is returned so the picker can label them.
-        return await self.call(
-            "/hr.employee/search_read",
-            {"domain": [["active", "in", [True, False]]], "fields": ["id", "display_name", "active"], "order": "id asc"},
-        )
+        # Include archived (active=False) employees too so a terminated Odoo employee
+        # can still be linked, but order ACTIVE first (and cap the list) so current
+        # employees never get buried behind old/archived ones. Falls back to
+        # active-only if the archived query errors on this Odoo build.
+        try:
+            return await self.call(
+                "/hr.employee/search_read",
+                {"domain": [["active", "in", [True, False]]],
+                 "fields": ["id", "display_name", "active"],
+                 "order": "active desc, name asc", "limit": 1000},  # name is stored (display_name isn't)
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"[Odoo] employee list incl. archived failed ({e}); active only.")
+            return await self.call(
+                "/hr.employee/search_read",
+                {"domain": [["active", "=", True]],
+                 "fields": ["id", "display_name", "active"], "order": "name asc", "limit": 1000},
+            )
 
     # ---- attendance (clock in/out) ----------------------------------------
 
