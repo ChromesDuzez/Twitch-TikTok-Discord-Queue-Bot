@@ -466,9 +466,10 @@ class TimeTracking(commands.Cog):
                    if e["id"] not in linked and term in str(e.get("display_name") or "").lower()]
 
         def label(e):
-            nm = e.get("display_name") or f"Employee #{e['id']}"
-            return f"{nm} (archived)" if not e.get("active", True) else nm
-        return [_choice(label(e), e["id"], f"Employee #{e['id']}") for e in matches[:25]]
+            nm = e.get("display_name") or "Employee"
+            arch = " · archived" if not e.get("active", True) else ""
+            return f"{nm} (Odoo #{e['id']}{arch})"  # id shown so same-named employees are distinguishable
+        return [_choice(label(e), str(e["id"]), f"Employee #{e['id']}") for e in matches[:25]]
 
     async def linked_employee_autocomplete(self, ctx: discord.AutocompleteContext):
         """Local employees currently linked to an Odoo employee (for /unlinkemployee).
@@ -516,7 +517,7 @@ class TimeTracking(commands.Cog):
             "AND (archived IS NULL OR archived = 0) ORDER BY name"
         )
         term = str(ctx.value or "").lower()
-        return [_choice(r["name"], r["id"])
+        return [_choice(f"{r['name']} (#{r['id']})", str(r["id"]))
                 for r in rows if term in str(r["name"] or "").lower()][:25]
 
     async def linked_customer_autocomplete(self, ctx: discord.AutocompleteContext):
@@ -527,7 +528,7 @@ class TimeTracking(commands.Cog):
             "SELECT id, name, odooId FROM customer WHERE odooId IS NOT NULL ORDER BY name"
         )
         term = str(ctx.value or "").lower()
-        return [_choice(f"{r['name']} (Odoo #{r['odooId']})", r["id"])
+        return [_choice(f"{r['name']} (#{r['id']} · Odoo #{r['odooId']})", str(r["id"]))
                 for r in rows if term in str(r["name"] or "").lower() or term in str(r["odooId"])][:25]
 
     async def odoo_customer_autocomplete(self, ctx: discord.AutocompleteContext):
@@ -548,7 +549,9 @@ class TimeTracking(commands.Cog):
         term = str(ctx.value or "").lower()
         matches = [c for c in self._odoo_customers
                    if c["id"] not in linked and term in str(c.get("display_name") or "").lower()]
-        return [_choice(c.get("display_name"), c["id"], f"Partner #{c['id']}") for c in matches[:25]]
+        # Show the Odoo id so same-named partners (two "Steve Long"s) are distinguishable.
+        return [_choice(f"{c.get('display_name') or 'Partner'} (Odoo #{c['id']})", str(c["id"]), f"Partner #{c['id']}")
+                for c in matches[:25]]
 
     async def employee_autocomplete(self, ctx: discord.AutocompleteContext):
         """All active employees (value = a mention, so it parses like a typed user)."""
@@ -736,10 +739,14 @@ class TimeTracking(commands.Cog):
     async def linkemployee(
         self, ctx: discord.ApplicationContext,
         user: discord.Option(str, description="The employee to link", autocomplete=unlinked_employee_autocomplete),  # type: ignore
-        odoo_employee: discord.Option(int, description="Odoo employee", autocomplete=odoo_employee_autocomplete),  # type: ignore
+        odoo_employee: discord.Option(str, description="Odoo employee", autocomplete=odoo_employee_autocomplete),  # type: ignore
     ):
         db = await self._ensure_db()
         await ctx.defer(ephemeral=self._eph(ctx))  # Odoo read + possible clock removal below
+        odoo_employee = _opt_int(odoo_employee)
+        if odoo_employee is None:
+            await ctx.respond("Pick an Odoo employee from the autocomplete list.", ephemeral=self._eph(ctx))
+            return
         try:
             emp_id = int(user[2:-1])
         except (ValueError, IndexError):
@@ -933,10 +940,14 @@ class TimeTracking(commands.Cog):
     @is_timecard_admin()
     async def linkcustomer(
         self, ctx: discord.ApplicationContext,
-        customer: discord.Option(int, description="Local customer", autocomplete=unlinked_customer_autocomplete),  # type: ignore
-        odoo_partner: discord.Option(int, description="Odoo customer", autocomplete=odoo_customer_autocomplete),  # type: ignore
+        customer: discord.Option(str, description="Local customer", autocomplete=unlinked_customer_autocomplete),  # type: ignore
+        odoo_partner: discord.Option(str, description="Odoo customer", autocomplete=odoo_customer_autocomplete),  # type: ignore
     ):
         db = await self._ensure_db()
+        customer, odoo_partner = _opt_int(customer), _opt_int(odoo_partner)
+        if customer is None or odoo_partner is None:
+            await ctx.respond("Pick both a local customer and an Odoo partner from the autocomplete lists.", ephemeral=self._eph(ctx))
+            return
         row = await db.fetchone("SELECT id, name FROM customer WHERE id = ?", (customer,))
         if row is None:
             await ctx.respond("That customer isn't in the database.", ephemeral=self._eph(ctx))
@@ -956,9 +967,13 @@ class TimeTracking(commands.Cog):
     @is_timecard_admin()
     async def unlinkcustomer(
         self, ctx: discord.ApplicationContext,
-        customer: discord.Option(int, description="Linked customer", autocomplete=linked_customer_autocomplete),  # type: ignore
+        customer: discord.Option(str, description="Linked customer", autocomplete=linked_customer_autocomplete),  # type: ignore
     ):
         db = await self._ensure_db()
+        customer = _opt_int(customer)
+        if customer is None:
+            await ctx.respond("Pick a customer from the autocomplete list.", ephemeral=self._eph(ctx))
+            return
         row = await db.fetchone("SELECT name, odooId FROM customer WHERE id = ?", (customer,))
         if row is None:
             await ctx.respond("That customer isn't in the database.", ephemeral=self._eph(ctx))
