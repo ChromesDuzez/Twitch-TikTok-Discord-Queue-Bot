@@ -123,16 +123,19 @@ async def on_ready():
         bot._bootstrap_posted = True
         bot._bootstrap_guild = _managed_guild()
         bot._test_decision = asyncio.get_event_loop().create_future()
+        bot._bootstrap_view = None
+        bot._bootstrap_message = None
         try:
             import testboot
             aid = os.getenv("TIMECARD_ADMIN_CHANNEL_ID")
             ch = bot.get_channel(int(aid)) if aid and aid.isdigit() else None
             if ch is not None:
-                await ch.send(
+                bot._bootstrap_view = testboot.TestBootstrapView(bot._test_decision)
+                bot._bootstrap_message = await ch.send(
                     "**No test database found.** Pull data from **production** (copy + "
                     "sanitize) or start from **scratch**? You can also answer y/n in the "
                     "console. No answer in 5 minutes → scratch.",
-                    view=testboot.TestBootstrapView(bot._test_decision))
+                    view=bot._bootstrap_view)
         except Exception:
             log.exception("[Setup] Could not post the test-bootstrap prompt.")
     log.info("[Bot] Hello! Chromes Py-Bot is ready!")
@@ -256,10 +259,31 @@ async def _run_test_bootstrap_if_needed(session):
     except Exception:
         log.exception("[Setup] Bootstrap prompt failed; starting from scratch.")
     bot._needs_test_bootstrap = False
+
+    # Resolve the Discord prompt message (remove buttons) — covers the console /
+    # timeout path, where no button was clicked to clean it up.
+    view = getattr(bot, "_bootstrap_view", None)
+    msg = getattr(bot, "_bootstrap_message", None)
+    if view is not None:
+        view.stop()
+    if msg is not None and not getattr(view, "answered", False):
+        try:
+            await msg.edit(content=("Test bootstrap: **pulling from production…**" if pull
+                                    else "Test bootstrap: **starting from scratch.**"), view=None)
+        except Exception:
+            log.warning("[Setup] Couldn't update the bootstrap prompt message.")
+
     try:
         await testboot.apply_decision(bot, pull, getattr(bot, "_bootstrap_guild", None))
+        summary = "pull complete — clocks built." if pull else "started from scratch (empty db)."
     except Exception:
         log.exception("[Setup] Test bootstrap execution failed.")
+        summary = "failed — see the logs."
+    if msg is not None:
+        try:
+            await msg.edit(content=f"Test bootstrap {summary}", view=None)
+        except Exception:
+            pass
 
 
 async def cli_input_loop():

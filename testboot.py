@@ -97,10 +97,11 @@ async def _prepare_sanitized_copy(src: str) -> tuple[str, list[int], int, int]:
     for suffix in ("", "-wal", "-shm", "-journal"):
         if os.path.exists(tmp + suffix):
             os.remove(tmp + suffix)
-    shutil.copy2(src, tmp)
+    # Copy off the event loop so a large db doesn't block heartbeats / interactions.
+    await asyncio.to_thread(shutil.copy2, src, tmp)
     for suffix in ("-wal", "-shm"):  # copy sidecars so no committed data is missed
         if os.path.exists(src + suffix):
-            shutil.copy2(src + suffix, tmp + suffix)
+            await asyncio.to_thread(shutil.copy2, src + suffix, tmp + suffix)
 
     sdb = await Database(tmp).setup()  # migrate the copy up to the current schema
     emps = (await sdb.fetchone("SELECT count(*) c FROM employee"))["c"]
@@ -124,10 +125,10 @@ async def _swap_in_test_db(tt, tmp: str) -> None:
     for suffix in ("", "-wal", "-shm", "-journal"):
         if os.path.exists(target + suffix):
             os.remove(target + suffix)
-    shutil.move(tmp, target)
+    await asyncio.to_thread(shutil.move, tmp, target)
     for suffix in ("-wal", "-shm"):
         if os.path.exists(tmp + suffix):
-            shutil.move(tmp + suffix, target + suffix)
+            await asyncio.to_thread(shutil.move, tmp + suffix, target + suffix)
     await tt._ensure_db()
 
 
@@ -234,19 +235,26 @@ class TestBootstrapView(discord.ui.View):
     def __init__(self, decision: asyncio.Future):
         super().__init__(timeout=300)
         self.decision = decision
+        self.answered = False  # True once a button resolved it (vs console/timeout)
 
     async def _choose(self, interaction: discord.Interaction, pull: bool):
         if not is_timecard_admin_member(interaction.user):
             await interaction.response.send_message("This isn't for you.", ephemeral=True)
             return
+        self.answered = True
+        self.stop()
+        # Acknowledge the interaction (remove the buttons) BEFORE resolving the
+        # decision — resolving kicks off the pull, whose file I/O would otherwise
+        # blow past the 3s interaction window and leave the buttons stuck.
+        try:
+            await interaction.response.edit_message(
+                content=("Test bootstrap: **pulling from production…**" if pull
+                         else "Test bootstrap: **starting from scratch.**"),
+                view=None)
+        except Exception:  # noqa: BLE001
+            pass
         if not self.decision.done():
             self.decision.set_result(pull)
-        self.disable_all_items()
-        await interaction.response.edit_message(
-            content=("Test bootstrap: **pulling from production…**" if pull
-                     else "Test bootstrap: **starting from scratch.**"),
-            view=self)
-        self.stop()
 
     @discord.ui.button(label="Pull from prod", style=discord.ButtonStyle.green)
     async def pull(self, button: discord.ui.Button, interaction: discord.Interaction):
