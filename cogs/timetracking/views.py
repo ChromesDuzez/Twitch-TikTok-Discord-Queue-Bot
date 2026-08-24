@@ -196,8 +196,10 @@ class ClockInButton(discord.ui.Button):
 
         await sync.enqueue(db, "punch", punch_id, "in")
         await render_clock(view.cog, view.message, view.employee_id)
+        erow = await db.fetchone("SELECT name FROM employee WHERE id = ?", (view.employee_id,))
+        ename = erow["name"] if erow else f"employee {view.employee_id}"
         timecard_log.info(
-            f"[Clock] {interaction.user} clocked IN employee {view.employee_id} "
+            f"[Clock] {interaction.user} clocked IN {ename} (employee {view.employee_id}) at {now_str} "
             f"(punch {punch_id}, auto-approved={approved})."
         )
         await interaction.followup.send("You clocked in.", ephemeral=True)
@@ -259,8 +261,10 @@ class ClockOutButton(discord.ui.Button):
 
         await sync.enqueue(db, "punch", punch_id, "out")
         await render_clock(view.cog, view.message, view.employee_id)
+        erow = await db.fetchone("SELECT name FROM employee WHERE id = ?", (view.employee_id,))
+        ename = erow["name"] if erow else f"employee {view.employee_id}"
         timecard_log.info(
-            f"[Clock] {interaction.user} clocked OUT employee {view.employee_id} "
+            f"[Clock] {interaction.user} clocked OUT {ename} (employee {view.employee_id}) at {now_str} "
             f"(punch {punch_id}, auto-approved={approved})."
         )
         await interaction.followup.send("You clocked out.", ephemeral=True)

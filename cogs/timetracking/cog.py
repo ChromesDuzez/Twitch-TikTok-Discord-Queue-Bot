@@ -1125,30 +1125,39 @@ class TimeTracking(commands.Cog):
             await ctx.respond("Pick a punch from the autocomplete list.", ephemeral=self._eph(ctx))
             return
         row = await db.fetchone(
-            "SELECT employeeID, punchInTime, punchOutTime FROM punch_clock WHERE id = ?", (punch,)
+            "SELECT employeeID, punchInTime, punchOutTime, punchInApproval, punchOutApproval "
+            "FROM punch_clock WHERE id = ?", (punch,)
         )
         if row is None:
             await ctx.respond("That punch doesn't exist.", ephemeral=self._eph(ctx))
             return
-        sets, params = [], []
+        sets, params, changes = [], [], []  # changes = human "field: old → new" for the log
         try:
             if clock_in is not None:
-                sets.append("punchInTime = ?"); params.append(_parse_punch_time(clock_in))
+                nv = _parse_punch_time(clock_in)
+                sets.append("punchInTime = ?"); params.append(nv)
+                changes.append(f"clock-in {row['punchInTime'] or '—'} → {nv}")
             if clock_out is not None:
-                sets.append("punchOutTime = ?"); params.append(_parse_punch_time(clock_out))
+                nv = _parse_punch_time(clock_out)
+                sets.append("punchOutTime = ?"); params.append(nv)
+                changes.append(f"clock-out {row['punchOutTime'] or 'open'} → {nv}")
         except ValueError as e:
             await ctx.respond(str(e), ephemeral=self._eph(ctx))
             return
         if approved is not None:
-            sets.append("punchInApproval = ?"); params.append(1 if approved else 0)
-            sets.append("punchOutApproval = ?"); params.append(1 if approved else 0)
+            v = 1 if approved else 0
+            sets += ["punchInApproval = ?", "punchOutApproval = ?"]; params += [v, v]
+            was = "approved" if (row["punchInApproval"] and row["punchOutApproval"]) else "pending"
+            changes.append(f"approval {was} → {'approved' if approved else 'unapproved'}")
         if not sets:
             await ctx.respond("Nothing to change — provide a new clock-in, clock-out, or approval.", ephemeral=self._eph(ctx))
             return
         await db.execute(f"UPDATE punch_clock SET {', '.join(sets)} WHERE id = ?", (*params, punch))
         await sync.enqueue(db, "punch", punch, "edit")
         await self._refresh_clock(row["employeeID"])
-        timecard_log.info(f"[Punch] {ctx.author} edited punch {punch} ({', '.join(sets)}).")
+        erow = await db.fetchone("SELECT name FROM employee WHERE id = ?", (row["employeeID"],))
+        ename = erow["name"] if erow else f"employee {row['employeeID']}"
+        timecard_log.info(f"[Punch] {ctx.author} edited punch {punch} for {ename}: {'; '.join(changes)}.")
         await ctx.respond(f"Updated punch #{punch}.", ephemeral=self._eph(ctx))
 
     @discord.slash_command(name="deletepunch", description="Delete a punch — review each linked worktime first.")
@@ -1341,24 +1350,32 @@ class TimeTracking(commands.Cog):
         if worktime is None:
             await ctx.respond("Pick a worktime from the autocomplete list.", ephemeral=self._eph(ctx))
             return
-        wt = await db.fetchone("SELECT punchID, odooId FROM work_time WHERE id = ?", (worktime,))
+        wt = await db.fetchone(
+            "SELECT punchID, odooId, punchType, timeSpent, customerID FROM work_time WHERE id = ?", (worktime,)
+        )
         if wt is None:
             await ctx.respond("That worktime doesn't exist.", ephemeral=self._eph(ctx))
             return
-        sets, params = [], []
+        sets, params, changes = [], [], []  # changes = human "field: old → new" for the log
         if worktype is not None:
             sets.append("punchType = ?"); params.append(worktype)
+            changes.append(f"type {wt['punchType']} → {worktype}")
         if hours is not None:
             try:
-                params.append(_hours_to_minutes(hours)); sets.append("timeSpent = ?")
+                mins = _hours_to_minutes(hours)
             except ValueError as e:
                 await ctx.respond(str(e), ephemeral=self._eph(ctx))
                 return
+            sets.append("timeSpent = ?"); params.append(mins)
+            changes.append(f"hours {(wt['timeSpent'] or 0) / 60:g}h → {hours:g}h")
         if customer is not None:
-            if await db.fetchone("SELECT 1 FROM customer WHERE id = ?", (customer,)) is None:
+            newc = await db.fetchone("SELECT name FROM customer WHERE id = ?", (customer,))
+            if newc is None:
                 await ctx.respond("That customer doesn't exist.", ephemeral=self._eph(ctx))
                 return
+            oldc = await db.fetchone("SELECT name FROM customer WHERE id = ?", (wt["customerID"],))
             sets.append("customerID = ?"); params.append(customer)
+            changes.append(f"customer {oldc['name'] if oldc else wt['customerID']} → {newc['name']}")
         if task is not None and self.client.loaded:
             try:
                 pid = await self.client.get_task_project(task)
@@ -1370,6 +1387,7 @@ class TimeTracking(commands.Cog):
                 return
             sets.append("odooTaskId = ?"); params.append(task)
             sets.append("odooProjectId = ?"); params.append(pid)
+            changes.append(f"Odoo task → {task}")
         if not sets:
             await ctx.respond("Nothing to change — provide a new type, hours, customer, or task.", ephemeral=self._eph(ctx))
             return
@@ -1377,10 +1395,13 @@ class TimeTracking(commands.Cog):
         push = self.client.loaded and (wt["odooId"] or task is not None)
         if push:
             await sync.enqueue(db, "worktime", worktime, "edit")
-        prow = await db.fetchone("SELECT employeeID FROM punch_clock WHERE id = ?", (wt["punchID"],))
+        prow = await db.fetchone(
+            "SELECT pc.employeeID, e.name FROM punch_clock pc JOIN employee e ON pc.employeeID = e.id "
+            "WHERE pc.id = ?", (wt["punchID"],))
         if prow:
             await self._refresh_clock(prow["employeeID"])
-        timecard_log.info(f"[Work] {ctx.author} edited worktime {worktime} ({', '.join(sets)}).")
+        ename = prow["name"] if prow else "?"
+        timecard_log.info(f"[Work] {ctx.author} edited worktime {worktime} for {ename}: {'; '.join(changes)}.")
         note = " — change queued to Odoo." if push else ""
         await ctx.respond(f"Updated worktime #{worktime}.{note}", ephemeral=self._eph(ctx))
 
