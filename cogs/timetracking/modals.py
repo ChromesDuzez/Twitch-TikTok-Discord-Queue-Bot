@@ -29,8 +29,7 @@ class Confirm(discord.ui.View):
             await interaction.response.send_message("This is not for you!", ephemeral=True)
             return
         self.value = True
-        self.stop()
-        await interaction.response.send_message("You clicked Yes!", ephemeral=True)
+        await self._acknowledge(interaction)
 
     @discord.ui.button(label="No", style=discord.ButtonStyle.red)
     async def cancel(self, button: discord.ui.Button, interaction: discord.Interaction):
@@ -38,8 +37,17 @@ class Confirm(discord.ui.View):
             await interaction.response.send_message("This is not for you!", ephemeral=True)
             return
         self.value = False
+        await self._acknowledge(interaction)
+
+    async def _acknowledge(self, interaction: discord.Interaction):
+        # Remove the buttons from the prompt (acknowledge the interaction) BEFORE
+        # stopping — so the waiting command's follow-up work can't blow past the 3s
+        # window and leave the buttons stuck. The command posts its own result next.
+        try:
+            await interaction.response.edit_message(view=None)
+        except Exception:  # noqa: BLE001
+            pass
         self.stop()
-        await interaction.response.send_message("You clicked No!", ephemeral=True)
 
 
 class GetTimeSpent(discord.ui.Modal):
