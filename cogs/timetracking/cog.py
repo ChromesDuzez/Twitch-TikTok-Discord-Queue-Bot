@@ -46,7 +46,7 @@ _MANAGEMENT_COMMANDS = {
     "addworktime", "editworktime", "deleteworktime", "reassignworktime",
     "viewtimecard",
     "synccustomers", "linkcustomer", "unlinkcustomer", "unlinkedcustomers",
-    "addcustomer", "editcustomer", "configureprojects", "configureroles",
+    "addcustomer", "editcustomer", "mergecustomers", "configureprojects", "configureroles",
     "addemployee", "linkemployee", "unlinkemployee", "archiveemployee", "unarchiveemployee",
     "createclock", "deleteclock",
 }
@@ -596,6 +596,24 @@ class TimeTracking(commands.Cog):
         return [_choice(r["name"], str(r["id"]))
                 for r in rows if term in str(r["name"] or "").lower()][:25]
 
+    async def merge_customer_autocomplete(self, ctx: discord.AutocompleteContext):
+        """Every customer with its local id, Odoo id, and archived state — so the two
+        same-named duplicates in a merge are distinguishable."""
+        if self.db is None:
+            return []
+        rows = await self.db.fetchall("SELECT id, name, odooId, archived FROM customer ORDER BY name")
+        term = str(ctx.value or "").lower()
+        out = []
+        for r in rows:
+            odoo = f" · Odoo #{r['odooId']}" if r["odooId"] else ""
+            arch = " · archived" if r["archived"] else ""
+            label = f"{r['name']} (#{r['id']}{odoo}{arch})"
+            if term in str(r["name"] or "").lower() or term in str(r["id"]):
+                out.append(_choice(label, str(r["id"])))
+            if len(out) >= 25:
+                break
+        return out
+
     async def worktime_autocomplete(self, ctx: discord.AutocompleteContext):
         """Recent worktime entries, shown as 'Name · Type Nh Customer (#id)'."""
         if self.db is None:
@@ -999,6 +1017,67 @@ class TimeTracking(commands.Cog):
         preview = "\n".join(f"• {n}" for n in names[:40])
         more = f"\n…and {len(names) - 40} more." if len(names) > 40 else ""
         await ctx.respond(f"**{len(names)}** unlinked customer(s):\n{preview}{more}\n\nLink them with /linkcustomer.", ephemeral=self._eph(ctx))
+
+    @discord.slash_command(name="mergecustomers", description="Merge two duplicate customers into one (moves worktime, keeps history).")
+    @is_timecard_admin()
+    async def mergecustomers(
+        self, ctx: discord.ApplicationContext,
+        keep: discord.Option(str, description="Customer to KEEP", autocomplete=merge_customer_autocomplete),  # type: ignore
+        remove: discord.Option(str, description="Customer to REMOVE (merged into keep)", autocomplete=merge_customer_autocomplete),  # type: ignore
+    ):
+        db = await self._ensure_db()
+        keep_id, remove_id = _opt_int(keep), _opt_int(remove)
+        if keep_id is None or remove_id is None:
+            await ctx.respond("Pick both customers from the autocomplete lists.", ephemeral=self._eph(ctx))
+            return
+        if keep_id == remove_id:
+            await ctx.respond("Those are the same customer — pick two different ones.", ephemeral=self._eph(ctx))
+            return
+        if remove_id == 0:
+            await ctx.respond("You can't remove the default/company customer.", ephemeral=self._eph(ctx))
+            return
+        krow = await db.fetchone("SELECT id, name, odooId FROM customer WHERE id = ?", (keep_id,))
+        rrow = await db.fetchone("SELECT id, name, odooId FROM customer WHERE id = ?", (remove_id,))
+        if krow is None or rrow is None:
+            await ctx.respond("One of those customers doesn't exist.", ephemeral=self._eph(ctx))
+            return
+
+        n = (await db.fetchone("SELECT count(*) c FROM work_time WHERE customerID = ?", (remove_id,)))["c"]
+        adopt_odoo = krow["odooId"] is None and rrow["odooId"] is not None
+        adopt_note = f"adopt its Odoo link (#{rrow['odooId']})" if adopt_odoo else "no extra fields to adopt"
+        confirm = Confirm(user=ctx.user, timeout=60)
+        await ctx.respond(
+            f"Merge **{rrow['name']}** (#{remove_id}"
+            f"{f' · Odoo #{rrow['odooId']}' if rrow['odooId'] else ''}) **into** "
+            f"**{krow['name']}** (#{keep_id}{f' · Odoo #{krow['odooId']}' if krow['odooId'] else ''})?\n"
+            f"• move **{n}** worktime entr{'y' if n == 1 else 'ies'} to #{keep_id}\n"
+            f"• {adopt_note}\n"
+            f"• then delete customer #{remove_id}.",
+            view=confirm, ephemeral=self._eph(ctx),
+        )
+        await confirm.wait()
+        if not confirm.value:
+            await ctx.followup.send("Cancelled — nothing was merged.", ephemeral=self._eph(ctx))
+            return
+
+        # Move worktime off the loser FIRST (work_time.customerID has a FK), adopt any
+        # missing field, cancel its pending Odoo push, then delete it.
+        await db.execute("UPDATE work_time SET customerID = ? WHERE customerID = ?", (keep_id, remove_id))
+        if adopt_odoo:
+            await db.execute("UPDATE customer SET odooId = ? WHERE id = ?", (rrow["odooId"], keep_id))
+        await db.execute(
+            "UPDATE odoo_outbox SET status = 'skipped' WHERE status = 'pending' "
+            "AND entity_type = 'customer' AND entity_id = ?", (remove_id,))
+        await db.execute("DELETE FROM customer WHERE id = ?", (remove_id,))
+        timecard_log.info(
+            f"[Customer] {ctx.author} merged customer {remove_id} ('{rrow['name']}') into "
+            f"{keep_id} ('{krow['name']}'): {n} worktime moved"
+            f"{f', adopted Odoo #{rrow['odooId']}' if adopt_odoo else ''}.")
+        await ctx.followup.send(
+            f"Merged **{rrow['name']}** into **{krow['name']}** (#{keep_id}): moved **{n}** worktime "
+            f"entr{'y' if n == 1 else 'ies'}{f' and adopted the Odoo link #{rrow['odooId']}' if adopt_odoo else ''}.",
+            ephemeral=self._eph(ctx),
+        )
 
     # ---- Odoo project configuration ----------------------------------------
 
