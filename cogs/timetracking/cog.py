@@ -47,7 +47,7 @@ _MANAGEMENT_COMMANDS = {
     "viewtimecard",
     "synccustomers", "linkcustomer", "unlinkcustomer", "unlinkedcustomers",
     "addcustomer", "editcustomer", "configureprojects", "configureroles",
-    "addemployee", "linkemployee", "unlinkemployee",
+    "addemployee", "linkemployee", "unlinkemployee", "archiveemployee", "unarchiveemployee",
     "createclock", "deleteclock",
 }
 
@@ -464,7 +464,11 @@ class TimeTracking(commands.Cog):
         term = str(ctx.value or "").lower()
         matches = [e for e in self._odoo_employees
                    if e["id"] not in linked and term in str(e.get("display_name") or "").lower()]
-        return [_choice(e.get("display_name"), e["id"], f"Employee #{e['id']}") for e in matches[:25]]
+
+        def label(e):
+            nm = e.get("display_name") or f"Employee #{e['id']}"
+            return f"{nm} (archived)" if not e.get("active", True) else nm
+        return [_choice(label(e), e["id"], f"Employee #{e['id']}") for e in matches[:25]]
 
     async def linked_employee_autocomplete(self, ctx: discord.AutocompleteContext):
         """Local employees currently linked to an Odoo employee (for /unlinkemployee).
@@ -493,6 +497,15 @@ class TimeTracking(commands.Cog):
         out = [_choice(r["name"], f"<@{r['id']}>")
                for r in rows if term in str(r["name"] or "").lower()]
         return out[:25]
+
+    async def archived_employee_autocomplete(self, ctx: discord.AutocompleteContext):
+        """Local employees currently archived (for /unarchiveemployee)."""
+        if self.db is None:
+            return []
+        rows = await self.db.fetchall("SELECT id, name FROM employee WHERE archived = 1 ORDER BY name")
+        term = str(ctx.value or "").lower()
+        return [_choice(r["name"], f"<@{r['id']}>")
+                for r in rows if term in str(r["name"] or "").lower()][:25]
 
     async def unlinked_customer_autocomplete(self, ctx: discord.AutocompleteContext):
         """Local customers not yet linked to an Odoo partner (value = local id)."""
@@ -726,6 +739,7 @@ class TimeTracking(commands.Cog):
         odoo_employee: discord.Option(int, description="Odoo employee", autocomplete=odoo_employee_autocomplete),  # type: ignore
     ):
         db = await self._ensure_db()
+        await ctx.defer(ephemeral=self._eph(ctx))  # Odoo read + possible clock removal below
         try:
             emp_id = int(user[2:-1])
         except (ValueError, IndexError):
@@ -747,7 +761,71 @@ class TimeTracking(commands.Cog):
             return
         await db.execute("UPDATE employee SET odooId = ? WHERE id = ?", (odoo_employee, emp_id))
         timecard_log.info(f"[Employee] {ctx.author} linked employee {emp_id} to Odoo employee {odoo_employee}.")
-        await ctx.respond(f"Linked {row['name']} (<@{emp_id}>) to Odoo employee {odoo_employee}.", ephemeral=self._eph(ctx))
+        # If the Odoo employee is archived (terminated), archive them here too — keeps
+        # their history but hides them from active lists and removes their clock.
+        note = ""
+        try:
+            rec = await self.client.read_record("hr.employee", odoo_employee, ["active"])
+            if rec is not None and not rec.get("active", True):
+                if await self.set_employee_archived(emp_id, True):
+                    note = " They're archived in Odoo, so I archived them here too (history kept, hidden from active lists)."
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"[Employee] Couldn't check Odoo archive state for {odoo_employee}: {e}")
+        await ctx.respond(f"Linked {row['name']} (<@{emp_id}>) to Odoo employee {odoo_employee}.{note}", ephemeral=self._eph(ctx))
+
+    @discord.slash_command(name="archiveemployee", description="Archive an employee: hide from active lists + remove their clock, keep history.")
+    @is_timecard_admin()
+    async def archiveemployee(
+        self, ctx: discord.ApplicationContext,
+        user: discord.Option(str, description="The employee to archive", autocomplete=employee_autocomplete),  # type: ignore
+    ):
+        db = await self._ensure_db()
+        await ctx.defer(ephemeral=self._eph(ctx))  # removing the clock message is a Discord call
+        try:
+            emp_id = int(user[2:-1])
+        except (ValueError, IndexError):
+            await ctx.respond(f"'{user}' is not a valid user mention.", ephemeral=self._eph(ctx))
+            return
+        row = await db.fetchone("SELECT name, archived FROM employee WHERE id = ?", (emp_id,))
+        if row is None:
+            await ctx.respond(f"{user} is not in the employee database.", ephemeral=self._eph(ctx))
+            return
+        if row["archived"]:
+            await ctx.respond(f"{row['name']} (<@{emp_id}>) is already archived.", ephemeral=self._eph(ctx))
+            return
+        await self.set_employee_archived(emp_id, True)
+        timecard_log.info(f"[Employee] {ctx.author} archived employee {emp_id}.")
+        await ctx.respond(
+            f"Archived **{row['name']}** (<@{emp_id}>): clock removed, history kept, and they're "
+            f"hidden from active lists. Reactivate with `/unarchiveemployee`.",
+            ephemeral=self._eph(ctx),
+        )
+
+    @discord.slash_command(name="unarchiveemployee", description="Reactivate an archived employee (then rebuild their clock with /createclock).")
+    @is_timecard_admin()
+    async def unarchiveemployee(
+        self, ctx: discord.ApplicationContext,
+        user: discord.Option(str, description="The archived employee to reactivate", autocomplete=archived_employee_autocomplete),  # type: ignore
+    ):
+        db = await self._ensure_db()
+        try:
+            emp_id = int(user[2:-1])
+        except (ValueError, IndexError):
+            await ctx.respond(f"'{user}' is not a valid user mention.", ephemeral=self._eph(ctx))
+            return
+        row = await db.fetchone("SELECT name, archived FROM employee WHERE id = ?", (emp_id,))
+        if row is None:
+            await ctx.respond(f"{user} is not in the employee database.", ephemeral=self._eph(ctx))
+            return
+        if not row["archived"]:
+            await ctx.respond(f"{row['name']} (<@{emp_id}>) isn't archived.", ephemeral=self._eph(ctx))
+            return
+        await self.set_employee_archived(emp_id, False)
+        timecard_log.info(f"[Employee] {ctx.author} reactivated employee {emp_id}.")
+        await ctx.respond(
+            f"Reactivated **{row['name']}** (<@{emp_id}>). Rebuild their clock with `/createclock`.",
+            ephemeral=self._eph(ctx),
+        )
 
     @discord.slash_command(name="unlinkemployee", description="Remove an employee's link to their Odoo hr.employee record.")
     @is_timecard_admin()
@@ -794,13 +872,16 @@ class TimeTracking(commands.Cog):
             return
         # Case-insensitive Odoo name -> [partner ids]. One Odoo call, match in memory.
         by_name: dict[str, list[int]] = {}
+        id_to_name = {}
         for c in odoo_customers:
             by_name.setdefault((c["display_name"] or "").strip().lower(), []).append(c["id"])
+            id_to_name[c["id"]] = c["display_name"] or f"#{c['id']}"
         already = {r["odooId"] for r in await db.fetchall("SELECT odooId FROM customer WHERE odooId IS NOT NULL")}
         unlinked = await db.fetchall(
             "SELECT id, name FROM customer WHERE odooId IS NULL AND (archived IS NULL OR archived = 0)"
         )
-        linked = ambiguous = nomatch = via_history = 0
+        linked = nomatch = via_history = 0
+        ambiguous_details = []  # (local_name, [(partner_id, partner_name), ...])
         history = None  # {former_name_lower: [partner_id]}, lazy-loaded on first no-match
         for c in unlinked:
             key = (c["name"] or "").strip().lower()
@@ -810,7 +891,7 @@ class TimeTracking(commands.Cog):
                 already.add(candidates[0]); linked += 1
                 continue
             if len(candidates) > 1:
-                ambiguous += 1
+                ambiguous_details.append((c["name"], [(i, id_to_name.get(i, f"#{i}")) for i in candidates]))
                 continue
             # No current-name match — try former names from the Odoo chatter, so a
             # customer renamed on one side still links (fetched once, then cached).
@@ -822,18 +903,31 @@ class TimeTracking(commands.Cog):
                 already.add(hist[0]); via_history += 1
             else:
                 nomatch += 1
+        ambiguous = len(ambiguous_details)
         timecard_log.info(
             f"[Customer] {ctx.author} synccustomers: {linked} linked, {via_history} via rename-history, "
             f"{ambiguous} ambiguous, {nomatch} no-match."
         )
+        # Record each ambiguous customer + the partners it matched (so it's kept even
+        # if the reply below truncates a long list).
+        for local_name, matches in ambiguous_details:
+            timecard_log.info(f"[Customer]   ambiguous: '{local_name}' matches "
+                              + ", ".join(f"#{i} {nm}" for i, nm in matches))
+
         via = f", **{via_history}** by a previous (renamed) Odoo name" if via_history else ""
-        await ctx.followup.send(
-            f"Auto-link complete: **{linked}** linked by exact name{via}. "
-            f"**{ambiguous + nomatch}** still unlinked — **{ambiguous}** ambiguous "
-            f"(the name matches more than one Odoo partner, so it can't pick one) and "
-            f"**{nomatch}** no match. Link those with `/linkcustomer` (see `/unlinkedcustomers`).",
-            ephemeral=self._eph(ctx),
-        )
+        body = (f"Auto-link complete: **{linked}** linked by exact name{via}. "
+                f"**{ambiguous + nomatch}** still unlinked — **{ambiguous}** ambiguous "
+                f"(the name matches more than one Odoo partner, so it can't pick one) and "
+                f"**{nomatch}** no match. Link those with `/linkcustomer` (see `/unlinkedcustomers`).")
+        if ambiguous_details:
+            body += "\n\n__Ambiguous — each matched >1 Odoo partner:__"
+            for local_name, matches in ambiguous_details:
+                line = f"\n• **{local_name}** → " + ", ".join(f"#{i} {nm}" for i, nm in matches)
+                if len(body) + len(line) > 1900:  # Discord message cap; rest is in the log channel
+                    body += f"\n…and more — see the full list in the log channel."
+                    break
+                body += line
+        await ctx.followup.send(body, ephemeral=self._eph(ctx))
 
     @discord.slash_command(name="linkcustomer", description="Link a local customer to their Odoo partner.")
     @is_timecard_admin()
@@ -1047,30 +1141,39 @@ class TimeTracking(commands.Cog):
             await ctx.respond("Pick a punch from the autocomplete list.", ephemeral=self._eph(ctx))
             return
         row = await db.fetchone(
-            "SELECT employeeID, punchInTime, punchOutTime FROM punch_clock WHERE id = ?", (punch,)
+            "SELECT employeeID, punchInTime, punchOutTime, punchInApproval, punchOutApproval "
+            "FROM punch_clock WHERE id = ?", (punch,)
         )
         if row is None:
             await ctx.respond("That punch doesn't exist.", ephemeral=self._eph(ctx))
             return
-        sets, params = [], []
+        sets, params, changes = [], [], []  # changes = human "field: old → new" for the log
         try:
             if clock_in is not None:
-                sets.append("punchInTime = ?"); params.append(_parse_punch_time(clock_in))
+                nv = _parse_punch_time(clock_in)
+                sets.append("punchInTime = ?"); params.append(nv)
+                changes.append(f"clock-in {row['punchInTime'] or '—'} → {nv}")
             if clock_out is not None:
-                sets.append("punchOutTime = ?"); params.append(_parse_punch_time(clock_out))
+                nv = _parse_punch_time(clock_out)
+                sets.append("punchOutTime = ?"); params.append(nv)
+                changes.append(f"clock-out {row['punchOutTime'] or 'open'} → {nv}")
         except ValueError as e:
             await ctx.respond(str(e), ephemeral=self._eph(ctx))
             return
         if approved is not None:
-            sets.append("punchInApproval = ?"); params.append(1 if approved else 0)
-            sets.append("punchOutApproval = ?"); params.append(1 if approved else 0)
+            v = 1 if approved else 0
+            sets += ["punchInApproval = ?", "punchOutApproval = ?"]; params += [v, v]
+            was = "approved" if (row["punchInApproval"] and row["punchOutApproval"]) else "pending"
+            changes.append(f"approval {was} → {'approved' if approved else 'unapproved'}")
         if not sets:
             await ctx.respond("Nothing to change — provide a new clock-in, clock-out, or approval.", ephemeral=self._eph(ctx))
             return
         await db.execute(f"UPDATE punch_clock SET {', '.join(sets)} WHERE id = ?", (*params, punch))
         await sync.enqueue(db, "punch", punch, "edit")
         await self._refresh_clock(row["employeeID"])
-        timecard_log.info(f"[Punch] {ctx.author} edited punch {punch} ({', '.join(sets)}).")
+        erow = await db.fetchone("SELECT name FROM employee WHERE id = ?", (row["employeeID"],))
+        ename = erow["name"] if erow else f"employee {row['employeeID']}"
+        timecard_log.info(f"[Punch] {ctx.author} edited punch {punch} for {ename}: {'; '.join(changes)}.")
         await ctx.respond(f"Updated punch #{punch}.", ephemeral=self._eph(ctx))
 
     @discord.slash_command(name="deletepunch", description="Delete a punch — review each linked worktime first.")
@@ -1263,24 +1366,32 @@ class TimeTracking(commands.Cog):
         if worktime is None:
             await ctx.respond("Pick a worktime from the autocomplete list.", ephemeral=self._eph(ctx))
             return
-        wt = await db.fetchone("SELECT punchID, odooId FROM work_time WHERE id = ?", (worktime,))
+        wt = await db.fetchone(
+            "SELECT punchID, odooId, punchType, timeSpent, customerID FROM work_time WHERE id = ?", (worktime,)
+        )
         if wt is None:
             await ctx.respond("That worktime doesn't exist.", ephemeral=self._eph(ctx))
             return
-        sets, params = [], []
+        sets, params, changes = [], [], []  # changes = human "field: old → new" for the log
         if worktype is not None:
             sets.append("punchType = ?"); params.append(worktype)
+            changes.append(f"type {wt['punchType']} → {worktype}")
         if hours is not None:
             try:
-                params.append(_hours_to_minutes(hours)); sets.append("timeSpent = ?")
+                mins = _hours_to_minutes(hours)
             except ValueError as e:
                 await ctx.respond(str(e), ephemeral=self._eph(ctx))
                 return
+            sets.append("timeSpent = ?"); params.append(mins)
+            changes.append(f"hours {(wt['timeSpent'] or 0) / 60:g}h → {hours:g}h")
         if customer is not None:
-            if await db.fetchone("SELECT 1 FROM customer WHERE id = ?", (customer,)) is None:
+            newc = await db.fetchone("SELECT name FROM customer WHERE id = ?", (customer,))
+            if newc is None:
                 await ctx.respond("That customer doesn't exist.", ephemeral=self._eph(ctx))
                 return
+            oldc = await db.fetchone("SELECT name FROM customer WHERE id = ?", (wt["customerID"],))
             sets.append("customerID = ?"); params.append(customer)
+            changes.append(f"customer {oldc['name'] if oldc else wt['customerID']} → {newc['name']}")
         if task is not None and self.client.loaded:
             try:
                 pid = await self.client.get_task_project(task)
@@ -1292,6 +1403,7 @@ class TimeTracking(commands.Cog):
                 return
             sets.append("odooTaskId = ?"); params.append(task)
             sets.append("odooProjectId = ?"); params.append(pid)
+            changes.append(f"Odoo task → {task}")
         if not sets:
             await ctx.respond("Nothing to change — provide a new type, hours, customer, or task.", ephemeral=self._eph(ctx))
             return
@@ -1299,10 +1411,13 @@ class TimeTracking(commands.Cog):
         push = self.client.loaded and (wt["odooId"] or task is not None)
         if push:
             await sync.enqueue(db, "worktime", worktime, "edit")
-        prow = await db.fetchone("SELECT employeeID FROM punch_clock WHERE id = ?", (wt["punchID"],))
+        prow = await db.fetchone(
+            "SELECT pc.employeeID, e.name FROM punch_clock pc JOIN employee e ON pc.employeeID = e.id "
+            "WHERE pc.id = ?", (wt["punchID"],))
         if prow:
             await self._refresh_clock(prow["employeeID"])
-        timecard_log.info(f"[Work] {ctx.author} edited worktime {worktime} ({', '.join(sets)}).")
+        ename = prow["name"] if prow else "?"
+        timecard_log.info(f"[Work] {ctx.author} edited worktime {worktime} for {ename}: {'; '.join(changes)}.")
         note = " — change queued to Odoo." if push else ""
         await ctx.respond(f"Updated worktime #{worktime}.{note}", ephemeral=self._eph(ctx))
 

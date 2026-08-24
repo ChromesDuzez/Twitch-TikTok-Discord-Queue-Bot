@@ -247,9 +247,12 @@ class OdooClient:
         return data[0] if data else None
 
     async def get_employee_list(self):
+        # Include archived (active=False) employees too so a terminated Odoo
+        # employee can still be linked; an explicit `active` clause disables Odoo's
+        # default active-only filter. `active` is returned so the picker can label them.
         return await self.call(
             "/hr.employee/search_read",
-            {"domain": [["active", "=", True]], "fields": ["id", "display_name"], "order": "id asc"},
+            {"domain": [["active", "in", [True, False]]], "fields": ["id", "display_name", "active"], "order": "id asc"},
         )
 
     # ---- attendance (clock in/out) ----------------------------------------
