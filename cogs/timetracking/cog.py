@@ -47,7 +47,7 @@ _MANAGEMENT_COMMANDS = {
     "viewtimecard",
     "synccustomers", "linkcustomer", "unlinkcustomer", "unlinkedcustomers",
     "addcustomer", "editcustomer", "configureprojects", "configureroles",
-    "addemployee", "linkemployee", "unlinkemployee",
+    "addemployee", "linkemployee", "unlinkemployee", "archiveemployee", "unarchiveemployee",
     "createclock", "deleteclock",
 }
 
@@ -464,7 +464,11 @@ class TimeTracking(commands.Cog):
         term = str(ctx.value or "").lower()
         matches = [e for e in self._odoo_employees
                    if e["id"] not in linked and term in str(e.get("display_name") or "").lower()]
-        return [_choice(e.get("display_name"), e["id"], f"Employee #{e['id']}") for e in matches[:25]]
+
+        def label(e):
+            nm = e.get("display_name") or f"Employee #{e['id']}"
+            return f"{nm} (archived)" if not e.get("active", True) else nm
+        return [_choice(label(e), e["id"], f"Employee #{e['id']}") for e in matches[:25]]
 
     async def linked_employee_autocomplete(self, ctx: discord.AutocompleteContext):
         """Local employees currently linked to an Odoo employee (for /unlinkemployee).
@@ -493,6 +497,15 @@ class TimeTracking(commands.Cog):
         out = [_choice(r["name"], f"<@{r['id']}>")
                for r in rows if term in str(r["name"] or "").lower()]
         return out[:25]
+
+    async def archived_employee_autocomplete(self, ctx: discord.AutocompleteContext):
+        """Local employees currently archived (for /unarchiveemployee)."""
+        if self.db is None:
+            return []
+        rows = await self.db.fetchall("SELECT id, name FROM employee WHERE archived = 1 ORDER BY name")
+        term = str(ctx.value or "").lower()
+        return [_choice(r["name"], f"<@{r['id']}>")
+                for r in rows if term in str(r["name"] or "").lower()][:25]
 
     async def unlinked_customer_autocomplete(self, ctx: discord.AutocompleteContext):
         """Local customers not yet linked to an Odoo partner (value = local id)."""
@@ -726,6 +739,7 @@ class TimeTracking(commands.Cog):
         odoo_employee: discord.Option(int, description="Odoo employee", autocomplete=odoo_employee_autocomplete),  # type: ignore
     ):
         db = await self._ensure_db()
+        await ctx.defer(ephemeral=self._eph(ctx))  # Odoo read + possible clock removal below
         try:
             emp_id = int(user[2:-1])
         except (ValueError, IndexError):
@@ -747,7 +761,71 @@ class TimeTracking(commands.Cog):
             return
         await db.execute("UPDATE employee SET odooId = ? WHERE id = ?", (odoo_employee, emp_id))
         timecard_log.info(f"[Employee] {ctx.author} linked employee {emp_id} to Odoo employee {odoo_employee}.")
-        await ctx.respond(f"Linked {row['name']} (<@{emp_id}>) to Odoo employee {odoo_employee}.", ephemeral=self._eph(ctx))
+        # If the Odoo employee is archived (terminated), archive them here too — keeps
+        # their history but hides them from active lists and removes their clock.
+        note = ""
+        try:
+            rec = await self.client.read_record("hr.employee", odoo_employee, ["active"])
+            if rec is not None and not rec.get("active", True):
+                if await self.set_employee_archived(emp_id, True):
+                    note = " They're archived in Odoo, so I archived them here too (history kept, hidden from active lists)."
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"[Employee] Couldn't check Odoo archive state for {odoo_employee}: {e}")
+        await ctx.respond(f"Linked {row['name']} (<@{emp_id}>) to Odoo employee {odoo_employee}.{note}", ephemeral=self._eph(ctx))
+
+    @discord.slash_command(name="archiveemployee", description="Archive an employee: hide from active lists + remove their clock, keep history.")
+    @is_timecard_admin()
+    async def archiveemployee(
+        self, ctx: discord.ApplicationContext,
+        user: discord.Option(str, description="The employee to archive", autocomplete=employee_autocomplete),  # type: ignore
+    ):
+        db = await self._ensure_db()
+        await ctx.defer(ephemeral=self._eph(ctx))  # removing the clock message is a Discord call
+        try:
+            emp_id = int(user[2:-1])
+        except (ValueError, IndexError):
+            await ctx.respond(f"'{user}' is not a valid user mention.", ephemeral=self._eph(ctx))
+            return
+        row = await db.fetchone("SELECT name, archived FROM employee WHERE id = ?", (emp_id,))
+        if row is None:
+            await ctx.respond(f"{user} is not in the employee database.", ephemeral=self._eph(ctx))
+            return
+        if row["archived"]:
+            await ctx.respond(f"{row['name']} (<@{emp_id}>) is already archived.", ephemeral=self._eph(ctx))
+            return
+        await self.set_employee_archived(emp_id, True)
+        timecard_log.info(f"[Employee] {ctx.author} archived employee {emp_id}.")
+        await ctx.respond(
+            f"Archived **{row['name']}** (<@{emp_id}>): clock removed, history kept, and they're "
+            f"hidden from active lists. Reactivate with `/unarchiveemployee`.",
+            ephemeral=self._eph(ctx),
+        )
+
+    @discord.slash_command(name="unarchiveemployee", description="Reactivate an archived employee (then rebuild their clock with /createclock).")
+    @is_timecard_admin()
+    async def unarchiveemployee(
+        self, ctx: discord.ApplicationContext,
+        user: discord.Option(str, description="The archived employee to reactivate", autocomplete=archived_employee_autocomplete),  # type: ignore
+    ):
+        db = await self._ensure_db()
+        try:
+            emp_id = int(user[2:-1])
+        except (ValueError, IndexError):
+            await ctx.respond(f"'{user}' is not a valid user mention.", ephemeral=self._eph(ctx))
+            return
+        row = await db.fetchone("SELECT name, archived FROM employee WHERE id = ?", (emp_id,))
+        if row is None:
+            await ctx.respond(f"{user} is not in the employee database.", ephemeral=self._eph(ctx))
+            return
+        if not row["archived"]:
+            await ctx.respond(f"{row['name']} (<@{emp_id}>) isn't archived.", ephemeral=self._eph(ctx))
+            return
+        await self.set_employee_archived(emp_id, False)
+        timecard_log.info(f"[Employee] {ctx.author} reactivated employee {emp_id}.")
+        await ctx.respond(
+            f"Reactivated **{row['name']}** (<@{emp_id}>). Rebuild their clock with `/createclock`.",
+            ephemeral=self._eph(ctx),
+        )
 
     @discord.slash_command(name="unlinkemployee", description="Remove an employee's link to their Odoo hr.employee record.")
     @is_timecard_admin()
