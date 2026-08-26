@@ -54,6 +54,13 @@ _MANAGEMENT_COMMANDS = {
     "createclock", "deleteclock",
 }
 
+# Pay commands expose sensitive compensation data, so they only run in these
+# (admin-facing) channels. log + timecard-log are always configured (required at
+# startup), so the allowed set is never empty.
+_PAY_CHANNEL_KEYS = (
+    "BOT_LOG_ID", "TIMECARD_LOG_ID", "TIMECARD_ADMIN_CHANNEL_ID", "TIMECARD_REPORTS_CHANNEL_ID",
+)
+
 
 def _parse_effective_date(raw: str | None) -> str:
     """Accept 'YYYY-MM-DD' (blank -> today) -> normalized date string. Raises
@@ -292,6 +299,29 @@ class TimeTracking(commands.Cog):
         """Whether an admin command should reply ephemerally. False in the
         timecard admin/log channels (show everyone); True elsewhere (declutter)."""
         return ctx.channel_id not in self._admin_visible_channels()
+
+    def _pay_channels(self) -> set[int]:
+        """Channels where pay commands are allowed (admin-facing only)."""
+        ids = set()
+        for var in _PAY_CHANNEL_KEYS:
+            v = os.getenv(var)
+            if v and v.isdigit():
+                ids.add(int(v))
+        return ids
+
+    async def _pay_channel_guard(self, ctx) -> bool:
+        """Gate pay commands to the admin-facing channels so compensation data
+        can't be surfaced in a general channel. Returns True if allowed; otherwise
+        replies ephemerally (so nothing is shown to the channel) and returns False.
+        The admin-role check still runs first via @is_timecard_admin."""
+        if ctx.channel_id in self._pay_channels():
+            return True
+        await ctx.respond(
+            "🔒 Pay commands can only be run in the **log**, **timecard-log**, "
+            "**timecard-admin**, or **timecard-reports** channel.",
+            ephemeral=True,
+        )
+        return False
 
     async def cog_after_invoke(self, ctx):
         """When an admin management command runs *outside* the timecard admin/log
@@ -620,7 +650,12 @@ class TimeTracking(commands.Cog):
                 for c in matches[:25]]
 
     async def employee_autocomplete(self, ctx: discord.AutocompleteContext):
-        """All active employees (value = a mention, so it parses like a typed user)."""
+        """All active employees (value = a mention, so it parses like a typed user).
+
+        SECURITY: autocomplete runs for anyone typing the command and CANNOT check
+        admin privileges, so this must only ever surface the employee's name --
+        never pay, rates, or banked hours. The pay commands that use it are
+        additionally gated to admin-facing channels (_pay_channel_guard)."""
         if self.db is None:
             return []
         rows = await self.db.fetchall(
@@ -886,6 +921,8 @@ class TimeTracking(commands.Cog):
         effective_date: discord.Option(str, default=None, description="When it takes effect [YYYY-MM-DD] (default: today)"),  # type: ignore
         note: discord.Option(str, default=None, description="e.g. annual raise"),  # type: ignore
     ):
+        if not await self._pay_channel_guard(ctx):
+            return
         db = await self._ensure_db()
         emp_id = self._emp_from_mention(employee)
         if emp_id is None:
@@ -916,6 +953,8 @@ class TimeTracking(commands.Cog):
         self, ctx: discord.ApplicationContext,
         employee: discord.Option(str, description="The employee", autocomplete=employee_autocomplete),  # type: ignore
     ):
+        if not await self._pay_channel_guard(ctx):
+            return
         db = await self._ensure_db()
         emp_id = self._emp_from_mention(employee)
         if emp_id is None:
@@ -946,6 +985,8 @@ class TimeTracking(commands.Cog):
         reason: discord.Option(str, default=None, description="Why (e.g. winter banking, season payout)"),  # type: ignore
         entry_date: discord.Option(str, default=None, description="Date it applies to [YYYY-MM-DD] (default: today)"),  # type: ignore
     ):
+        if not await self._pay_channel_guard(ctx):
+            return
         db = await self._ensure_db()
         emp_id = self._emp_from_mention(employee)
         if emp_id is None:
@@ -980,6 +1021,8 @@ class TimeTracking(commands.Cog):
         self, ctx: discord.ApplicationContext,
         employee: discord.Option(str, default=None, description="The employee (blank = everyone with a balance)", autocomplete=employee_autocomplete),  # type: ignore
     ):
+        if not await self._pay_channel_guard(ctx):
+            return
         db = await self._ensure_db()
         if employee is None:
             rows = await db.fetchall(
