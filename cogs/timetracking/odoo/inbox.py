@@ -112,7 +112,7 @@ async def enqueue_inbound(db: Database, model: str, odoo_id: int,
         (model, odoo_id),
     )
     if existing:
-        log.debug(f"[Inbox] Debounced duplicate {model}:{odoo_id}")
+        log.info(f"[Inbox] Debounced duplicate {model}:{odoo_id}")
         return
     await db.execute(
         "INSERT INTO odoo_inbox (model, odoo_id, action, write_uid, status, created_at) "
@@ -197,7 +197,9 @@ class InboxWorker:
                 log.info(f"[Inbox] {row['action'] or 'update'} {row['model']}:{row['odoo_id']}"
                          f"{_desc_suffix(desc)} applied.")
             else:
-                log.debug(f"[Inbox] {row['model']}:{row['odoo_id']} no-op.")
+                desc = await _local_descriptor(self.db, row["model"], row["odoo_id"])
+                log.info(f"[Inbox] {row['action'] or 'update'} {row['model']}:{row['odoo_id']}"
+                         f"{_desc_suffix(desc)} checked -- no change.")
         except Exception as e:  # noqa: BLE001
             attempts = row["attempts"] + 1
             status = "failed" if attempts >= MAX_ATTEMPTS else "pending"
