@@ -90,7 +90,7 @@ class SyncWorker:
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # noqa: BLE001 - keep the loop alive
-                log.error(f"[Sync] Drain loop error: {e}")
+                log.error(f"[Outbox] Drain loop error: {e}")
             await asyncio.sleep(DRAIN_INTERVAL)
 
     async def drain(self):
@@ -117,7 +117,7 @@ class SyncWorker:
                 "UPDATE odoo_outbox SET attempts = ?, last_error = ?, status = ? WHERE id = ?",
                 (attempts, str(e)[:500], status, row["id"]),
             )
-            log.warning(f"[Sync] Outbox #{row['id']} ({row['entity_type']}/{row['op']}) error: {e}")
+            log.warning(f"[Outbox] Outbox #{row['id']} ({row['entity_type']}/{row['op']}) error: {e}")
 
     async def _dispatch(self, entity_type: str, entity_id: int, op: str, payload: dict):
         """Return True (done), False (skip), or 'retry' (dependency pending)."""
@@ -144,7 +144,7 @@ class SyncWorker:
             return await self._restore_punch(entity_id)
         if entity_type == "worktime" and op == "restore":
             return await self._restore_worktime(entity_id)
-        log.warning(f"[Sync] Unknown outbox job: {entity_type}/{op}")
+        log.warning(f"[Outbox] Unknown outbox job: {entity_type}/{op}")
         return False
 
     # ---- deletions (Discord -> Odoo) --------------------------------------
@@ -155,7 +155,7 @@ class SyncWorker:
             return True  # nothing was synced to Odoo; nothing to delete
         model = "hr.attendance" if entity_type == "punch" else "account.analytic.line"
         await self.client.unlink(model, int(odoo_id))
-        log.info(f"[Sync] Deleted {model} {odoo_id} in Odoo.")
+        log.info(f"[Outbox] Deleted {model} {odoo_id} in Odoo.")
         return True
 
     # ---- restores (Odoo-side delete rejected; Discord is truth) -----------
@@ -182,7 +182,7 @@ class SyncWorker:
         ):
             await self.db.execute("UPDATE work_time SET odooId = NULL WHERE id = ?", (wt["id"],))
             await enqueue(self.db, "worktime", wt["id"], "restore")
-        log.info(f"[Sync] Restored punch {punch_id} as hr.attendance {att_id} in Odoo.")
+        log.info(f"[Outbox] Restored punch {punch_id} as hr.attendance {att_id} in Odoo.")
         return True
 
     async def _restore_worktime(self, worktime_id: int):
@@ -201,6 +201,7 @@ class SyncWorker:
         odoo_id = partner[0] if isinstance(partner, (list, tuple)) else partner.get("id") if isinstance(partner, dict) else partner
         if odoo_id:
             await self.db.execute("UPDATE customer SET odooId = ? WHERE id = ?", (odoo_id, customer_id))
+            log.info(f"[Outbox] Created res.partner {odoo_id} for customer {customer_id} ('{row['name']}').")
         return True
 
     async def _employee_odoo_id(self, employee_id: int):
@@ -221,6 +222,7 @@ class SyncWorker:
         )
         if att_id:
             await self.db.execute("UPDATE punch_clock SET odooId = ? WHERE id = ?", (att_id, punch_id))
+            log.info(f"[Outbox] Clock-in: punch {punch_id} -> hr.attendance {att_id}.")
         return True
 
     async def _sync_punch_out(self, punch_id: int):
@@ -236,6 +238,7 @@ class SyncWorker:
         await self.client.attendance_write(
             punch["odooId"], local_str_to_utc_str(punch["punchOutTime"])
         )
+        log.info(f"[Outbox] Clock-out: punch {punch_id} (hr.attendance {punch['odooId']}).")
         return True
 
     async def _sync_punch_edit(self, punch_id: int):
@@ -259,10 +262,12 @@ class SyncWorker:
             await self.db.execute("UPDATE punch_clock SET odooId = ? WHERE id = ?", (att_id, punch_id))
             if check_out:
                 await self.client.attendance_write(att_id, check_out_utc=check_out)
+            log.info(f"[Outbox] Pushed punch {punch_id} edit -> new hr.attendance {att_id}.")
         else:
             await self.client.attendance_write(
                 punch["odooId"], check_out_utc=check_out, check_in_utc=check_in
             )
+            log.info(f"[Outbox] Pushed punch {punch_id} edit -> hr.attendance {punch['odooId']}.")
         return True
 
     async def _reassign_worktime(self, worktime_id: int):
@@ -283,7 +288,7 @@ class SyncWorker:
         if punch["odooId"] is None:
             return "retry"  # new attendance not synced yet -- link once it is
         await self.client.set_timesheet_shift(wt["odooId"], punch["odooId"])
-        log.info(f"[Sync] Repointed timesheet {wt['odooId']} shift link to attendance {punch['odooId']}.")
+        log.info(f"[Outbox] Repointed timesheet {wt['odooId']} shift link to attendance {punch['odooId']}.")
         return True
 
     async def _sync_worktime_edit(self, worktime_id: int):
@@ -307,7 +312,7 @@ class SyncWorker:
             task_id=wt["odooTaskId"],
             description=f"{wt['punchType']} work (Discord timecard)",
         )
-        log.info(f"[Sync] Updated timesheet {wt['odooId']} (worktime {worktime_id}) in Odoo.")
+        log.info(f"[Outbox] Updated timesheet {wt['odooId']} (worktime {worktime_id}) in Odoo.")
         return True
 
     async def _sync_worktime(self, worktime_id: int):
@@ -351,4 +356,6 @@ class SyncWorker:
         )
         if line_id:
             await self.db.execute("UPDATE work_time SET odooId = ? WHERE id = ?", (line_id, worktime_id))
+            log.info(f"[Outbox] Posted timesheet line {line_id} for worktime {worktime_id} "
+                     f"({wt['punchType']}, {hours:.2f}h).")
         return True
