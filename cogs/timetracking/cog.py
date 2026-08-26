@@ -19,6 +19,7 @@ from .db import (
     db_archive_dir, db_dir, move_db_file, resolve_db_path,
 )
 from .modals import Confirm
+from . import pay
 from .odoo import inbox, sync
 from .odoo.client import OdooClient
 from .perms import has_perms, is_timecard_admin
@@ -49,8 +50,21 @@ _MANAGEMENT_COMMANDS = {
     "addcustomer", "editcustomer", "mergecustomers", "archivecustomer", "unarchivecustomer",
     "deletecustomer", "purgeimportedcontacts", "configureprojects", "configureroles", "configurecategories",
     "addemployee", "linkemployee", "unlinkemployee", "archiveemployee", "unarchiveemployee",
+    "setpay", "payhistory", "bankadjust", "bankbalance",
     "createclock", "deleteclock",
 }
+
+
+def _parse_effective_date(raw: str | None) -> str:
+    """Accept 'YYYY-MM-DD' (blank -> today) -> normalized date string. Raises
+    ValueError on a bad format."""
+    raw = (raw or "").strip()
+    if not raw:
+        return datetime.now().strftime("%Y-%m-%d")
+    try:
+        return datetime.strptime(raw, "%Y-%m-%d").strftime("%Y-%m-%d")
+    except ValueError:
+        raise ValueError(f"'{raw}' is not a valid date. Use YYYY-MM-DD.")
 
 
 def _parse_punch_time(raw: str) -> str:
@@ -782,7 +796,8 @@ class TimeTracking(commands.Cog):
         zip: discord.Option(str, description="Address Zip of Employee"),  # type: ignore
         addressline2: discord.Option(str, default="", description="Address Line 2"),  # type: ignore
         user: discord.Option(str, default=None, description="Attach a different user"),  # type: ignore
-        payrate: discord.Option(float, default=16.00, description="Payrate"),  # type: ignore
+        payrate: discord.Option(float, default=16.00, description="$/hr (Hourly/Hybrid) or the bi-weekly GROSS (Salaried)"),  # type: ignore
+        pay_type: discord.Option(str, default="Hourly", choices=["Hourly", "Salaried", "Hybrid"], description="Pay structure"),  # type: ignore
         employeetype: discord.Option(int, default=2, description="Employee Type", autocomplete=employee_type_autocomplete),  # type: ignore
         odoo_employee: discord.Option(int, default=None, description="Link to an Odoo employee (for sync)", autocomplete=odoo_employee_autocomplete),  # type: ignore
     ):
@@ -810,14 +825,187 @@ class TimeTracking(commands.Cog):
         try:
             await db.execute(
                 "INSERT INTO employee (id, name, phoneNumber, addressLine1, addressLine2, "
-                "addressCity, addressState, addressZip, payrate, employeeTypeID, odooId) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "addressCity, addressState, addressZip, payrate, pay_type, employeeTypeID, odooId) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (emp_id, name, phonenumber, addressline1, addressline2, city, state, zip,
-                 payrate, employeetype, odoo_employee),
+                 payrate, pay_type, employeetype, odoo_employee),
             )
-            await ctx.respond(f"Added new employee {name} (<@{emp_id}>).", ephemeral=self._eph(ctx))
+            # Seed the initial effective-dated pay record (effective today) so the
+            # employee is costable from day one and shows in /payhistory.
+            await self._record_pay(db, emp_id, pay_type, payrate,
+                                   datetime.now().strftime("%Y-%m-%d"),
+                                   "initial rate (addemployee)", str(ctx.author))
+            await ctx.respond(f"Added new employee {name} (<@{emp_id}>) — {pay_type}.", ephemeral=self._eph(ctx))
         except Exception as e:  # noqa: BLE001
             await ctx.respond(f"Error adding employee {name}: {e}", ephemeral=self._eph(ctx))
+
+    # ---- pay: effective-dated rates + the hybrid hour bank -----------------
+
+    async def _record_pay(self, db, employee_id, pay_type, amount, effective_date, note, created_by):
+        """Insert an effective-dated pay_rate row (hourly_rate for Hourly/Hybrid,
+        cycle_gross for Salaried), then re-sync the employee mirror (pay_type, and
+        payrate for hourly types) to whatever record is effective TODAY -- so a
+        future-dated raise doesn't change the mirror until it takes effect."""
+        hourly = amount if pay_type in ("Hourly", "Hybrid") else None
+        gross = amount if pay_type == "Salaried" else None
+        await db.execute(
+            "INSERT INTO pay_rate (employeeID, effective_date, pay_type, hourly_rate, cycle_gross, note, created_at, created_by) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (employee_id, effective_date, pay_type, hourly, gross, note,
+             datetime.now().strftime("%Y-%m-%d %H:%M:%S"), created_by),
+        )
+        cur = await pay.effective_pay(db, employee_id, None)
+        if cur is not None:
+            if cur["pay_type"] in ("Hourly", "Hybrid"):
+                await db.execute("UPDATE employee SET pay_type = ?, payrate = ? WHERE id = ?",
+                                 (cur["pay_type"], cur["hourly_rate"], employee_id))
+            else:
+                await db.execute("UPDATE employee SET pay_type = ? WHERE id = ?",
+                                 (cur["pay_type"], employee_id))
+
+    def _emp_from_mention(self, mention):
+        """Parse a '<@id>' autocomplete value to an int id, or None."""
+        try:
+            return int(str(mention)[2:-1])
+        except (ValueError, IndexError):
+            return None
+
+    @staticmethod
+    def _pay_amount_label(pay_type, hourly_rate, cycle_gross) -> str:
+        if pay_type == "Salaried":
+            return f"${float(cycle_gross or 0):,.2f}/cycle"
+        return f"${float(hourly_rate or 0):,.2f}/hr"
+
+    @discord.slash_command(name="setpay", description="Record a new effective-dated pay rate (raise, cut, or pay-type change).")
+    @is_timecard_admin()
+    async def setpay(
+        self, ctx: discord.ApplicationContext,
+        employee: discord.Option(str, description="The employee", autocomplete=employee_autocomplete),  # type: ignore
+        pay_type: discord.Option(str, choices=["Hourly", "Salaried", "Hybrid"], description="Pay structure"),  # type: ignore
+        amount: discord.Option(float, description="$/hr for Hourly/Hybrid; the bi-weekly GROSS for Salaried"),  # type: ignore
+        effective_date: discord.Option(str, default=None, description="When it takes effect [YYYY-MM-DD] (default: today)"),  # type: ignore
+        note: discord.Option(str, default=None, description="e.g. annual raise"),  # type: ignore
+    ):
+        db = await self._ensure_db()
+        emp_id = self._emp_from_mention(employee)
+        if emp_id is None:
+            await ctx.respond(f"'{employee}' is not a valid user mention.", ephemeral=self._eph(ctx))
+            return
+        row = await db.fetchone("SELECT name FROM employee WHERE id = ?", (emp_id,))
+        if row is None:
+            await ctx.respond(f"{employee} is not in the employee database. Add them with /addemployee first.", ephemeral=self._eph(ctx))
+            return
+        if amount < 0:
+            await ctx.respond("Amount can't be negative.", ephemeral=self._eph(ctx))
+            return
+        try:
+            eff = _parse_effective_date(effective_date)
+        except ValueError as e:
+            await ctx.respond(str(e), ephemeral=self._eph(ctx))
+            return
+        await self._record_pay(db, emp_id, pay_type, amount, eff, note, str(ctx.author))
+        label = self._pay_amount_label(pay_type, amount, amount)
+        timecard_log.info(f"[Pay] {ctx.author} set {row['name']} ({emp_id}) to {pay_type} {label} effective {eff}"
+                          + (f" ({note})" if note else "") + ".")
+        await ctx.respond(f"Recorded pay for **{row['name']}**: {pay_type} {label}, effective `{eff}`."
+                          + (f"\nNote: {note}" if note else ""), ephemeral=self._eph(ctx))
+
+    @discord.slash_command(name="payhistory", description="Show an employee's pay-rate history (newest first).")
+    @is_timecard_admin()
+    async def payhistory(
+        self, ctx: discord.ApplicationContext,
+        employee: discord.Option(str, description="The employee", autocomplete=employee_autocomplete),  # type: ignore
+    ):
+        db = await self._ensure_db()
+        emp_id = self._emp_from_mention(employee)
+        if emp_id is None:
+            await ctx.respond(f"'{employee}' is not a valid user mention.", ephemeral=self._eph(ctx))
+            return
+        row = await db.fetchone("SELECT name FROM employee WHERE id = ?", (emp_id,))
+        if row is None:
+            await ctx.respond(f"{employee} is not in the employee database.", ephemeral=self._eph(ctx))
+            return
+        rows = await db.fetchall(
+            "SELECT * FROM pay_rate WHERE employeeID = ? ORDER BY effective_date DESC, id DESC", (emp_id,))
+        if not rows:
+            await ctx.respond(f"No pay history for {row['name']} yet. Set one with /setpay.", ephemeral=self._eph(ctx))
+            return
+        lines = []
+        for r in rows:
+            amt = self._pay_amount_label(r["pay_type"], r["hourly_rate"], r["cycle_gross"])
+            note = f" — {r['note']}" if r["note"] else ""
+            lines.append(f"`{r['effective_date']}`  {r['pay_type']:<9} {amt}{note}")
+        await ctx.respond(f"**Pay history — {row['name']}**\n" + "\n".join(lines), ephemeral=self._eph(ctx))
+
+    @discord.slash_command(name="bankadjust", description="Adjust an employee's banked hours (+accrue / -drawdown).")
+    @is_timecard_admin()
+    async def bankadjust(
+        self, ctx: discord.ApplicationContext,
+        employee: discord.Option(str, description="The employee", autocomplete=employee_autocomplete),  # type: ignore
+        hours: discord.Option(float, description="Hours to add (+) or draw down (-)"),  # type: ignore
+        reason: discord.Option(str, default=None, description="Why (e.g. winter banking, season payout)"),  # type: ignore
+        entry_date: discord.Option(str, default=None, description="Date it applies to [YYYY-MM-DD] (default: today)"),  # type: ignore
+    ):
+        db = await self._ensure_db()
+        emp_id = self._emp_from_mention(employee)
+        if emp_id is None:
+            await ctx.respond(f"'{employee}' is not a valid user mention.", ephemeral=self._eph(ctx))
+            return
+        row = await db.fetchone("SELECT name FROM employee WHERE id = ?", (emp_id,))
+        if row is None:
+            await ctx.respond(f"{employee} is not in the employee database.", ephemeral=self._eph(ctx))
+            return
+        if hours == 0:
+            await ctx.respond("Hours must be non-zero.", ephemeral=self._eph(ctx))
+            return
+        try:
+            eff = _parse_effective_date(entry_date)
+        except ValueError as e:
+            await ctx.respond(str(e), ephemeral=self._eph(ctx))
+            return
+        await db.execute(
+            "INSERT INTO hour_bank (employeeID, entry_date, hours, reason, created_at, created_by) VALUES (?, ?, ?, ?, ?, ?)",
+            (emp_id, eff, hours, reason, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), str(ctx.author)),
+        )
+        bal = await pay.bank_balance(db, emp_id)
+        sign = "+" if hours > 0 else ""
+        timecard_log.info(f"[Bank] {ctx.author} adjusted {row['name']} ({emp_id}) by {sign}{hours:g}h on {eff}"
+                          + (f" ({reason})" if reason else "") + f"; balance {bal:g}h.")
+        await ctx.respond(f"Adjusted **{row['name']}** by `{sign}{hours:g}h` (effective `{eff}`). New balance: **{bal:g}h**."
+                          + (f"\nReason: {reason}" if reason else ""), ephemeral=self._eph(ctx))
+
+    @discord.slash_command(name="bankbalance", description="Show banked hours: one employee's detail, or everyone with a balance.")
+    @is_timecard_admin()
+    async def bankbalance(
+        self, ctx: discord.ApplicationContext,
+        employee: discord.Option(str, default=None, description="The employee (blank = everyone with a balance)", autocomplete=employee_autocomplete),  # type: ignore
+    ):
+        db = await self._ensure_db()
+        if employee is None:
+            rows = await db.fetchall(
+                "SELECT e.id, e.name, COALESCE(SUM(hb.hours), 0) AS bal FROM employee e "
+                "JOIN hour_bank hb ON hb.employeeID = e.id GROUP BY e.id, e.name HAVING bal != 0 ORDER BY e.name")
+            if not rows:
+                await ctx.respond("No employees have banked hours.", ephemeral=self._eph(ctx))
+                return
+            body = "\n".join(f"{r['name']}: **{float(r['bal']):g}h**" for r in rows)
+            await ctx.respond(f"**Banked hours**\n{body}", ephemeral=self._eph(ctx))
+            return
+        emp_id = self._emp_from_mention(employee)
+        if emp_id is None:
+            await ctx.respond(f"'{employee}' is not a valid user mention.", ephemeral=self._eph(ctx))
+            return
+        row = await db.fetchone("SELECT name FROM employee WHERE id = ?", (emp_id,))
+        if row is None:
+            await ctx.respond(f"{employee} is not in the employee database.", ephemeral=self._eph(ctx))
+            return
+        bal = await pay.bank_balance(db, emp_id)
+        recent = await db.fetchall(
+            "SELECT entry_date, hours, reason FROM hour_bank WHERE employeeID = ? ORDER BY entry_date DESC, id DESC LIMIT 10", (emp_id,))
+        lines = [f"`{r['entry_date']}`  {'+' if r['hours'] > 0 else ''}{float(r['hours']):g}h"
+                 + (f" — {r['reason']}" if r["reason"] else "") for r in recent]
+        detail = ("\n" + "\n".join(lines)) if lines else ""
+        await ctx.respond(f"**{row['name']}** banked balance: **{bal:g}h**{detail}", ephemeral=self._eph(ctx))
 
     @discord.slash_command(name="linkemployee", description="Link an existing employee to their Odoo hr.employee record.")
     @is_timecard_admin()

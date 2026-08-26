@@ -41,7 +41,7 @@ ENV_VERSION_KEY = "ENV_VERSION"
 # The whole V2.0 refactor is ONE version: pre-refactor = 1, this release = 2.
 # New keys added during V2 dev (TESTING, ODOO_SHIFT_FIELD, ...) ride along the
 # 1->2 migration via the .env.example sync. Bump both on a future change.
-ENV_TARGET_VERSION = 2
+ENV_TARGET_VERSION = 3
 
 _write_lock = threading.Lock()
 

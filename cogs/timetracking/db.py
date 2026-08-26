@@ -28,7 +28,7 @@ RELEASE_VERSION = "2.0"
 # version 1, the refactored schema is version 2. Drives upgrades and stamps the
 # live db filename (timetracker.v{N}.db). Bump (both here and ENV in config.py)
 # on a future schema change.
-TARGET_VERSION = 2
+TARGET_VERSION = 3
 
 # Canonical worktime categories the employee can start. NOTE: "Shop" is NOT one
 # of these -- shop time is a calculated remainder in reports, never a punch.
@@ -119,6 +119,7 @@ class Database:
                 addressState   TEXT               NOT NULL,
                 addressZip     TEXT               NOT NULL,
                 payrate        DECIMAL(10,2)      NOT NULL DEFAULT 16.00,
+                pay_type       TEXT               NOT NULL DEFAULT 'Hourly',
                 employeeTypeID INTEGER            NOT NULL DEFAULT 2,
                 lunchSkipable  BOOLEAN            NOT NULL DEFAULT 0,
                 clockChannelId UNSIGNED BIG INT   NULL DEFAULT NULL,
@@ -204,6 +205,29 @@ class Database:
                 message_id  UNSIGNED BIG INT NULL,
                 created_at  DATETIME NOT NULL
             );
+            CREATE TABLE pay_rate (
+                id             INTEGER          PRIMARY KEY AUTOINCREMENT,
+                employeeID     UNSIGNED BIG INT NOT NULL,
+                effective_date DATE             NOT NULL,
+                pay_type       TEXT CHECK( pay_type IN ('Hourly','Salaried','Hybrid') ) NOT NULL,
+                hourly_rate    DECIMAL(10,2)    NULL,
+                cycle_gross    DECIMAL(10,2)    NULL,
+                note           TEXT             NULL,
+                created_at     DATETIME         NOT NULL,
+                created_by     TEXT             NULL,
+                FOREIGN KEY (employeeID) REFERENCES employee(id)
+            );
+            CREATE INDEX idx_pay_rate_emp_date ON pay_rate (employeeID, effective_date);
+            CREATE TABLE hour_bank (
+                id          INTEGER          PRIMARY KEY AUTOINCREMENT,
+                employeeID  UNSIGNED BIG INT NOT NULL,
+                entry_date  DATE             NOT NULL,
+                hours       DECIMAL(6,2)     NOT NULL,
+                reason      TEXT             NULL,
+                created_at  DATETIME         NOT NULL,
+                created_by  TEXT             NULL,
+                FOREIGN KEY (employeeID) REFERENCES employee(id)
+            );
             """
         )
         await c.executemany(
@@ -247,6 +271,8 @@ class Database:
         # schema, so they just get re-stamped to TARGET below.)
         if current < 2:
             await self._migrate_to_v2()
+        if current < 3:
+            await self._migrate_to_v3()
 
         await c.execute("UPDATE schema_version SET version = ?", (TARGET_VERSION,))
         await c.commit()
@@ -261,6 +287,7 @@ class Database:
     _EXPECTED_COLUMNS = (
         ("employee", "odooId", "UNSIGNED BIG INT NULL DEFAULT NULL"),
         ("employee", "archived", "BOOLEAN NOT NULL DEFAULT 0"),
+        ("employee", "pay_type", "TEXT NOT NULL DEFAULT 'Hourly'"),
         ("punch_clock", "odooId", "UNSIGNED BIG INT NULL DEFAULT NULL"),
         ("punch_clock", "legacy", "BOOLEAN NOT NULL DEFAULT 0"),
         ("customer", "odooId", "UNSIGNED BIG INT NULL DEFAULT NULL"),
@@ -418,6 +445,63 @@ class Database:
             "id, punchID, customerID, punchType, timeSpent, timeStarted, odooId, odooTaskId, odooProjectId",
         )
         log.info("[DB] Upgrade to v2 complete.")
+
+    async def _migrate_to_v3(self):
+        """v2 -> v3: effective-dated pay history + the hybrid hour bank.
+
+        Adds the ``pay_rate`` and ``hour_bank`` tables and the ``employee.pay_type``
+        mirror, then seeds one ``pay_rate`` row per existing employee from their
+        current ``payrate`` (effective far in the past so all historical work is
+        costable). Idempotent: tables use IF NOT EXISTS, the column add is guarded,
+        and the seed only touches employees that don't already have a pay_rate row.
+        Salaried/hybrid staff are reclassified afterward with /setpay (we don't
+        have their gross to guess).
+        """
+        log.info("[DB] Upgrading database to v3 (pay history + hour bank)...")
+        c = self._conn
+        if not await self._column_exists("employee", "pay_type"):
+            await c.execute("ALTER TABLE employee ADD COLUMN pay_type TEXT NOT NULL DEFAULT 'Hourly'")
+        await c.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS pay_rate (
+                id             INTEGER          PRIMARY KEY AUTOINCREMENT,
+                employeeID     UNSIGNED BIG INT NOT NULL,
+                effective_date DATE             NOT NULL,
+                pay_type       TEXT CHECK( pay_type IN ('Hourly','Salaried','Hybrid') ) NOT NULL,
+                hourly_rate    DECIMAL(10,2)    NULL,
+                cycle_gross    DECIMAL(10,2)    NULL,
+                note           TEXT             NULL,
+                created_at     DATETIME         NOT NULL,
+                created_by     TEXT             NULL,
+                FOREIGN KEY (employeeID) REFERENCES employee(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_pay_rate_emp_date ON pay_rate (employeeID, effective_date);
+            CREATE TABLE IF NOT EXISTS hour_bank (
+                id          INTEGER          PRIMARY KEY AUTOINCREMENT,
+                employeeID  UNSIGNED BIG INT NOT NULL,
+                entry_date  DATE             NOT NULL,
+                hours       DECIMAL(6,2)     NOT NULL,
+                reason      TEXT             NULL,
+                created_at  DATETIME         NOT NULL,
+                created_by  TEXT             NULL,
+                FOREIGN KEY (employeeID) REFERENCES employee(id)
+            );
+            """
+        )
+        await c.commit()
+        # Seed each existing employee's current payrate as their first effective-
+        # dated pay record (Hourly, far past so every historical punch has a rate).
+        # A re-run skips employees that already have a pay_rate row.
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        await c.execute(
+            "INSERT INTO pay_rate (employeeID, effective_date, pay_type, hourly_rate, note, created_at) "
+            "SELECT e.id, '2000-01-01', 'Hourly', e.payrate, 'migrated from employee.payrate', ? "
+            "FROM employee e "
+            "WHERE NOT EXISTS (SELECT 1 FROM pay_rate p WHERE p.employeeID = e.id)",
+            (now,),
+        )
+        await c.commit()
+        log.info("[DB] Upgrade to v3 complete.")
 
     async def _rebuild_id_as_rowid(self, table: str, create_new_sql: str, columns: str):
         """Rebuild `table` from a `<table>_new` definition, copying all columns.
