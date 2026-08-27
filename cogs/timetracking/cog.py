@@ -20,6 +20,8 @@ from .db import (
 )
 from .modals import Confirm
 from . import pay
+from . import costing
+from .hipp_report import generate_hipp_invoice
 from .odoo import inbox, sync
 from .odoo.client import OdooClient
 from .perms import has_perms, is_timecard_admin
@@ -51,6 +53,8 @@ _MANAGEMENT_COMMANDS = {
     "deletecustomer", "purgeimportedcontacts", "configureprojects", "configureroles", "configurecategories",
     "addemployee", "linkemployee", "unlinkemployee", "archiveemployee", "unarchiveemployee",
     "setpay", "payhistory", "bankadjust", "bankbalance",
+    "creategroup", "addtogroup", "removefromgroup", "groupmembers",
+    "setrateround", "hippinvoice",
     "createclock", "deleteclock",
 }
 
@@ -2249,6 +2253,193 @@ class TimeTracking(commands.Cog):
         embed = await build_timecard_embed(self, emp_id, erow["name"], eow)
         view = TimecardWeekView(self, emp_id, erow["name"], eow, ctx.user.id)
         await ctx.respond(embed=embed, view=view, ephemeral=self._eph(ctx))
+
+    # ---- employee groups (prerequisite for group-scoped reports) ----------
+
+    @discord.slash_command(name="creategroup", description="Create an employee group (used to scope reports like /hippinvoice).")
+    @is_timecard_admin()
+    async def creategroup(
+        self, ctx: discord.ApplicationContext,
+        name: discord.Option(str, description="Group name"),  # type: ignore
+    ):
+        db = await self._ensure_db()
+        name = (name or "").strip()
+        if not name:
+            await ctx.respond("Provide a group name.", ephemeral=self._eph(ctx))
+            return
+        if await db.fetchone("SELECT id FROM employee_group WHERE name = ?", (name,)):
+            await ctx.respond(f"Group '{name}' already exists.", ephemeral=self._eph(ctx))
+            return
+        gid = await db.execute("INSERT INTO employee_group (name) VALUES (?)", (name,))
+        timecard_log.info(f"[Group] {ctx.author} created employee group '{name}' (#{gid}).")
+        await ctx.respond(f"Created employee group **{name}**. Add members with /addtogroup.", ephemeral=self._eph(ctx))
+
+    @discord.slash_command(name="addtogroup", description="Add an employee to a group.")
+    @is_timecard_admin()
+    async def addtogroup(
+        self, ctx: discord.ApplicationContext,
+        employee_group: discord.Option(str, description="The group", autocomplete=employee_group_autocomplete),  # type: ignore
+        employee: discord.Option(str, description="The employee", autocomplete=employee_autocomplete),  # type: ignore
+    ):
+        db = await self._ensure_db()
+        emp_id = self._emp_from_mention(employee)
+        if emp_id is None:
+            await ctx.respond(f"'{employee}' is not a valid user mention.", ephemeral=self._eph(ctx))
+            return
+        group = await db.fetchone("SELECT id FROM employee_group WHERE name = ?", (employee_group,))
+        if group is None:
+            await ctx.respond(f"Group '{employee_group}' not found. Create it with /creategroup.", ephemeral=self._eph(ctx))
+            return
+        erow = await db.fetchone("SELECT name FROM employee WHERE id = ?", (emp_id,))
+        if erow is None:
+            await ctx.respond(f"{employee} isn't in the employee system.", ephemeral=self._eph(ctx))
+            return
+        if await db.fetchone("SELECT 1 FROM group_member WHERE groupID = ? AND employeeID = ?", (group["id"], emp_id)):
+            await ctx.respond(f"{erow['name']} is already in '{employee_group}'.", ephemeral=self._eph(ctx))
+            return
+        await db.execute("INSERT INTO group_member (employeeID, groupID) VALUES (?, ?)", (emp_id, group["id"]))
+        timecard_log.info(f"[Group] {ctx.author} added {erow['name']} ({emp_id}) to '{employee_group}'.")
+        await ctx.respond(f"Added **{erow['name']}** to **{employee_group}**.", ephemeral=self._eph(ctx))
+
+    @discord.slash_command(name="removefromgroup", description="Remove an employee from a group.")
+    @is_timecard_admin()
+    async def removefromgroup(
+        self, ctx: discord.ApplicationContext,
+        employee_group: discord.Option(str, description="The group", autocomplete=employee_group_autocomplete),  # type: ignore
+        employee: discord.Option(str, description="The employee", autocomplete=employee_autocomplete),  # type: ignore
+    ):
+        db = await self._ensure_db()
+        emp_id = self._emp_from_mention(employee)
+        if emp_id is None:
+            await ctx.respond(f"'{employee}' is not a valid user mention.", ephemeral=self._eph(ctx))
+            return
+        group = await db.fetchone("SELECT id FROM employee_group WHERE name = ?", (employee_group,))
+        if group is None:
+            await ctx.respond(f"Group '{employee_group}' not found.", ephemeral=self._eph(ctx))
+            return
+        erow = await db.fetchone("SELECT name FROM employee WHERE id = ?", (emp_id,))
+        await db.execute("DELETE FROM group_member WHERE groupID = ? AND employeeID = ?", (group["id"], emp_id))
+        who = erow["name"] if erow else str(emp_id)
+        timecard_log.info(f"[Group] {ctx.author} removed {who} ({emp_id}) from '{employee_group}'.")
+        await ctx.respond(f"Removed **{who}** from **{employee_group}**.", ephemeral=self._eph(ctx))
+
+    @discord.slash_command(name="groupmembers", description="List the members of an employee group.")
+    @is_timecard_admin()
+    async def groupmembers(
+        self, ctx: discord.ApplicationContext,
+        employee_group: discord.Option(str, description="The group", autocomplete=employee_group_autocomplete),  # type: ignore
+    ):
+        db = await self._ensure_db()
+        group = await db.fetchone("SELECT id FROM employee_group WHERE name = ?", (employee_group,))
+        if group is None:
+            await ctx.respond(f"Group '{employee_group}' not found.", ephemeral=self._eph(ctx))
+            return
+        rows = await db.fetchall(
+            "SELECT e.name FROM group_member gm JOIN employee e ON e.id = gm.employeeID "
+            "WHERE gm.groupID = ? ORDER BY e.name", (group["id"],))
+        if not rows:
+            await ctx.respond(f"**{employee_group}** has no members. Add some with /addtogroup.", ephemeral=self._eph(ctx))
+            return
+        body = "\n".join(f"• {r['name']}" for r in rows)
+        await ctx.respond(f"**{employee_group}** ({len(rows)} member{'s' if len(rows) != 1 else ''}):\n{body}", ephemeral=self._eph(ctx))
+
+    @discord.slash_command(name="setrateround", description="Toggle an employee's Hipp billed-rate rounding (round up vs truncate).")
+    @is_timecard_admin()
+    async def setrateround(
+        self, ctx: discord.ApplicationContext,
+        employee: discord.Option(str, description="The employee", autocomplete=employee_autocomplete),  # type: ignore
+        round_up: discord.Option(bool, description="Round the billed rate up to the cent (default off = truncate)"),  # type: ignore
+    ):
+        if not await self._pay_channel_guard(ctx):
+            return
+        db = await self._ensure_db()
+        emp_id = self._emp_from_mention(employee)
+        if emp_id is None:
+            await ctx.respond(f"'{employee}' is not a valid user mention.", ephemeral=self._eph(ctx))
+            return
+        erow = await db.fetchone("SELECT name FROM employee WHERE id = ?", (emp_id,))
+        if erow is None:
+            await ctx.respond(f"{employee} isn't in the employee system.", ephemeral=self._eph(ctx))
+            return
+        await db.execute("UPDATE employee SET rate_round_up = ? WHERE id = ?", (1 if round_up else 0, emp_id))
+        mode = "round up to the cent" if round_up else "truncate to the cent"
+        timecard_log.info(f"[Pay] {ctx.author} set {erow['name']} ({emp_id}) billed-rate rounding to {mode}.")
+        await ctx.respond(f"**{erow['name']}** billed rate will now **{mode}**.", ephemeral=self._eph(ctx))
+
+    @discord.slash_command(name="hippinvoice", description="Generate the Hipp staffing invoice (Std/OT billing + department breakdown).")
+    @is_timecard_admin()
+    async def hippinvoice(
+        self, ctx: discord.ApplicationContext,
+        employee_group: discord.Option(str, description="The Hipp employee group", autocomplete=employee_group_autocomplete),  # type: ignore
+        week_ending: discord.Option(str, default=None, description="Week-ending SATURDAY [YYYY-MM-DD]; defaults to the most recent.", autocomplete=week_ending_autocomplete),  # type: ignore
+        through_week: discord.Option(str, default=None, description="Optional later week-ending SATURDAY to span multiple weeks.", autocomplete=week_ending_autocomplete),  # type: ignore
+        invoice_number: discord.Option(str, default=None, description="Invoice number to print on the sheet."),  # type: ignore
+    ):
+        if not await self._pay_channel_guard(ctx):
+            return
+        db = await self._ensure_db()
+        await ctx.defer(ephemeral=True)
+        from datetime import datetime, timedelta
+        try:
+            if week_ending:
+                start_sat = datetime.strptime(week_ending, "%Y-%m-%d")
+                if start_sat.weekday() != 5:
+                    await ctx.respond(f"{week_ending} is a {get_day_of_week(week_ending)}, not a Saturday.", ephemeral=True)
+                    return
+            else:
+                today = datetime.now()
+                start_sat = today - timedelta(days=(today.weekday() - 5) % 7)
+            end_sat = start_sat
+            if through_week:
+                end_sat = datetime.strptime(through_week, "%Y-%m-%d")
+                if end_sat.weekday() != 5:
+                    await ctx.respond(f"{through_week} is a {get_day_of_week(through_week)}, not a Saturday.", ephemeral=True)
+                    return
+            if end_sat < start_sat:
+                start_sat, end_sat = end_sat, start_sat
+        except ValueError:
+            await ctx.respond("Invalid date format. Please use YYYY-MM-DD.", ephemeral=True)
+            return
+
+        period_start = start_sat - timedelta(days=6)   # Sunday opening the first week
+        period_end = end_sat + timedelta(days=1)        # exclusive: through the last Saturday
+
+        group = await db.fetchone("SELECT id FROM employee_group WHERE name = ?", (employee_group,))
+        if group is None:
+            await ctx.respond(f"Employee group '{employee_group}' not found. Create it with /creategroup.", ephemeral=True)
+            return
+        members = await db.fetchall("SELECT employeeID FROM group_member WHERE groupID = ?", (group["id"],))
+        if not members:
+            await ctx.respond(f"No employees in group '{employee_group}'. Add some with /addtogroup.", ephemeral=True)
+            return
+
+        rows = []
+        for m in members:
+            b = await costing.hipp_billing(db, m["employeeID"], period_start, period_end)
+            if b and (b["std_hrs"] or b["ot_hrs"]):
+                rows.append(b)
+        rows.sort(key=lambda r: r["name"])
+        if not rows:
+            await ctx.respond(f"No billable hours for '{employee_group}' in that period.", ephemeral=True)
+            return
+
+        if end_sat == start_sat:
+            period_label = f"Week ending {start_sat:%Y-%m-%d}"
+        else:
+            period_label = f"{period_start:%Y-%m-%d} to {end_sat:%Y-%m-%d}"
+        safe_group = employee_group.strip().replace(" ", "_")
+        os.makedirs("reports", exist_ok=True)
+        file_path = f"reports/{safe_group}_Hipp_Invoice_{start_sat:%Y-%m-%d}.xlsx"
+        await asyncio.to_thread(generate_hipp_invoice, file_path, rows, period_label, invoice_number)
+
+        rc_id = os.getenv("TIMECARD_REPORTS_CHANNEL_ID")
+        reports_channel = self.bot.get_channel(int(rc_id)) if rc_id and rc_id.isdigit() else None
+        if reports_channel:
+            await reports_channel.send(file=discord.File(file_path))
+            timecard_log.info(f"[Report] {ctx.author} generated the Hipp invoice for '{employee_group}' ({period_label}) → reports channel.")
+            await ctx.respond(f"Hipp invoice for {period_label} sent to the reports channel.", ephemeral=True)
+        else:
+            await ctx.respond(f"Hipp invoice for {period_label}:", file=discord.File(file_path), ephemeral=True)
 
     @discord.slash_command(name="timecardreport", description="Generate a weekly punch report given an end date.")
     @is_timecard_admin()
