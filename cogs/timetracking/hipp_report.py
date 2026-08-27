@@ -63,9 +63,11 @@ def _build_invoice_sheet(ws, rows, period_label, invoice_number):
     _cell(ws, "A4", f"Period Covered: {period_label}", _BODY)
 
     top = 6
-    headers = [("A", "Emp. #"), ("B", "Employee"), ("C", "Std. Hrs."), ("D", "Std. Rate"),
-               ("E", "OT Hrs."), ("F", "OT Rate"), ("G", "Total")]
-    _header_row(ws, top, headers, widths=[8, 26, 10, 12, 10, 12, 14])
+    # "Pay Rate" is the employee's current standard hourly rate; "Std. Rate" is the
+    # billed rate (Pay Rate x the employee-type markup).
+    headers = [("A", "Emp. #"), ("B", "Employee"), ("C", "Pay Rate"), ("D", "Std. Hrs."),
+               ("E", "Std. Rate"), ("F", "OT Hrs."), ("G", "OT Rate"), ("H", "Total")]
+    _header_row(ws, top, headers, widths=[8, 26, 11, 10, 12, 10, 12, 14])
 
     r = top
     grand = 0.0
@@ -73,15 +75,16 @@ def _build_invoice_sheet(ws, rows, period_label, invoice_number):
         r += 1
         _cell(ws, f"A{r}", n, _BODY, "General", _BOX, _CENTER)
         _cell(ws, f"B{r}", row["name"], _BODY, "General", _BOX)
-        _cell(ws, f"C{r}", row["std_hrs"], _BODY, _HRS, _BOX, _RIGHT)
-        _cell(ws, f"D{r}", row["std_rate"], _BODY, _CUR, _BOX, _RIGHT)
-        _cell(ws, f"E{r}", row["ot_hrs"], _BODY, _HRS, _BOX, _RIGHT)
-        _cell(ws, f"F{r}", row["ot_rate"], _BODY, _CUR, _BOX, _RIGHT)
-        _cell(ws, f"G{r}", row["total"], _BODY, _CUR, _BOX, _RIGHT)
+        _cell(ws, f"C{r}", row.get("base_rate", 0.0), _BODY, _CUR, _BOX, _RIGHT)
+        _cell(ws, f"D{r}", row["std_hrs"], _BODY, _HRS, _BOX, _RIGHT)
+        _cell(ws, f"E{r}", row["std_rate"], _BODY, _CUR, _BOX, _RIGHT)
+        _cell(ws, f"F{r}", row["ot_hrs"], _BODY, _HRS, _BOX, _RIGHT)
+        _cell(ws, f"G{r}", row["ot_rate"], _BODY, _CUR, _BOX, _RIGHT)
+        _cell(ws, f"H{r}", row["total"], _BODY, _CUR, _BOX, _RIGHT)
         grand += row["total"]
     r += 1
     _cell(ws, f"B{r}", "Total", _HDR, "General", _BOX, _RIGHT)
-    _cell(ws, f"G{r}", round(grand, 2), _HDR, _CUR, _BOX, _RIGHT)
+    _cell(ws, f"H{r}", round(grand, 2), _HDR, _CUR, _BOX, _RIGHT)
 
 
 def _build_department_sheet(ws, rows):

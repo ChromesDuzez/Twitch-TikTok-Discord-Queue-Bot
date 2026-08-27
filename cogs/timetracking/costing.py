@@ -134,7 +134,7 @@ async def hipp_billing(db: Database, employee_id: int, start, end) -> dict:
     """Everything the Hipp invoice needs for one employee over [start, end).
 
     Std/OT hours come from weekly (>40) net hours. The billed rate marks up the
-    employee's effective payrate by their employee_type.rate (Clerical 1.5,
+    employee's CURRENT payrate by their employee_type.rate (Clerical 1.5,
     Construction 1.7); OT bills at that x1.5. Rates are truncated to 2 decimals
     unless the employee's rate_round_up flag is set. The line total rounds each
     component to the cent (round(std_hrs*std_rate) + round(ot_hrs*ot_rate)). Also
@@ -147,7 +147,11 @@ async def hipp_billing(db: Database, employee_id: int, start, end) -> dict:
     )
     if emp is None:
         return {}
-    pay_rec = await pay.effective_pay(db, employee_id, _as_str(start)[:10])
+    # Bill at the employee's CURRENT standard rate (what's set for them now), not
+    # the rate that happened to be in effect during the work period -- an invoice
+    # goes out at today's contracted rate. Hybrid stores its rate in hourly_rate
+    # too, so this covers Hourly and Hybrid; a Salaried record has no hourly rate.
+    pay_rec = await pay.current_pay(db, employee_id)
     base = float(pay_rec["hourly_rate"]) if pay_rec and pay_rec["hourly_rate"] is not None else 0.0
     type_rate = float(emp["type_rate"] or 1.0)
 
@@ -158,6 +162,7 @@ async def hipp_billing(db: Database, employee_id: int, start, end) -> dict:
     return {
         "employee_id": employee_id,
         "name": emp["name"],
+        "base_rate": round(base, 2),   # the employee's current standard hourly rate
         "std_hrs": round(std_hrs, 2),
         "ot_hrs": round(ot_hrs, 2),
         "std_rate": std_rate,
