@@ -24,12 +24,49 @@ Blocking; call via asyncio.to_thread. Rows come from costing.hipp_billing.
 
 from __future__ import annotations
 
+import re
 from datetime import date
 
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 
 from . import costing
+
+
+def _modern_theme() -> bytes | None:
+    """openpyxl bundles the OLD Office 2007-2010 theme, so a downloaded report shows
+    that palette (beige "Background 2", muted accents) instead of the modern one the
+    owner's spreadsheets use. Rebuild the theme with the modern Office color scheme
+    (+ Calibri Light headings) so the in-Excel palette matches. Colors in the report
+    itself are explicit hex, so this only affects the theme palette, never the look.
+    Returns theme bytes to assign to Workbook.loaded_theme, or None if unavailable."""
+    try:
+        from openpyxl.writer.theme import theme_xml
+    except Exception:  # noqa: BLE001 - never let theming break report generation
+        return None
+    xml = theme_xml.decode() if isinstance(theme_xml, (bytes, bytearray)) else theme_xml
+    modern_clr = (
+        '<a:clrScheme name="Office">'
+        '<a:dk1><a:sysClr val="windowText" lastClr="000000"/></a:dk1>'
+        '<a:lt1><a:sysClr val="window" lastClr="FFFFFF"/></a:lt1>'
+        '<a:dk2><a:srgbClr val="44546A"/></a:dk2>'
+        '<a:lt2><a:srgbClr val="E7E6E6"/></a:lt2>'
+        '<a:accent1><a:srgbClr val="4472C4"/></a:accent1>'
+        '<a:accent2><a:srgbClr val="ED7D31"/></a:accent2>'
+        '<a:accent3><a:srgbClr val="A5A5A5"/></a:accent3>'
+        '<a:accent4><a:srgbClr val="FFC000"/></a:accent4>'
+        '<a:accent5><a:srgbClr val="5B9BD5"/></a:accent5>'
+        '<a:accent6><a:srgbClr val="70AD47"/></a:accent6>'
+        '<a:hlink><a:srgbClr val="0563C1"/></a:hlink>'
+        '<a:folHlink><a:srgbClr val="954F72"/></a:folHlink>'
+        '</a:clrScheme>'
+    )
+    xml = re.sub(r"<a:clrScheme.*?</a:clrScheme>", lambda _m: modern_clr, xml, count=1, flags=re.S)
+    xml = xml.replace('<a:latin typeface="Cambria"/>', '<a:latin typeface="Calibri Light"/>', 1)
+    return xml.encode("utf-8")
+
+
+_MODERN_THEME = _modern_theme()
 
 _HDR = Font(name="Arial", size=10, bold=True)
 _BODY = Font(name="Arial", size=10)
@@ -173,6 +210,8 @@ def generate_hipp_invoice(file_path: str, rows: list[dict], period_label: str,
     """Write the two-sheet Hipp invoice workbook to ``file_path``. ``rows`` is a list
     of costing.hipp_billing dicts. Blocking — run in a worker thread."""
     wb = Workbook()
+    if _MODERN_THEME:
+        wb.loaded_theme = _MODERN_THEME   # match the owner's spreadsheets' theme palette
     _build_invoice_sheet(wb.active, rows, period_label, invoice_number)
     _build_department_sheet(wb.create_sheet("Payroll by Department"), rows)
     wb.save(file_path)
