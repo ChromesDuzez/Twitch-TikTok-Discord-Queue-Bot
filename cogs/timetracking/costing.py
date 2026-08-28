@@ -162,7 +162,7 @@ async def hipp_billing(db: Database, employee_id: int, start, end) -> dict:
     std_hrs, ot_hrs = std_ot_split(await weekly_net_hours(db, employee_id, start, end))
     std_rate = _round_rate(base * type_rate, emp["std_rate_round"])
     ot_rate = _round_rate(base * type_rate * 1.5, emp["ot_rate_round"])
-    total = round(round(std_hrs * std_rate, 2) + round(ot_hrs * ot_rate, 2), 2)
+    total = round(std_hrs * std_rate, 2) + round(ot_hrs * ot_rate, 2)
     return {
         "employee_id": employee_id,
         "name": emp["name"],
