@@ -107,7 +107,7 @@ def distribute_pay(total: float, hours_by_cat: dict[str, float], catchall: str) 
     `total`. This is the shared primitive behind the Hipp department breakdown and
     (later) the salaried cost distribution. A zero-hours input yields all-zero
     except the catch-all, which gets the full total."""
-    total = round(float(total), 2)
+    total = round_cents(float(total))
     total_hours = sum(hours_by_cat.values())
     out = {c: 0.0 for c in hours_by_cat}
     if catchall not in out:
@@ -118,9 +118,18 @@ def distribute_pay(total: float, hours_by_cat: dict[str, float], catchall: str) 
     for cat, hrs in hours_by_cat.items():
         if cat == catchall:
             continue
-        out[cat] = round(total * hrs / total_hours, 2)
-    out[catchall] = round(total - sum(v for c, v in out.items() if c != catchall), 2)
+        out[cat] = round_cents(total * hrs / total_hours)
+    out[catchall] = round_cents(total - sum(v for c, v in out.items() if c != catchall))
     return out
+
+
+def round_cents(x: float) -> float:
+    """Round money to 2 decimals, half away from zero — matching Excel's ROUND, and
+    float-safe. Python's round() both uses banker's rounding AND is fooled by binary
+    float noise (13.75*54.82 is stored as 753.77499999…, so round() gives 753.77);
+    trimming to 6 decimals first, then Decimal-rounding half-up, yields 753.78 like
+    the spreadsheet. Use this for every money figure so pennies match the reports."""
+    return float(Decimal(str(round(x, 6))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 
 def _round_rate(rate: float, do_round) -> float:
@@ -162,7 +171,8 @@ async def hipp_billing(db: Database, employee_id: int, start, end) -> dict:
     std_hrs, ot_hrs = std_ot_split(await weekly_net_hours(db, employee_id, start, end))
     std_rate = _round_rate(base * type_rate, emp["std_rate_round"])
     ot_rate = _round_rate(base * type_rate * 1.5, emp["ot_rate_round"])
-    total = round(std_hrs * std_rate, 2) + round(ot_hrs * ot_rate, 2)
+    # Mirror the invoice: SUM(ROUND(std_hrs*std_rate,2), ROUND(ot_hrs*ot_rate,2)).
+    total = round_cents(round_cents(std_hrs * std_rate) + round_cents(ot_hrs * ot_rate))
     return {
         "employee_id": employee_id,
         "name": emp["name"],
