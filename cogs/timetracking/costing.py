@@ -17,6 +17,7 @@ three stored punchTypes (Construction/Service/Office); **Shop is the remainder**
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 
 from .db import Database
 from .reports import convert_minutes_to_hours, round_to_quarter_hour
@@ -122,12 +123,14 @@ def distribute_pay(total: float, hours_by_cat: dict[str, float], catchall: str) 
     return out
 
 
-def _round_rate(rate: float, round_up) -> float:
-    """Truncate the billed rate to 2 decimals by default; round to nearest cent when
-    the per-employee round-up flag is set (matches the Hipp template)."""
-    if round_up:
-        return round(rate, 2)
-    return int(rate * 100) / 100.0  # truncate toward zero (rates are non-negative)
+def _round_rate(rate: float, do_round) -> float:
+    """Reduce a billed rate to 2 decimals. ``do_round`` truthy → normal rounding
+    (half away from zero, like Excel ROUND); falsy → truncate (drop the extra
+    digits). Uses Decimal on a noise-trimmed value so binary float artifacts (e.g.
+    18*1.7 == 30.599999999999998) don't mis-truncate 30.60 to 30.59."""
+    d = Decimal(str(round(rate, 6)))  # str(round(...)) strips float noise
+    mode = ROUND_HALF_UP if do_round else ROUND_DOWN
+    return float(d.quantize(Decimal("0.01"), rounding=mode))
 
 
 async def hipp_billing(db: Database, employee_id: int, start, end) -> dict:
@@ -135,13 +138,14 @@ async def hipp_billing(db: Database, employee_id: int, start, end) -> dict:
 
     Std/OT hours come from weekly (>40) net hours. The billed rate marks up the
     employee's CURRENT payrate by their employee_type.rate (Clerical 1.5,
-    Construction 1.7); OT bills at that x1.5. Rates are truncated to 2 decimals
-    unless the employee's rate_round_up flag is set. The line total rounds each
-    component to the cent (round(std_hrs*std_rate) + round(ot_hrs*ot_rate)). Also
-    returns category hours for the department-distribution sheet.
+    Construction 1.7); OT bills at that x1.5. Each billed rate is truncated to 2
+    decimals unless that employee's per-rate rounding flag is set (std_rate_round
+    for the standard rate, ot_rate_round for OT), in which case it rounds normally.
+    The line total rounds each component to the cent (round(std_hrs*std_rate) +
+    round(ot_hrs*ot_rate)). Also returns category hours for the department sheet.
     """
     emp = await db.fetchone(
-        "SELECT e.name, e.rate_round_up, et.rate AS type_rate "
+        "SELECT e.name, e.std_rate_round, e.ot_rate_round, et.rate AS type_rate "
         "FROM employee e JOIN employee_type et ON e.employeeTypeID = et.id WHERE e.id = ?",
         (employee_id,),
     )
@@ -156,8 +160,8 @@ async def hipp_billing(db: Database, employee_id: int, start, end) -> dict:
     type_rate = float(emp["type_rate"] or 1.0)
 
     std_hrs, ot_hrs = std_ot_split(await weekly_net_hours(db, employee_id, start, end))
-    std_rate = _round_rate(base * type_rate, emp["rate_round_up"])
-    ot_rate = _round_rate(base * type_rate * 1.5, emp["rate_round_up"])
+    std_rate = _round_rate(base * type_rate, emp["std_rate_round"])
+    ot_rate = _round_rate(base * type_rate * 1.5, emp["ot_rate_round"])
     total = round(round(std_hrs * std_rate, 2) + round(ot_hrs * ot_rate, 2), 2)
     return {
         "employee_id": employee_id,

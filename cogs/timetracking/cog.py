@@ -2343,12 +2343,13 @@ class TimeTracking(commands.Cog):
         body = "\n".join(f"• {r['name']}" for r in rows)
         await ctx.respond(f"**{employee_group}** ({len(rows)} member{'s' if len(rows) != 1 else ''}):\n{body}", ephemeral=self._eph(ctx))
 
-    @discord.slash_command(name="setrateround", description="Toggle an employee's Hipp billed-rate rounding (round up vs truncate).")
+    @discord.slash_command(name="setrateround", description="Set how an employee's Hipp billed rates round (round normally vs truncate).")
     @is_timecard_admin()
     async def setrateround(
         self, ctx: discord.ApplicationContext,
         employee: discord.Option(str, description="The employee", autocomplete=employee_autocomplete),  # type: ignore
-        round_up: discord.Option(bool, description="Round the billed rate up to the cent (default off = truncate)"),  # type: ignore
+        standard: discord.Option(bool, default=None, description="Standard rate: on = round to nearest cent, off = truncate"),  # type: ignore
+        overtime: discord.Option(bool, default=None, description="OT rate: on = round to nearest cent, off = truncate"),  # type: ignore
     ):
         if not await self._pay_channel_guard(ctx):
             return
@@ -2357,14 +2358,27 @@ class TimeTracking(commands.Cog):
         if emp_id is None:
             await ctx.respond(f"'{employee}' is not a valid user mention.", ephemeral=self._eph(ctx))
             return
-        erow = await db.fetchone("SELECT name FROM employee WHERE id = ?", (emp_id,))
+        erow = await db.fetchone("SELECT name, std_rate_round, ot_rate_round FROM employee WHERE id = ?", (emp_id,))
         if erow is None:
             await ctx.respond(f"{employee} isn't in the employee system.", ephemeral=self._eph(ctx))
             return
-        await db.execute("UPDATE employee SET rate_round_up = ? WHERE id = ?", (1 if round_up else 0, emp_id))
-        mode = "round up to the cent" if round_up else "truncate to the cent"
-        timecard_log.info(f"[Pay] {ctx.author} set {erow['name']} ({emp_id}) billed-rate rounding to {mode}.")
-        await ctx.respond(f"**{erow['name']}** billed rate will now **{mode}**.", ephemeral=self._eph(ctx))
+        sets, changed = [], []
+        if standard is not None:
+            sets.append(("std_rate_round", 1 if standard else 0))
+            changed.append(f"standard rate → {'round' if standard else 'truncate'}")
+        if overtime is not None:
+            sets.append(("ot_rate_round", 1 if overtime else 0))
+            changed.append(f"OT rate → {'round' if overtime else 'truncate'}")
+        if not sets:
+            std = "round" if erow["std_rate_round"] else "truncate"
+            ot = "round" if erow["ot_rate_round"] else "truncate"
+            await ctx.respond(f"**{erow['name']}** rate rounding — standard: **{std}**, OT: **{ot}**. "
+                              f"Pass `standard` and/or `overtime` to change.", ephemeral=self._eph(ctx))
+            return
+        await db.execute(f"UPDATE employee SET {', '.join(f'{c} = ?' for c, _ in sets)} WHERE id = ?",
+                         (*[v for _, v in sets], emp_id))
+        timecard_log.info(f"[Pay] {ctx.author} set {erow['name']} ({emp_id}) rate rounding: {'; '.join(changed)}.")
+        await ctx.respond(f"**{erow['name']}** rate rounding updated — {'; '.join(changed)}.", ephemeral=self._eph(ctx))
 
     @discord.slash_command(name="hippinvoice", description="Generate the Hipp staffing invoice (Std/OT billing + department breakdown).")
     @is_timecard_admin()
