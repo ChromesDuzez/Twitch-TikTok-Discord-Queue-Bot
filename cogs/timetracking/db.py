@@ -28,7 +28,7 @@ RELEASE_VERSION = "2.0"
 # version 1, the refactored schema is version 2. Drives upgrades and stamps the
 # live db filename (timetracker.v{N}.db). Bump (both here and ENV in config.py)
 # on a future schema change.
-TARGET_VERSION = 3
+TARGET_VERSION = 4
 
 # Canonical worktime categories the employee can start. NOTE: "Shop" is NOT one
 # of these -- shop time is a calculated remainder in reports, never a punch.
@@ -122,6 +122,7 @@ class Database:
                 pay_type       TEXT               NOT NULL DEFAULT 'Hourly',
                 std_rate_round BOOLEAN            NOT NULL DEFAULT 0,
                 ot_rate_round  BOOLEAN            NOT NULL DEFAULT 0,
+                catchall_category TEXT            NOT NULL DEFAULT 'Shop',
                 employeeTypeID INTEGER            NOT NULL DEFAULT 2,
                 lunchSkipable  BOOLEAN            NOT NULL DEFAULT 0,
                 clockChannelId UNSIGNED BIG INT   NULL DEFAULT NULL,
@@ -230,6 +231,24 @@ class Database:
                 created_by  TEXT             NULL,
                 FOREIGN KEY (employeeID) REFERENCES employee(id)
             );
+            CREATE TABLE pay_period (
+                id          INTEGER          PRIMARY KEY AUTOINCREMENT,
+                period_end  DATE             NOT NULL UNIQUE,
+                check_date  DATE             NOT NULL,
+                label       TEXT             NULL
+            );
+            CREATE TABLE leave_entry (
+                id          INTEGER          PRIMARY KEY AUTOINCREMENT,
+                employeeID  UNSIGNED BIG INT NOT NULL,
+                entry_date  DATE             NOT NULL,
+                kind        TEXT CHECK( kind IN ('Vacation','Holiday','Sick','Bonus') ) NOT NULL,
+                hours       DECIMAL(6,2)     NULL,
+                amount      DECIMAL(10,2)    NULL,
+                note        TEXT             NULL,
+                created_at  DATETIME         NOT NULL,
+                created_by  TEXT             NULL,
+                FOREIGN KEY (employeeID) REFERENCES employee(id)
+            );
             """
         )
         await c.executemany(
@@ -275,6 +294,8 @@ class Database:
             await self._migrate_to_v2()
         if current < 3:
             await self._migrate_to_v3()
+        if current < 4:
+            await self._migrate_to_v4()
 
         await c.execute("UPDATE schema_version SET version = ?", (TARGET_VERSION,))
         await c.commit()
@@ -294,6 +315,8 @@ class Database:
         # 0 = truncate. Separate flags for the standard rate and the OT rate.
         ("employee", "std_rate_round", "BOOLEAN NOT NULL DEFAULT 0"),
         ("employee", "ot_rate_round", "BOOLEAN NOT NULL DEFAULT 0"),
+        # Per-employee canonical category that absorbs the distribution remainder.
+        ("employee", "catchall_category", "TEXT NOT NULL DEFAULT 'Shop'"),
         ("punch_clock", "odooId", "UNSIGNED BIG INT NULL DEFAULT NULL"),
         ("punch_clock", "legacy", "BOOLEAN NOT NULL DEFAULT 0"),
         ("customer", "odooId", "UNSIGNED BIG INT NULL DEFAULT NULL"),
@@ -508,6 +531,39 @@ class Database:
         )
         await c.commit()
         log.info("[DB] Upgrade to v3 complete.")
+
+    async def _migrate_to_v4(self):
+        """v3 -> v4: the payroll-distribution foundation — a configurable pay
+        calendar, a leave & bonus ledger, and a per-employee catch-all category.
+        Idempotent: tables use IF NOT EXISTS and the column add is guarded."""
+        log.info("[DB] Upgrading database to v4 (pay calendar + leave/bonus ledger)...")
+        c = self._conn
+        if not await self._column_exists("employee", "catchall_category"):
+            await c.execute("ALTER TABLE employee ADD COLUMN catchall_category TEXT NOT NULL DEFAULT 'Shop'")
+        await c.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS pay_period (
+                id          INTEGER          PRIMARY KEY AUTOINCREMENT,
+                period_end  DATE             NOT NULL UNIQUE,
+                check_date  DATE             NOT NULL,
+                label       TEXT             NULL
+            );
+            CREATE TABLE IF NOT EXISTS leave_entry (
+                id          INTEGER          PRIMARY KEY AUTOINCREMENT,
+                employeeID  UNSIGNED BIG INT NOT NULL,
+                entry_date  DATE             NOT NULL,
+                kind        TEXT CHECK( kind IN ('Vacation','Holiday','Sick','Bonus') ) NOT NULL,
+                hours       DECIMAL(6,2)     NULL,
+                amount      DECIMAL(10,2)    NULL,
+                note        TEXT             NULL,
+                created_at  DATETIME         NOT NULL,
+                created_by  TEXT             NULL,
+                FOREIGN KEY (employeeID) REFERENCES employee(id)
+            );
+            """
+        )
+        await c.commit()
+        log.info("[DB] Upgrade to v4 complete.")
 
     async def _rebuild_id_as_rowid(self, table: str, create_new_sql: str, columns: str):
         """Rebuild `table` from a `<table>_new` definition, copying all columns.

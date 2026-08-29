@@ -154,7 +154,7 @@ async def hipp_billing(db: Database, employee_id: int, start, end) -> dict:
     round(ot_hrs*ot_rate)). Also returns category hours for the department sheet.
     """
     emp = await db.fetchone(
-        "SELECT e.name, e.std_rate_round, e.ot_rate_round, et.rate AS type_rate "
+        "SELECT e.name, e.std_rate_round, e.ot_rate_round, e.catchall_category, et.rate AS type_rate "
         "FROM employee e JOIN employee_type et ON e.employeeTypeID = et.id WHERE e.id = ?",
         (employee_id,),
     )
@@ -182,5 +182,6 @@ async def hipp_billing(db: Database, employee_id: int, start, end) -> dict:
         "std_rate": std_rate,
         "ot_rate": ot_rate,
         "total": total,
+        "catchall": emp["catchall_category"] or "Shop",
         "category_hours": await category_hours(db, employee_id, start, end),
     }
