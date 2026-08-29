@@ -185,3 +185,89 @@ async def hipp_billing(db: Database, employee_id: int, start, end) -> dict:
         "catchall": emp["catchall_category"] or "Shop",
         "category_hours": await category_hours(db, employee_id, start, end),
     }
+
+
+# ---- payroll-distribution engine (insurance-audit reports) ------------------
+#
+# Each employee's pay for a bi-weekly PAY PERIOD is distributed across categories
+# by hours, with a per-employee catch-all absorbing the remainder (same primitive
+# as the Hipp department sheet). Salaried gross = the cycle amount; hourly gross =
+# hours*rate (+OT). Paid leave (Vacation/Holiday/Sick) hours land in the Bonus
+# category; the year-end bonus lump sum is added separately by the report.
+
+# The category columns these reports show. Officer is carried (always 0 today).
+PAYROLL_CATEGORIES = ("Officer", "Construction", "Service", "Office", "Shop", "Bonus")
+
+
+def _date_only(x) -> str:
+    return x[:10] if isinstance(x, str) else x.strftime("%Y-%m-%d")
+
+
+def period_range(period_end) -> tuple[datetime, datetime]:
+    """The two Saturday-weeks a bi-weekly period covers: [period_end-13d, period_end+1d)
+    (Sunday opening week 1 through the period-ending Saturday)."""
+    d = datetime.strptime(_date_only(period_end), "%Y-%m-%d")
+    return d - timedelta(days=13), d + timedelta(days=1)
+
+
+async def pay_periods(db: Database, start, end) -> list:
+    """Calendar periods whose CHECK date falls in [start, end) (Monthly/Summary
+    bucket by check date), oldest first."""
+    return await db.fetchall(
+        "SELECT id, period_end, check_date, label FROM pay_period "
+        "WHERE check_date >= ? AND check_date < ? ORDER BY period_end",
+        (_date_only(start), _date_only(end)),
+    )
+
+
+async def leave_hours(db: Database, employee_id: int, start, end) -> float:
+    """Paid-leave hours (Vacation/Holiday/Sick) with entry_date in [start, end)."""
+    row = await db.fetchone(
+        "SELECT COALESCE(SUM(hours), 0) AS h FROM leave_entry "
+        "WHERE employeeID = ? AND kind IN ('Vacation','Holiday','Sick') "
+        "AND entry_date >= ? AND entry_date < ?",
+        (employee_id, _date_only(start), _date_only(end)),
+    )
+    return float(row["h"]) if row and row["h"] is not None else 0.0
+
+
+async def bonus_amount(db: Database, employee_id: int, start, end) -> float:
+    """Bonus lump-sum dollars with entry_date in [start, end)."""
+    row = await db.fetchone(
+        "SELECT COALESCE(SUM(amount), 0) AS a FROM leave_entry "
+        "WHERE employeeID = ? AND kind = 'Bonus' AND entry_date >= ? AND entry_date < ?",
+        (employee_id, _date_only(start), _date_only(end)),
+    )
+    return float(row["a"]) if row and row["a"] is not None else 0.0
+
+
+async def period_gross(db: Database, employee_id: int, period_end) -> float:
+    """The employee's gross pay for the pay period, at the rate in effect during the
+    period (payroll is historical). Salaried: the cycle gross; Hourly/Hybrid:
+    std*rate + ot*(rate*1.5) over the two weeks (>40/week OT)."""
+    rec = await pay.effective_pay(db, employee_id, _date_only(period_end))
+    if rec is None:
+        return 0.0
+    if rec["pay_type"] == "Salaried":
+        return round_cents(float(rec["cycle_gross"] or 0.0))
+    rate = float(rec["hourly_rate"] or 0.0)
+    start, end = period_range(period_end)
+    std, ot = std_ot_split(await weekly_net_hours(db, employee_id, start, end))
+    return round_cents(std * rate + ot * rate * 1.5)
+
+
+async def period_distribution(db: Database, employee_id: int, period_end) -> dict[str, float]:
+    """Distribute an employee's period gross across the payroll categories by hours,
+    with the per-employee catch-all absorbing the remainder. Work hours come from
+    the timecard; paid-leave hours become the Bonus category's hours (so a salaried
+    person's leave is paid out of the same gross). Does NOT include the year-end
+    bonus lump sum — the report adds that to the Bonus column via ``bonus_amount``."""
+    start, end = period_range(period_end)
+    ch = await category_hours(db, employee_id, start, end)
+    lv = await leave_hours(db, employee_id, start, end)
+    gross = await period_gross(db, employee_id, period_end)
+    row = await db.fetchone("SELECT catchall_category FROM employee WHERE id = ?", (employee_id,))
+    catchall = (row["catchall_category"] if row else "Shop") or "Shop"
+    hours = {"Officer": 0.0, "Construction": ch["Construction"], "Service": ch["Service"],
+             "Office": ch["Office"], "Shop": ch["Shop"], "Bonus": lv}
+    return distribute_pay(gross, hours, catchall)

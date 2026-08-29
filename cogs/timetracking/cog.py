@@ -55,6 +55,8 @@ _MANAGEMENT_COMMANDS = {
     "setpay", "payhistory", "bankadjust", "bankbalance",
     "creategroup", "addtogroup", "removefromgroup", "groupmembers",
     "setrateround", "hippinvoice",
+    "genpaycalendar", "addpayperiod", "paycalendar",
+    "addleave", "addbonus", "leavehistory", "setcatchall",
     "createclock", "deleteclock",
 }
 
@@ -2454,6 +2456,213 @@ class TimeTracking(commands.Cog):
             await ctx.respond(f"Hipp invoice for {period_label} sent to the reports channel.", ephemeral=True)
         else:
             await ctx.respond(f"Hipp invoice for {period_label}:", file=discord.File(file_path), ephemeral=True)
+
+    # ---- payroll calendar, leave/bonus ledger, catch-all (payroll reports) --
+
+    @discord.slash_command(name="genpaycalendar", description="Generate bi-weekly pay periods from an anchor period-end date.")
+    @is_timecard_admin()
+    async def genpaycalendar(
+        self, ctx: discord.ApplicationContext,
+        anchor_period_end: discord.Option(str, description="First period-end date [YYYY-MM-DD] (a Saturday)"),  # type: ignore
+        count: discord.Option(int, default=26, description="How many periods to generate (default 26 ≈ 1 year)"),  # type: ignore
+        check_offset_days: discord.Option(int, default=7, description="Days after period-end the check is dated (default 7)"),  # type: ignore
+        cadence_days: discord.Option(int, default=14, description="Days between period-ends (default 14 = bi-weekly)"),  # type: ignore
+    ):
+        if not await self._pay_channel_guard(ctx):
+            return
+        db = await self._ensure_db()
+        try:
+            anchor = _parse_effective_date(anchor_period_end)
+        except ValueError as e:
+            await ctx.respond(str(e), ephemeral=self._eph(ctx))
+            return
+        from datetime import datetime, timedelta
+        d0 = datetime.strptime(anchor, "%Y-%m-%d")
+        existing = {r["period_end"] for r in await db.fetchall("SELECT period_end FROM pay_period")}
+        created = skipped = 0
+        for i in range(max(1, count)):
+            pe = (d0 + timedelta(days=cadence_days * i)).strftime("%Y-%m-%d")
+            cd = (d0 + timedelta(days=cadence_days * i + check_offset_days)).strftime("%Y-%m-%d")
+            if pe in existing:
+                skipped += 1
+                continue
+            await db.execute("INSERT INTO pay_period (period_end, check_date) VALUES (?, ?)", (pe, cd))
+            created += 1
+        timecard_log.info(f"[Payroll] {ctx.author} generated {created} pay period(s) from {anchor} "
+                          f"(every {cadence_days}d, check +{check_offset_days}d).")
+        await ctx.respond(f"Generated **{created}** pay period(s) from `{anchor}` (every {cadence_days}d, "
+                          f"check +{check_offset_days}d)." + (f" {skipped} already existed." if skipped else ""),
+                          ephemeral=self._eph(ctx))
+
+    @discord.slash_command(name="addpayperiod", description="Add or edit a single pay period (period-end + check date).")
+    @is_timecard_admin()
+    async def addpayperiod(
+        self, ctx: discord.ApplicationContext,
+        period_end: discord.Option(str, description="Period-end date [YYYY-MM-DD]"),  # type: ignore
+        check_date: discord.Option(str, description="Check date [YYYY-MM-DD]"),  # type: ignore
+        label: discord.Option(str, default=None, description="Optional label"),  # type: ignore
+    ):
+        if not await self._pay_channel_guard(ctx):
+            return
+        db = await self._ensure_db()
+        try:
+            pe, cd = _parse_effective_date(period_end), _parse_effective_date(check_date)
+        except ValueError as e:
+            await ctx.respond(str(e), ephemeral=self._eph(ctx))
+            return
+        exists = await db.fetchone("SELECT id FROM pay_period WHERE period_end = ?", (pe,))
+        if exists:
+            await db.execute("UPDATE pay_period SET check_date = ?, label = ? WHERE id = ?", (cd, label, exists["id"]))
+            verb = "Updated"
+        else:
+            await db.execute("INSERT INTO pay_period (period_end, check_date, label) VALUES (?, ?, ?)", (pe, cd, label))
+            verb = "Added"
+        timecard_log.info(f"[Payroll] {ctx.author} {verb.lower()} pay period {pe} (check {cd}).")
+        await ctx.respond(f"{verb} pay period ending `{pe}`, check `{cd}`" + (f" — {label}" if label else "") + ".",
+                          ephemeral=self._eph(ctx))
+
+    @discord.slash_command(name="paycalendar", description="Show the pay periods for a year.")
+    @is_timecard_admin()
+    async def paycalendar(
+        self, ctx: discord.ApplicationContext,
+        year: discord.Option(int, default=None, description="Year (default: current)"),  # type: ignore
+    ):
+        if not await self._pay_channel_guard(ctx):
+            return
+        db = await self._ensure_db()
+        yr = year or datetime.now().year
+        rows = await db.fetchall(
+            "SELECT period_end, check_date, label FROM pay_period WHERE period_end LIKE ? ORDER BY period_end",
+            (f"{yr}-%",))
+        if not rows:
+            await ctx.respond(f"No pay periods for {yr}. Generate them with /genpaycalendar.", ephemeral=self._eph(ctx))
+            return
+        lines = [f"`{r['period_end']}` → check `{r['check_date']}`" + (f"  {r['label']}" if r["label"] else "") for r in rows]
+        await ctx.respond(f"**Pay calendar {yr}** ({len(rows)} periods)\n" + "\n".join(lines), ephemeral=self._eph(ctx))
+
+    @discord.slash_command(name="addleave", description="Log paid leave hours (Vacation/Holiday/Sick) for an employee.")
+    @is_timecard_admin()
+    async def addleave(
+        self, ctx: discord.ApplicationContext,
+        employee: discord.Option(str, description="The employee", autocomplete=employee_autocomplete),  # type: ignore
+        kind: discord.Option(str, choices=["Vacation", "Holiday", "Sick"], description="Leave type"),  # type: ignore
+        hours: discord.Option(float, description="Hours of leave"),  # type: ignore
+        date: discord.Option(str, default=None, description="Date it applies to [YYYY-MM-DD] (default: today)"),  # type: ignore
+        note: discord.Option(str, default=None, description="Optional note"),  # type: ignore
+    ):
+        if not await self._pay_channel_guard(ctx):
+            return
+        db = await self._ensure_db()
+        emp_id = self._emp_from_mention(employee)
+        if emp_id is None:
+            await ctx.respond(f"'{employee}' is not a valid user mention.", ephemeral=self._eph(ctx))
+            return
+        row = await db.fetchone("SELECT name FROM employee WHERE id = ?", (emp_id,))
+        if row is None:
+            await ctx.respond(f"{employee} isn't in the employee system.", ephemeral=self._eph(ctx))
+            return
+        if hours <= 0:
+            await ctx.respond("Hours must be positive.", ephemeral=self._eph(ctx))
+            return
+        try:
+            eff = _parse_effective_date(date)
+        except ValueError as e:
+            await ctx.respond(str(e), ephemeral=self._eph(ctx))
+            return
+        await db.execute(
+            "INSERT INTO leave_entry (employeeID, entry_date, kind, hours, note, created_at, created_by) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (emp_id, eff, kind, hours, note, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), str(ctx.author)))
+        timecard_log.info(f"[Payroll] {ctx.author} logged {hours:g}h {kind} for {row['name']} ({emp_id}) on {eff}.")
+        await ctx.respond(f"Logged **{hours:g}h {kind}** for **{row['name']}** on `{eff}`."
+                          + (f"\nNote: {note}" if note else ""), ephemeral=self._eph(ctx))
+
+    @discord.slash_command(name="addbonus", description="Log a bonus check (lump sum) for an employee.")
+    @is_timecard_admin()
+    async def addbonus(
+        self, ctx: discord.ApplicationContext,
+        employee: discord.Option(str, description="The employee", autocomplete=employee_autocomplete),  # type: ignore
+        amount: discord.Option(float, description="Bonus amount ($)"),  # type: ignore
+        check_date: discord.Option(str, default=None, description="Check date [YYYY-MM-DD] (default: today)"),  # type: ignore
+        note: discord.Option(str, default=None, description="Optional note"),  # type: ignore
+    ):
+        if not await self._pay_channel_guard(ctx):
+            return
+        db = await self._ensure_db()
+        emp_id = self._emp_from_mention(employee)
+        if emp_id is None:
+            await ctx.respond(f"'{employee}' is not a valid user mention.", ephemeral=self._eph(ctx))
+            return
+        row = await db.fetchone("SELECT name FROM employee WHERE id = ?", (emp_id,))
+        if row is None:
+            await ctx.respond(f"{employee} isn't in the employee system.", ephemeral=self._eph(ctx))
+            return
+        if amount <= 0:
+            await ctx.respond("Amount must be positive.", ephemeral=self._eph(ctx))
+            return
+        try:
+            eff = _parse_effective_date(check_date)
+        except ValueError as e:
+            await ctx.respond(str(e), ephemeral=self._eph(ctx))
+            return
+        await db.execute(
+            "INSERT INTO leave_entry (employeeID, entry_date, kind, amount, note, created_at, created_by) "
+            "VALUES (?, ?, 'Bonus', ?, ?, ?, ?)",
+            (emp_id, eff, amount, note, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), str(ctx.author)))
+        timecard_log.info(f"[Payroll] {ctx.author} logged a ${amount:,.2f} bonus for {row['name']} ({emp_id}) on {eff}.")
+        await ctx.respond(f"Logged a **${amount:,.2f}** bonus for **{row['name']}** dated `{eff}`."
+                          + (f"\nNote: {note}" if note else ""), ephemeral=self._eph(ctx))
+
+    @discord.slash_command(name="leavehistory", description="Show an employee's leave & bonus entries.")
+    @is_timecard_admin()
+    async def leavehistory(
+        self, ctx: discord.ApplicationContext,
+        employee: discord.Option(str, description="The employee", autocomplete=employee_autocomplete),  # type: ignore
+    ):
+        if not await self._pay_channel_guard(ctx):
+            return
+        db = await self._ensure_db()
+        emp_id = self._emp_from_mention(employee)
+        if emp_id is None:
+            await ctx.respond(f"'{employee}' is not a valid user mention.", ephemeral=self._eph(ctx))
+            return
+        row = await db.fetchone("SELECT name FROM employee WHERE id = ?", (emp_id,))
+        if row is None:
+            await ctx.respond(f"{employee} isn't in the employee system.", ephemeral=self._eph(ctx))
+            return
+        rows = await db.fetchall(
+            "SELECT entry_date, kind, hours, amount, note FROM leave_entry WHERE employeeID = ? "
+            "ORDER BY entry_date DESC, id DESC LIMIT 25", (emp_id,))
+        if not rows:
+            await ctx.respond(f"No leave or bonus entries for {row['name']} yet.", ephemeral=self._eph(ctx))
+            return
+        lines = []
+        for r in rows:
+            val = f"${float(r['amount']):,.2f}" if r["kind"] == "Bonus" else f"{float(r['hours'] or 0):g}h"
+            lines.append(f"`{r['entry_date']}`  {r['kind']:<8} {val}" + (f" — {r['note']}" if r["note"] else ""))
+        await ctx.respond(f"**Leave & bonus — {row['name']}**\n" + "\n".join(lines), ephemeral=self._eph(ctx))
+
+    @discord.slash_command(name="setcatchall", description="Set the category that absorbs an employee's distribution remainder.")
+    @is_timecard_admin()
+    async def setcatchall(
+        self, ctx: discord.ApplicationContext,
+        employee: discord.Option(str, description="The employee", autocomplete=employee_autocomplete),  # type: ignore
+        category: discord.Option(str, choices=["Shop", "Office", "Construction", "Service"], description="Catch-all category"),  # type: ignore
+    ):
+        if not await self._pay_channel_guard(ctx):
+            return
+        db = await self._ensure_db()
+        emp_id = self._emp_from_mention(employee)
+        if emp_id is None:
+            await ctx.respond(f"'{employee}' is not a valid user mention.", ephemeral=self._eph(ctx))
+            return
+        row = await db.fetchone("SELECT name FROM employee WHERE id = ?", (emp_id,))
+        if row is None:
+            await ctx.respond(f"{employee} isn't in the employee system.", ephemeral=self._eph(ctx))
+            return
+        await db.execute("UPDATE employee SET catchall_category = ? WHERE id = ?", (category, emp_id))
+        timecard_log.info(f"[Payroll] {ctx.author} set {row['name']} ({emp_id}) catch-all category to {category}.")
+        await ctx.respond(f"**{row['name']}**'s remainder now falls into **{category}**.", ephemeral=self._eph(ctx))
 
     @discord.slash_command(name="timecardreport", description="Generate a weekly punch report given an end date.")
     @is_timecard_admin()
