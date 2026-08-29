@@ -135,8 +135,8 @@ def _finalize(ws, header_last_row, last_col, last_row, landscape):
     """Set the print area to the used range ($B$1 -> bottom-right edited cell), fit
     to width, modest margins, and repeat the top spacing + header rows on every page.
     `last_col` is the logical rightmost column; `last_row` is the actual bottom row."""
-    ws.print_area = f"${_shift_col('A')}$1:${_shift_col(last_col)}${last_row}"
-    ws.print_title_rows = f"1:{header_last_row + _ROW_SHIFT}"
+    ws.print_area = f"${_shift_col('A')}${1 + _ROW_SHIFT}:${_shift_col(last_col)}${last_row}"
+    ws.print_title_rows = f"{1 + _ROW_SHIFT}:{header_last_row + _ROW_SHIFT}"
     ws.page_setup.orientation = "landscape" if landscape else "portrait"
     ws.page_margins = PageMargins(left=0.3, right=0.3, top=0.5, bottom=0.5, header=0.3, footer=0.3)
     ws.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
