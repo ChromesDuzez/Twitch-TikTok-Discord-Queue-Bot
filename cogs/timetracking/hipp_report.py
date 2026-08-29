@@ -131,9 +131,11 @@ def _put(ws, col, r, value, fmt, align, fill, sides, base_font=_BODY, zero_gray=
     return c
 
 
-def _finalize(ws, header_last_row, landscape):
-    """Fit-to-width printing, modest margins, and repeat the top spacing + header rows
-    on every printed page (print titles)."""
+def _finalize(ws, header_last_row, last_col, last_row, landscape):
+    """Set the print area to the used range ($B$1 -> bottom-right edited cell), fit
+    to width, modest margins, and repeat the top spacing + header rows on every page.
+    `last_col` is the logical rightmost column; `last_row` is the actual bottom row."""
+    ws.print_area = f"${_shift_col('A')}$1:${_shift_col(last_col)}${last_row}"
     ws.print_title_rows = f"1:{header_last_row + _ROW_SHIFT}"
     ws.page_setup.orientation = "landscape" if landscape else "portrait"
     ws.page_margins = PageMargins(left=0.3, right=0.3, top=0.5, bottom=0.5, header=0.3, footer=0.3)
@@ -178,7 +180,7 @@ def _build_invoice_sheet(ws, rows, period_label, invoice_number):
     for col, val, fmt, align in total_cells:
         sides = {"top", "bottom"} | ({"left"} if col == first else set()) | ({"right"} if col == last else set())
         _put(ws, col, r, val, fmt, align, _TOTAL_FILL, sides, _HDR)
-    _finalize(ws, header_last_row=top, landscape=False)
+    _finalize(ws, header_last_row=top, last_col="H", last_row=r + _ROW_SHIFT, landscape=False)
 
 
 def _build_department_sheet(ws, rows):
@@ -229,7 +231,7 @@ def _build_department_sheet(ws, rows):
     for col, val, fmt, align in total_cells:
         sides = {"top", "bottom"} | ({"left", "right"} if col in vcols else set())
         _put(ws, col, r, val, fmt, align, _TOTAL_FILL, sides, _HDR)
-    _finalize(ws, header_last_row=top, landscape=True)
+    _finalize(ws, header_last_row=top, last_col="L", last_row=r + _ROW_SHIFT, landscape=True)
 
 
 def generate_hipp_invoice(file_path: str, rows: list[dict], period_label: str,
