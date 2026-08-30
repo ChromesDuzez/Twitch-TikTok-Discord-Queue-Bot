@@ -235,6 +235,7 @@ class Database:
                 id          INTEGER          PRIMARY KEY AUTOINCREMENT,
                 period_end  DATE             NOT NULL UNIQUE,
                 check_date  DATE             NOT NULL,
+                kind        TEXT             NOT NULL DEFAULT 'Regular',
                 label       TEXT             NULL
             );
             CREATE TABLE leave_entry (
@@ -317,6 +318,8 @@ class Database:
         ("employee", "ot_rate_round", "BOOLEAN NOT NULL DEFAULT 0"),
         # Per-employee canonical category that absorbs the distribution remainder.
         ("employee", "catchall_category", "TEXT NOT NULL DEFAULT 'Shop'"),
+        # Pay-run kind: 'Regular' payroll or a 'Bonus' check-run.
+        ("pay_period", "kind", "TEXT NOT NULL DEFAULT 'Regular'"),
         ("punch_clock", "odooId", "UNSIGNED BIG INT NULL DEFAULT NULL"),
         ("punch_clock", "legacy", "BOOLEAN NOT NULL DEFAULT 0"),
         ("customer", "odooId", "UNSIGNED BIG INT NULL DEFAULT NULL"),
@@ -546,6 +549,7 @@ class Database:
                 id          INTEGER          PRIMARY KEY AUTOINCREMENT,
                 period_end  DATE             NOT NULL UNIQUE,
                 check_date  DATE             NOT NULL,
+                kind        TEXT             NOT NULL DEFAULT 'Regular',
                 label       TEXT             NULL
             );
             CREATE TABLE IF NOT EXISTS leave_entry (

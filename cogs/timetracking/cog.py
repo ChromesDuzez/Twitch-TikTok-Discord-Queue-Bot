@@ -22,6 +22,7 @@ from .modals import Confirm
 from . import pay
 from . import costing
 from .hipp_report import generate_hipp_invoice
+from .payroll_report import generate_payroll_distribution
 from .odoo import inbox, sync
 from .odoo.client import OdooClient
 from .perms import has_perms, is_timecard_admin
@@ -57,6 +58,7 @@ _MANAGEMENT_COMMANDS = {
     "setrateround", "hippinvoice",
     "genpaycalendar", "addpayperiod", "paycalendar",
     "addleave", "addbonus", "leavehistory", "setcatchall",
+    "payrollweekly", "payrollmonthly",
     "createclock", "deleteclock",
 }
 
@@ -66,6 +68,14 @@ _MANAGEMENT_COMMANDS = {
 _PAY_CHANNEL_KEYS = (
     "BOT_LOG_ID", "TIMECARD_LOG_ID", "TIMECARD_ADMIN_CHANNEL_ID", "TIMECARD_REPORTS_CHANNEL_ID",
 )
+
+
+def _payroll_row(name: str, dist: dict) -> dict:
+    """Map a costing category distribution to a payroll_report row (Pool=Construction,
+    Shop=Shop)."""
+    return {"name": name, "officer": dist.get("Officer", 0.0), "pool": dist.get("Construction", 0.0),
+            "service": dist.get("Service", 0.0), "shop": dist.get("Shop", 0.0),
+            "office": dist.get("Office", 0.0), "bonus": dist.get("Bonus", 0.0)}
 
 
 def _parse_effective_date(raw: str | None) -> str:
@@ -2494,12 +2504,13 @@ class TimeTracking(commands.Cog):
                           f"check +{check_offset_days}d)." + (f" {skipped} already existed." if skipped else ""),
                           ephemeral=self._eph(ctx))
 
-    @discord.slash_command(name="addpayperiod", description="Add or edit a single pay period (period-end + check date).")
+    @discord.slash_command(name="addpayperiod", description="Add or edit a single pay period / bonus run (period-end + check date).")
     @is_timecard_admin()
     async def addpayperiod(
         self, ctx: discord.ApplicationContext,
-        period_end: discord.Option(str, description="Period-end date [YYYY-MM-DD]"),  # type: ignore
+        period_end: discord.Option(str, description="Period-end date [YYYY-MM-DD] (a marker date for a Bonus run)"),  # type: ignore
         check_date: discord.Option(str, description="Check date [YYYY-MM-DD]"),  # type: ignore
+        kind: discord.Option(str, default="Regular", choices=["Regular", "Bonus"], description="Regular payroll or a Bonus check-run"),  # type: ignore
         label: discord.Option(str, default=None, description="Optional label"),  # type: ignore
     ):
         if not await self._pay_channel_guard(ctx):
@@ -2512,14 +2523,16 @@ class TimeTracking(commands.Cog):
             return
         exists = await db.fetchone("SELECT id FROM pay_period WHERE period_end = ?", (pe,))
         if exists:
-            await db.execute("UPDATE pay_period SET check_date = ?, label = ? WHERE id = ?", (cd, label, exists["id"]))
+            await db.execute("UPDATE pay_period SET check_date = ?, kind = ?, label = ? WHERE id = ?",
+                             (cd, kind, label, exists["id"]))
             verb = "Updated"
         else:
-            await db.execute("INSERT INTO pay_period (period_end, check_date, label) VALUES (?, ?, ?)", (pe, cd, label))
+            await db.execute("INSERT INTO pay_period (period_end, check_date, kind, label) VALUES (?, ?, ?, ?)",
+                             (pe, cd, kind, label))
             verb = "Added"
-        timecard_log.info(f"[Payroll] {ctx.author} {verb.lower()} pay period {pe} (check {cd}).")
-        await ctx.respond(f"{verb} pay period ending `{pe}`, check `{cd}`" + (f" — {label}" if label else "") + ".",
-                          ephemeral=self._eph(ctx))
+        timecard_log.info(f"[Payroll] {ctx.author} {verb.lower()} {kind.lower()} pay period {pe} (check {cd}).")
+        await ctx.respond(f"{verb} **{kind}** pay period ending `{pe}`, check `{cd}`"
+                          + (f" — {label}" if label else "") + ".", ephemeral=self._eph(ctx))
 
     @discord.slash_command(name="paycalendar", description="Show the pay periods for a year.")
     @is_timecard_admin()
@@ -2532,12 +2545,13 @@ class TimeTracking(commands.Cog):
         db = await self._ensure_db()
         yr = year or datetime.now().year
         rows = await db.fetchall(
-            "SELECT period_end, check_date, label FROM pay_period WHERE period_end LIKE ? ORDER BY period_end",
+            "SELECT period_end, check_date, kind, label FROM pay_period WHERE period_end LIKE ? ORDER BY period_end",
             (f"{yr}-%",))
         if not rows:
             await ctx.respond(f"No pay periods for {yr}. Generate them with /genpaycalendar.", ephemeral=self._eph(ctx))
             return
-        lines = [f"`{r['period_end']}` → check `{r['check_date']}`" + (f"  {r['label']}" if r["label"] else "") for r in rows]
+        lines = [f"`{r['period_end']}` → check `{r['check_date']}`"
+                 + ("  **Bonus**" if r["kind"] == "Bonus" else "") + (f"  {r['label']}" if r["label"] else "") for r in rows]
         await ctx.respond(f"**Pay calendar {yr}** ({len(rows)} periods)\n" + "\n".join(lines), ephemeral=self._eph(ctx))
 
     @discord.slash_command(name="addleave", description="Log paid leave hours (Vacation/Holiday/Sick) for an employee.")
@@ -2663,6 +2677,132 @@ class TimeTracking(commands.Cog):
         await db.execute("UPDATE employee SET catchall_category = ? WHERE id = ?", (category, emp_id))
         timecard_log.info(f"[Payroll] {ctx.author} set {row['name']} ({emp_id}) catch-all category to {category}.")
         await ctx.respond(f"**{row['name']}**'s remainder now falls into **{category}**.", ephemeral=self._eph(ctx))
+
+    async def payperiod_autocomplete(self, ctx: discord.AutocompleteContext):
+        """Existing pay periods (value = period_end), newest first; Bonus runs marked."""
+        if self.db is None:
+            return []
+        rows = await self.db.fetchall("SELECT period_end, kind FROM pay_period ORDER BY period_end DESC LIMIT 300")
+        term = str(ctx.value or "").lower()
+        out = []
+        for r in rows:
+            label = f"{r['period_end']}" + (" (Bonus)" if r["kind"] == "Bonus" else "")
+            if term in label.lower():
+                out.append(discord.OptionChoice(name=label[:100], value=str(r["period_end"])))
+            if len(out) >= 25:
+                break
+        return out
+
+    async def _payroll_employees(self, db, employee_group):
+        """(id, name) for the payroll set: a named group, or all active employees.
+        Returns None if a named group doesn't exist."""
+        if employee_group:
+            g = await db.fetchone("SELECT id FROM employee_group WHERE name = ?", (employee_group,))
+            if g is None:
+                return None
+            return await db.fetchall(
+                "SELECT e.id, e.name FROM group_member gm JOIN employee e ON e.id = gm.employeeID "
+                "WHERE gm.groupID = ? ORDER BY e.name", (g["id"],))
+        return await db.fetchall(
+            "SELECT id, name FROM employee WHERE archived = 0 OR archived IS NULL ORDER BY name")
+
+    @discord.slash_command(name="payrollweekly", description="Payroll distribution for one pay run (a week-ending / check run).")
+    @is_timecard_admin()
+    async def payrollweekly(
+        self, ctx: discord.ApplicationContext,
+        week_ending: discord.Option(str, description="Pay period-end date [YYYY-MM-DD]", autocomplete=payperiod_autocomplete),  # type: ignore
+        employee_group: discord.Option(str, default=None, description="Limit to a group (default: all active)", autocomplete=employee_group_autocomplete),  # type: ignore
+    ):
+        if not await self._pay_channel_guard(ctx):
+            return
+        db = await self._ensure_db()
+        await ctx.defer(ephemeral=True)
+        try:
+            pe = _parse_effective_date(week_ending)
+        except ValueError as e:
+            await ctx.respond(str(e), ephemeral=True)
+            return
+        period = await db.fetchone("SELECT * FROM pay_period WHERE period_end = ?", (pe,))
+        if period is None:
+            await ctx.respond(f"No pay period ending `{pe}`. Add it with /addpayperiod or /genpaycalendar.", ephemeral=True)
+            return
+        emps = await self._payroll_employees(db, employee_group)
+        if emps is None:
+            await ctx.respond(f"Employee group '{employee_group}' not found.", ephemeral=True)
+            return
+        rows = []
+        for e in emps:
+            dist = await costing.run_distribution(db, e["id"], period)
+            if round(sum(dist.values()), 2) != 0:
+                rows.append(_payroll_row(e["name"], dist))
+        if not rows:
+            await ctx.respond(f"No payroll for the run ending `{pe}`.", ephemeral=True)
+            return
+        subtitle = (f"Week ending {pe} — paid {period['check_date']}"
+                    + ("  (Bonus run)" if period["kind"] == "Bonus" else ""))
+        os.makedirs("reports", exist_ok=True)
+        file_path = f"reports/Payroll_Weekly_{pe}.xlsx"
+        await asyncio.to_thread(generate_payroll_distribution, file_path, "Weekly Payroll",
+                                "SwimShack Inc. — Payroll Distribution", subtitle, rows)
+        rc_id = os.getenv("TIMECARD_REPORTS_CHANNEL_ID")
+        reports_channel = self.bot.get_channel(int(rc_id)) if rc_id and rc_id.isdigit() else None
+        if reports_channel:
+            await reports_channel.send(file=discord.File(file_path))
+            timecard_log.info(f"[Report] {ctx.author} generated the weekly payroll distribution for {pe} → reports channel.")
+            await ctx.respond(f"Weekly payroll distribution for `{pe}` sent to the reports channel.", ephemeral=True)
+        else:
+            await ctx.respond(f"Weekly payroll distribution for `{pe}`:", file=discord.File(file_path), ephemeral=True)
+
+    @discord.slash_command(name="payrollmonthly", description="Payroll distribution for a month (all runs paid that month).")
+    @is_timecard_admin()
+    async def payrollmonthly(
+        self, ctx: discord.ApplicationContext,
+        month: discord.Option(int, description="Month (1-12)", min_value=1, max_value=12),  # type: ignore
+        year: discord.Option(int, description="Year"),  # type: ignore
+        employee_group: discord.Option(str, default=None, description="Limit to a group (default: all active)", autocomplete=employee_group_autocomplete),  # type: ignore
+    ):
+        if not await self._pay_channel_guard(ctx):
+            return
+        db = await self._ensure_db()
+        await ctx.defer(ephemeral=True)
+        from datetime import date
+        start = f"{year}-{month:02d}-01"
+        ny, nm = (year + 1, 1) if month == 12 else (year, month + 1)
+        nxt = f"{ny}-{nm:02d}-01"
+        periods = await costing.pay_periods(db, start, nxt)   # runs whose check date is in the month
+        if not periods:
+            await ctx.respond(f"No pay runs paid in {month:02d}/{year}.", ephemeral=True)
+            return
+        emps = await self._payroll_employees(db, employee_group)
+        if emps is None:
+            await ctx.respond(f"Employee group '{employee_group}' not found.", ephemeral=True)
+            return
+        rows = []
+        for e in emps:
+            agg = {c: 0.0 for c in costing.PAYROLL_CATEGORIES}
+            for p in periods:
+                d = await costing.run_distribution(db, e["id"], p)
+                for k in agg:
+                    agg[k] += d.get(k, 0.0)
+            if round(sum(agg.values()), 2) != 0:
+                rows.append(_payroll_row(e["name"], {k: round(v, 2) for k, v in agg.items()}))
+        if not rows:
+            await ctx.respond(f"No payroll in {month:02d}/{year}.", ephemeral=True)
+            return
+        month_name = date(year, month, 1).strftime("%B")
+        subtitle = f"{month_name} {year} — {len(periods)} pay run(s)"
+        os.makedirs("reports", exist_ok=True)
+        file_path = f"reports/Payroll_Monthly_{year}-{month:02d}.xlsx"
+        await asyncio.to_thread(generate_payroll_distribution, file_path, "Monthly Payroll",
+                                "SwimShack Inc. — Payroll Month Distribution", subtitle, rows)
+        rc_id = os.getenv("TIMECARD_REPORTS_CHANNEL_ID")
+        reports_channel = self.bot.get_channel(int(rc_id)) if rc_id and rc_id.isdigit() else None
+        if reports_channel:
+            await reports_channel.send(file=discord.File(file_path))
+            timecard_log.info(f"[Report] {ctx.author} generated the monthly payroll distribution for {month:02d}/{year} → reports channel.")
+            await ctx.respond(f"Monthly payroll distribution for {month_name} {year} sent to the reports channel.", ephemeral=True)
+        else:
+            await ctx.respond(f"Monthly payroll distribution for {month_name} {year}:", file=discord.File(file_path), ephemeral=True)
 
     @discord.slash_command(name="timecardreport", description="Generate a weekly punch report given an end date.")
     @is_timecard_admin()

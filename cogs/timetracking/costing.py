@@ -214,7 +214,7 @@ async def pay_periods(db: Database, start, end) -> list:
     """Calendar periods whose CHECK date falls in [start, end) (Monthly/Summary
     bucket by check date), oldest first."""
     return await db.fetchall(
-        "SELECT id, period_end, check_date, label FROM pay_period "
+        "SELECT id, period_end, check_date, kind, label FROM pay_period "
         "WHERE check_date >= ? AND check_date < ? ORDER BY period_end",
         (_date_only(start), _date_only(end)),
     )
@@ -256,18 +256,49 @@ async def period_gross(db: Database, employee_id: int, period_end) -> float:
     return round_cents(std * rate + ot * rate * 1.5)
 
 
+def _plus_day(d) -> str:
+    return (datetime.strptime(_date_only(d), "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+
+
 async def period_distribution(db: Database, employee_id: int, period_end) -> dict[str, float]:
-    """Distribute an employee's period gross across the payroll categories by hours,
-    with the per-employee catch-all absorbing the remainder. Work hours come from
-    the timecard; paid-leave hours become the Bonus category's hours (so a salaried
-    person's leave is paid out of the same gross). Does NOT include the year-end
-    bonus lump sum — the report adds that to the Bonus column via ``bonus_amount``."""
+    """A REGULAR pay run's distribution across the payroll categories, keyed by pay
+    type so hourly PTO stays at the standard rate:
+
+    * Salaried: PTO is paid out of the fixed salary, so distribute the whole cycle
+      gross across work + leave hours (leave lands in Bonus at the average rate).
+    * Hourly/Hybrid: OT comes from worked hours only; the worked pay is distributed
+      across the WORKED categories (catch-all absorbs the remainder), and paid leave
+      is added to Bonus at the STANDARD rate (never the OT-inflated rate).
+
+    Excludes the year-end bonus lump sum — that is a separate Bonus pay run
+    (see ``run_distribution``)."""
     start, end = period_range(period_end)
     ch = await category_hours(db, employee_id, start, end)
     lv = await leave_hours(db, employee_id, start, end)
-    gross = await period_gross(db, employee_id, period_end)
-    row = await db.fetchone("SELECT catchall_category FROM employee WHERE id = ?", (employee_id,))
-    catchall = (row["catchall_category"] if row else "Shop") or "Shop"
-    hours = {"Officer": 0.0, "Construction": ch["Construction"], "Service": ch["Service"],
-             "Office": ch["Office"], "Shop": ch["Shop"], "Bonus": lv}
-    return distribute_pay(gross, hours, catchall)
+    emp = await db.fetchone("SELECT catchall_category FROM employee WHERE id = ?", (employee_id,))
+    catchall = (emp["catchall_category"] if emp else "Shop") or "Shop"
+    rec = await pay.effective_pay(db, employee_id, _date_only(period_end))
+    base = await period_gross(db, employee_id, period_end)   # salaried: cycle gross; hourly: worked pay
+
+    if rec is not None and rec["pay_type"] == "Salaried":
+        hours = {"Officer": 0.0, "Construction": ch["Construction"], "Service": ch["Service"],
+                 "Office": ch["Office"], "Shop": ch["Shop"], "Bonus": lv}
+        return distribute_pay(base, hours, catchall)
+
+    rate = float(rec["hourly_rate"] or 0.0) if rec is not None else 0.0
+    worked = {"Officer": 0.0, "Construction": ch["Construction"], "Service": ch["Service"],
+              "Office": ch["Office"], "Shop": ch["Shop"]}
+    dist = distribute_pay(base, worked, catchall)
+    dist["Bonus"] = round_cents(lv * rate)   # PTO at the standard rate
+    return dist
+
+
+async def run_distribution(db: Database, employee_id: int, period) -> dict[str, float]:
+    """One employee's distribution for a pay RUN (a ``pay_period`` row, which must
+    include ``kind``, ``period_end``, ``check_date``). A **Regular** run uses
+    ``period_distribution``; a **Bonus** run puts the employee's bonus for that
+    check date entirely into the Bonus category."""
+    if (period["kind"] or "Regular") == "Bonus":
+        b = await bonus_amount(db, employee_id, period["check_date"], _plus_day(period["check_date"]))
+        return {c: 0.0 for c in PAYROLL_CATEGORIES} | {"Bonus": round_cents(b)}
+    return await period_distribution(db, employee_id, period["period_end"])
