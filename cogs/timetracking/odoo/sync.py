@@ -170,18 +170,20 @@ class SyncWorker:
         emp_odoo = await self._employee_odoo_id(punch["employeeID"])
         if not emp_odoo:
             return "retry"
-        att_id = await self.client.attendance_create(emp_odoo, local_str_to_utc_str(punch["punchInTime"]))
+        att_id = await self._ensure_attendance(emp_odoo, local_str_to_utc_str(punch["punchInTime"]))
         if not att_id:
             return "retry"
         await self.db.execute("UPDATE punch_clock SET odooId = ? WHERE id = ?", (att_id, punch_id))
         if punch["punchOutTime"]:
             await self.client.attendance_write(att_id, check_out_utc=local_str_to_utc_str(punch["punchOutTime"]))
-        # Re-create the worktime lines under the restored attendance.
+        # Re-link the worktime lines to the restored attendance. A line that still
+        # exists in Odoo (orphaned when its attendance was deleted) is re-pointed at
+        # the new attendance's shift rather than duplicated; a never-synced line is
+        # created. _reassign_worktime self-heals if the line was truly deleted.
         for wt in await self.db.fetchall(
-            "SELECT id FROM work_time WHERE punchID = ? AND timeSpent > 0", (punch_id,)
+            "SELECT id, odooId FROM work_time WHERE punchID = ? AND timeSpent > 0", (punch_id,)
         ):
-            await self.db.execute("UPDATE work_time SET odooId = NULL WHERE id = ?", (wt["id"],))
-            await enqueue(self.db, "worktime", wt["id"], "restore")
+            await enqueue(self.db, "worktime", wt["id"], "reassign" if wt["odooId"] else "create")
         log.info(f"[Outbox] Restored punch {punch_id} as hr.attendance {att_id} in Odoo.")
         return True
 
@@ -208,6 +210,16 @@ class SyncWorker:
         row = await self.db.fetchone("SELECT odooId FROM employee WHERE id = ?", (employee_id,))
         return row["odooId"] if row else None
 
+    async def _ensure_attendance(self, emp_odoo: int, check_in_utc: str):
+        """Idempotent attendance create: adopt an existing attendance for this
+        (employee, check-in) if one exists, else create a new one. Prevents the
+        duplicate-overlap 422 that occurs when a create is retried after a prior
+        attempt already made the attendance (e.g. a crash before odooId was saved)."""
+        existing = await self.client.find_attendance(emp_odoo, check_in_utc)
+        if existing:
+            return existing
+        return await self.client.attendance_create(emp_odoo, check_in_utc)
+
     async def _sync_punch_in(self, punch_id: int):
         punch = await self.db.fetchone(
             "SELECT employeeID, punchInTime, odooId, legacy FROM punch_clock WHERE id = ?", (punch_id,)
@@ -217,9 +229,7 @@ class SyncWorker:
         emp_odoo = await self._employee_odoo_id(punch["employeeID"])
         if not emp_odoo or not punch["punchInTime"]:
             return "retry"  # employee not linked to Odoo yet
-        att_id = await self.client.attendance_create(
-            emp_odoo, local_str_to_utc_str(punch["punchInTime"])
-        )
+        att_id = await self._ensure_attendance(emp_odoo, local_str_to_utc_str(punch["punchInTime"]))
         if att_id:
             await self.db.execute("UPDATE punch_clock SET odooId = ? WHERE id = ?", (att_id, punch_id))
             log.info(f"[Outbox] Clock-in: punch {punch_id} -> hr.attendance {att_id}.")
@@ -256,7 +266,7 @@ class SyncWorker:
         check_in = local_str_to_utc_str(punch["punchInTime"])
         check_out = local_str_to_utc_str(punch["punchOutTime"]) if punch["punchOutTime"] else None
         if punch["odooId"] is None:
-            att_id = await self.client.attendance_create(emp_odoo, check_in)
+            att_id = await self._ensure_attendance(emp_odoo, check_in)
             if not att_id:
                 return "retry"
             await self.db.execute("UPDATE punch_clock SET odooId = ? WHERE id = ?", (att_id, punch_id))
@@ -287,6 +297,11 @@ class SyncWorker:
             return True
         if punch["odooId"] is None:
             return "retry"  # new attendance not synced yet -- link once it is
+        # If the Odoo line was actually deleted (not just orphaned), re-create it
+        # rather than repointing a ghost id (self-heals the restore/reassign path).
+        if await self.client.read_record("account.analytic.line", wt["odooId"], ["id"]) is None:
+            await self.db.execute("UPDATE work_time SET odooId = NULL WHERE id = ?", (worktime_id,))
+            return await self._sync_worktime(worktime_id)
         await self.client.set_timesheet_shift(wt["odooId"], punch["odooId"])
         log.info(f"[Outbox] Repointed timesheet {wt['odooId']} shift link to attendance {punch['odooId']}.")
         return True

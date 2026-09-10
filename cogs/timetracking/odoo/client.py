@@ -84,16 +84,19 @@ class OdooClient:
             json=data,
             timeout=DEFAULT_TIMEOUT,
         )
-        if response.status_code == 500:
+        if not response.ok:
+            # Log the Odoo error body for EVERY failure (not just 500) so a 422
+            # UNPROCESSABLE ENTITY surfaces its actual validation message (e.g. an
+            # overlapping / "still checked in" hr.attendance) instead of a bare
+            # "422 Client Error".
             try:
                 error_data = response.json()
-                log.error("[Odoo] API Error Details:")
-                for key, value in error_data.items():
+                log.error("[Odoo] API error %s on %s:", response.status_code, endpoint)
+                for key, value in (error_data.items() if isinstance(error_data, dict) else [("body", error_data)]):
                     log.error(f"  {key}: {value}")
             except json.JSONDecodeError:
-                log.error(f"[Odoo] Response not JSON. Raw: {response.text}")
-            raise RuntimeError(f"Odoo API request to {endpoint} failed (500).")
-        response.raise_for_status()
+                log.error(f"[Odoo] API error {response.status_code} on {endpoint}. Raw: {response.text}")
+            response.raise_for_status()
         return response.json()
 
     async def call(self, endpoint: str, data: dict):
@@ -282,6 +285,17 @@ class OdooClient:
             )
 
     # ---- attendance (clock in/out) ----------------------------------------
+
+    async def find_attendance(self, employee_odoo_id: int, check_in_utc: str):
+        """Find an existing hr.attendance for this employee at this exact check-in,
+        or None. Lets a retried create ADOPT the attendance a prior attempt already
+        made instead of creating a duplicate (which Odoo rejects as overlapping)."""
+        rows = await self.call(
+            "/hr.attendance/search_read",
+            {"domain": [["employee_id", "=", employee_odoo_id], ["check_in", "=", check_in_utc]],
+             "fields": ["id"], "limit": 1},
+        )
+        return rows[0]["id"] if rows else None
 
     async def attendance_create(self, employee_odoo_id: int, check_in_utc: str):
         """Create an hr.attendance check-in. Returns the new attendance id."""
