@@ -51,7 +51,7 @@ _MANAGEMENT_COMMANDS = {
     "viewtimecard",
     "synccustomers", "linkcustomer", "unlinkcustomer", "unlinkedcustomers",
     "addcustomer", "editcustomer", "mergecustomers", "archivecustomer", "unarchivecustomer",
-    "deletecustomer", "purgeimportedcontacts", "configureprojects", "configureroles", "configurecategories",
+    "deletecustomer", "purgeimportedcontacts", "reconcileattendance", "configureprojects", "configureroles", "configurecategories",
     "addemployee", "linkemployee", "unlinkemployee", "archiveemployee", "unarchiveemployee",
     "setpay", "payhistory", "bankadjust", "bankbalance",
     "creategroup", "addtogroup", "removefromgroup", "groupmembers",
@@ -1577,6 +1577,102 @@ class TimeTracking(commands.Cog):
             f"Purge complete: **{len(to_delete)}** deleted, **{len(to_archive)}** archived (had worktime). "
             f"Each is listed in the log channel — re-add or `/unarchivecustomer` to bring one back.",
             ephemeral=self._eph(ctx))
+
+    async def _classify_odoo_attendances(self, db, atts):
+        """Split Odoo hr.attendance rows against local synced punches:
+        * duplicate = same (employee, check-in) as a synced punch but a DIFFERENT
+          Odoo id — the leftover from a failed create-retry (safe to delete).
+        * orphan = no matching local punch — could be Odoo-native or from a
+          locally-deleted punch (reported, not auto-deleted).
+        Returns (duplicates, orphans) as lists of dicts."""
+        emps = await db.fetchall("SELECT id, name, odooId FROM employee WHERE odooId IS NOT NULL")
+        name_by_odoo = {e["odooId"]: e["name"] for e in emps}
+        local_to_odoo = {e["id"]: e["odooId"] for e in emps}
+        owned_ids, owned_slots = set(), {}
+        for p in await db.fetchall(
+                "SELECT employeeID, punchInTime, odooId FROM punch_clock WHERE odooId IS NOT NULL AND legacy = 0"):
+            owned_ids.add(p["odooId"])
+            eo = local_to_odoo.get(p["employeeID"])
+            if eo and p["punchInTime"]:
+                owned_slots[(eo, sync.local_str_to_utc_str(p["punchInTime"]))] = p["odooId"]
+        dups, orphans = [], []
+        for a in atts or []:
+            if a["id"] in owned_ids:
+                continue  # a legit, locally-owned attendance
+            ef = a["employee_id"]
+            eo = ef[0] if isinstance(ef, (list, tuple)) else ef
+            entry = {"id": a["id"], "check_in": a["check_in"], "check_out": a.get("check_out"),
+                     "name": name_by_odoo.get(eo, f"Odoo emp {eo}")}
+            (dups if (eo, a["check_in"]) in owned_slots else orphans).append(entry)
+        return dups, orphans
+
+    @discord.slash_command(name="reconcileattendance", description="Find & clean up duplicate/orphaned Odoo attendances left by failed syncs.")
+    @is_timecard_admin()
+    async def reconcileattendance(
+        self, ctx: discord.ApplicationContext,
+        since: discord.Option(str, default=None, description="Only check attendances on/after this date [YYYY-MM-DD] (default: all)"),  # type: ignore
+    ):
+        if not await self._pay_channel_guard(ctx):
+            return
+        if not self.client.loaded:
+            await ctx.respond("Odoo isn't configured.", ephemeral=self._eph(ctx))
+            return
+        db = await self._ensure_db()
+        await ctx.defer(ephemeral=self._eph(ctx))
+        since_utc = None
+        if since:
+            try:
+                since_utc = sync.local_str_to_utc_str(_parse_effective_date(since) + " 00:00:00")
+            except ValueError as e:
+                await ctx.followup.send(str(e), ephemeral=self._eph(ctx))
+                return
+        emp_ids = [e["odooId"] for e in await db.fetchall("SELECT odooId FROM employee WHERE odooId IS NOT NULL")]
+        if not emp_ids:
+            await ctx.followup.send("No employees are linked to Odoo.", ephemeral=self._eph(ctx))
+            return
+        try:
+            atts = await self.client.attendances_for_employees(emp_ids, since_utc)
+        except Exception as e:  # noqa: BLE001
+            log.exception("[Reconcile] Odoo attendance fetch failed")
+            await ctx.followup.send(f"Couldn't fetch attendances from Odoo: {e}", ephemeral=self._eph(ctx))
+            return
+        dups, orphans = await self._classify_odoo_attendances(db, atts)
+        if not dups and not orphans:
+            await ctx.followup.send("✅ No duplicate or orphaned Odoo attendances found — Odoo matches the bot.",
+                                    ephemeral=self._eph(ctx))
+            return
+
+        def _fmt(e):
+            return f"{e['name']} · {e['check_in']}{' → ' + e['check_out'] if e['check_out'] else ''} (att #{e['id']})"
+
+        lines = [f"🗑️ dup: {_fmt(e)}" for e in dups[:12]] + [f"❓ orphan: {_fmt(e)}" for e in orphans[:12]]
+        summary = (f"Found **{len(dups)}** duplicate attendance(s) — same employee + check-in as a synced punch "
+                   f"but a different Odoo id (leftovers from failed create-retries) — and **{len(orphans)}** "
+                   f"orphan(s) with no local punch (could be Odoo-native or from a locally-deleted punch).\n\n"
+                   + "\n".join(lines))
+        if not dups:
+            await ctx.followup.send((summary + "\n\nNothing is auto-deletable — review the orphans manually in Odoo.")[:1990],
+                                    ephemeral=self._eph(ctx))
+            return
+        summary += ("\n\nDelete the **duplicates** in Odoo? (Orphans are only reported — review those manually.) "
+                    "Each deletion is logged to the timecard log channel.")
+        confirm = Confirm(user=ctx.user, timeout=120)
+        await ctx.followup.send(summary[:1990], view=confirm, ephemeral=self._eph(ctx))
+        await confirm.wait()
+        if not confirm.value:
+            await ctx.followup.send("Cancelled — nothing was deleted.", ephemeral=self._eph(ctx))
+            return
+        deleted = 0
+        for e in dups:
+            try:
+                await self.client.unlink("hr.attendance", e["id"])
+                timecard_log.info(f"[Reconcile] Deleted duplicate hr.attendance #{e['id']} ({e['name']} {e['check_in']}).")
+                deleted += 1
+            except Exception as ex:  # noqa: BLE001
+                log.warning(f"[Reconcile] Could not delete attendance #{e['id']}: {ex}")
+        timecard_log.info(f"[Reconcile] {ctx.author} deleted {deleted}/{len(dups)} duplicate attendance(s).")
+        await ctx.followup.send(f"Deleted **{deleted}** duplicate attendance(s). "
+                                f"{len(orphans)} orphan(s) left for manual review.", ephemeral=self._eph(ctx))
 
     # ---- Odoo project configuration ----------------------------------------
 
