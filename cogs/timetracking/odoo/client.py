@@ -297,9 +297,12 @@ class OdooClient:
         )
         return rows[0]["id"] if rows else None
 
-    async def attendances_for_employees(self, employee_odoo_ids, since_utc: str | None = None):
-        """All hr.attendance for these employees (optionally with check_in >= since),
-        for the reconcile/cleanup command. Returns id, employee_id ([id,name]),
+    async def attendances_for_employees(self, employee_odoo_ids, since_utc: str | None = None,
+                                        page_size: int = 2000):
+        """ALL hr.attendance for these employees (optionally with check_in >= since),
+        for the reconcile/cleanup command. Pages through the results (offset/limit,
+        ordered by the stable id) so nothing is silently truncated no matter how many
+        records exist — one API call per page. Returns id, employee_id ([id,name]),
         check_in, check_out."""
         ids = list(employee_odoo_ids)
         if not ids:
@@ -307,11 +310,18 @@ class OdooClient:
         domain = [["employee_id", "in", ids]]
         if since_utc:
             domain.append(["check_in", ">=", since_utc])
-        return await self.call(
-            "/hr.attendance/search_read",
-            {"domain": domain, "fields": ["id", "employee_id", "check_in", "check_out"],
-             "order": "check_in asc", "limit": 5000},
-        )
+        out, offset = [], 0
+        while True:
+            rows = await self.call(
+                "/hr.attendance/search_read",
+                {"domain": domain, "fields": ["id", "employee_id", "check_in", "check_out"],
+                 "order": "id asc", "limit": page_size, "offset": offset},
+            ) or []
+            out.extend(rows)
+            if len(rows) < page_size:   # a short (final) page means we've read them all
+                break
+            offset += page_size
+        return out
 
     async def attendance_create(self, employee_odoo_id: int, check_in_utc: str):
         """Create an hr.attendance check-in. Returns the new attendance id."""
