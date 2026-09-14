@@ -36,10 +36,11 @@ from .reports import (
 from .views import (
     ApprovePunch, DeleteApproval, DeletePunchFlow, TimecardWeekView,
     build_timecard_embed, delete_punch_cascade, delete_worktime_local,
-    reassign_worktime, render_clock,
+    load_timecard_views, reassign_worktime, render_clock, save_timecard_views,
 )
 
 WORKTYPES = ["Construction", "Service", "Office"]
+TIMECARD_VIEW_TTL_HOURS = 24   # persistent /viewtimecard views lose their buttons after this
 
 # Admin management commands: their results are shown publicly in the timecard
 # admin/log channels and ephemerally (decluttered, + mirrored to the log channel)
@@ -142,6 +143,8 @@ class TimeTracking(commands.Cog):
         )
         self.sync: sync.SyncWorker | None = None
         self.inbox: inbox.InboxWorker | None = None
+        self._view_sweep_task: asyncio.Task | None = None
+        self._ephemeral_timecard_views: set = set()   # live session-only /viewtimecard views
         self._lock = asyncio.Lock()
         self._odoo_employees: list | None = None  # cached hr.employee list for autocomplete
         self._odoo_customers: list | None = None  # cached res.partner (customer) list for autocomplete
@@ -194,6 +197,8 @@ class TimeTracking(commands.Cog):
                 self.sync.start()
                 self.inbox = inbox.InboxWorker(self)
                 self.inbox.start()
+                if self._view_sweep_task is None:
+                    self._view_sweep_task = asyncio.create_task(self._view_sweep_loop())
         return self.db
 
     async def enqueue_inbound(self, model: str, odoo_id: int, action=None, write_uid=None):
@@ -248,9 +253,78 @@ class TimeTracking(commands.Cog):
         channel = self.bot.get_channel(channel_id) or await self.bot.fetch_channel(channel_id)
         return await channel.fetch_message(message_id)
 
+    def _save_timecard_view(self, msg, emp_id, ename, week_end_dt, author_id, token):
+        from .views import put_timecard_view
+        put_timecard_view(msg.id, {
+            "channel_id": msg.channel.id, "emp_id": emp_id, "ename": ename,
+            "week_end": week_end_dt.strftime("%Y-%m-%d"), "author_id": author_id,
+            "token": token, "created_at": datetime.now().isoformat(timespec="seconds"),
+        })
+
+    async def _sweep_timecard_views(self, reattach: bool = False):
+        """Expire persistent /viewtimecard views older than the TTL (strip their
+        buttons + drop the JSON entry); optionally re-attach the live ones (startup)."""
+        from datetime import timedelta
+        views = load_timecard_views()
+        if not views:
+            return
+        changed = False
+        now = datetime.now()
+        for mid, e in list(views.items()):
+            try:
+                created = datetime.fromisoformat(e.get("created_at", ""))
+            except ValueError:
+                created = now
+            expired = (now - created) > timedelta(hours=TIMECARD_VIEW_TTL_HOURS)
+            try:
+                msg = await self.obtain_message(e["channel_id"], int(mid))
+            except discord.NotFound:
+                views.pop(mid, None); changed = True; continue
+            except Exception as ex:  # noqa: BLE001
+                log.warning(f"[Timecard] sweep: can't fetch {mid}: {ex}"); continue
+            if expired:
+                try:
+                    await msg.edit(view=None)   # remove the buttons, keep the message
+                except Exception:  # noqa: BLE001
+                    pass
+                views.pop(mid, None); changed = True
+            elif reattach:
+                try:
+                    wk = datetime.strptime(e["week_end"], "%Y-%m-%d")
+                    v = TimecardWeekView(self, e["emp_id"], e["ename"], wk, e["author_id"],
+                                         persistent=True, token=e["token"])
+                    v.message = msg
+                    await msg.edit(view=v)
+                except Exception as ex:  # noqa: BLE001
+                    log.warning(f"[Timecard] sweep: can't re-attach {mid}: {ex}")
+        if changed:
+            save_timecard_views(views)
+
+    async def _view_sweep_loop(self):
+        while True:
+            try:
+                await asyncio.sleep(3600)
+                await self._sweep_timecard_views()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                log.warning(f"[Timecard] view sweep loop error: {e}")
+
     async def close_db(self):
         """Stop the workers and close the db connection (leaves the file)."""
+        # Strip buttons off any live ephemeral /viewtimecard views so a post-shutdown
+        # press doesn't hit a dead view (best-effort; token may already be expired).
+        for v in list(self._ephemeral_timecard_views):
+            try:
+                if v.message is not None:
+                    await v.message.edit(view=None)
+            except Exception:  # noqa: BLE001
+                pass
+        self._ephemeral_timecard_views.clear()
         async with self._lock:
+            if self._view_sweep_task is not None:
+                self._view_sweep_task.cancel()
+                self._view_sweep_task = None
             if self.sync is not None:
                 await self.sync.stop()
                 self.sync = None
@@ -490,6 +564,12 @@ class TimeTracking(commands.Cog):
                 await db.execute("DELETE FROM pending_action WHERE id = ?", (r["id"],))
             except Exception as e:  # noqa: BLE001
                 log.warning(f"[Delete] Failed to restore delete-approval {r['id']}: {e}")
+
+        # Re-attach persistent /viewtimecard views (and expire stale ones).
+        try:
+            await self._sweep_timecard_views(reattach=True)
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"[Timecard] view re-attach failed: {e}")
 
     # ---- customer commands -------------------------------------------------
 
@@ -2421,8 +2501,27 @@ class TimeTracking(commands.Cog):
             d = datetime.now()
         eow = d + timedelta(days=(5 - d.weekday()) % 7)  # snap to that week's ending Saturday
         embed = await build_timecard_embed(self, emp_id, erow["name"], eow)
-        view = TimecardWeekView(self, emp_id, erow["name"], eow, ctx.user.id)
-        await ctx.respond(embed=embed, view=view, ephemeral=self._eph(ctx))
+        if self._eph(ctx):
+            # Session-only: dies on restart, but its buttons are stripped on timeout/shutdown.
+            view = TimecardWeekView(self, emp_id, erow["name"], eow, ctx.user.id)
+            await ctx.respond(embed=embed, view=view, ephemeral=True)
+            try:
+                view.message = await ctx.interaction.original_response()
+            except Exception:  # noqa: BLE001
+                view.message = None
+            self._ephemeral_timecard_views.add(view)
+        else:
+            # Persistent: JSON-backed so the buttons survive a restart (re-attached in on_ready).
+            import uuid
+            token = uuid.uuid4().hex[:12]
+            view = TimecardWeekView(self, emp_id, erow["name"], eow, ctx.user.id, persistent=True, token=token)
+            await ctx.respond(embed=embed, view=view, ephemeral=False)
+            try:
+                msg = await ctx.interaction.original_response()
+                view.message = msg
+                self._save_timecard_view(msg, emp_id, erow["name"], eow, ctx.user.id, token)
+            except Exception as e:  # noqa: BLE001
+                log.warning(f"[Timecard] couldn't persist view: {e}")
 
     # ---- employee groups (prerequisite for group-scoped reports) ----------
 

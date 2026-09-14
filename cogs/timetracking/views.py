@@ -9,13 +9,14 @@ string-matching embed text (the cause of views desyncing on restart).
 
 from __future__ import annotations
 
+import json
 import os
 from datetime import datetime, timedelta
 
 import discord
 
 from botlog import log, timecard_log
-from .db import Database
+from .db import Database, db_dir
 from .modals import Confirm, CustomerInputModal, CustomerSelectMenu, EditPunchTimeModal, GetTimeSpent
 from .perms import CLOCK_ROLES, has_perms
 from .odoo import sync
@@ -1064,16 +1065,81 @@ async def build_timecard_embed(cog, emp_id: int, ename: str, week_end_dt: dateti
     return embed
 
 
-class TimecardWeekView(discord.ui.View):
-    """Prev/Next/Refresh paging around build_timecard_embed for /viewtimecard."""
+# ---- /viewtimecard persistent-view store (JSON) ----------------------------
+# Non-ephemeral viewtimecard views survive restart: their state is kept in a small
+# JSON file (message_id -> {channel_id, emp_id, ename, week_end, author_id, token,
+# created_at}) and re-attached on startup, mirroring how the clock messages persist.
+# Ephemeral views are session-only and never stored (they can't be re-fetched).
 
-    def __init__(self, cog, emp_id: int, ename: str, week_end_dt: datetime, author_id: int):
-        super().__init__(timeout=300)
+def _timecard_views_path() -> str:
+    return os.path.join(db_dir(os.getcwd()), "timecard_views.json")
+
+
+def load_timecard_views() -> dict:
+    try:
+        with open(_timecard_views_path(), "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_timecard_views(views: dict) -> None:
+    path = _timecard_views_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(views, f)
+    os.replace(tmp, path)   # atomic
+
+
+def put_timecard_view(message_id: int, entry: dict) -> None:
+    views = load_timecard_views()
+    views[str(message_id)] = entry
+    save_timecard_views(views)
+
+
+def remove_timecard_view(message_id) -> None:
+    views = load_timecard_views()
+    if views.pop(str(message_id), None) is not None:
+        save_timecard_views(views)
+
+
+def update_timecard_view_week(message_id, week_end: str) -> None:
+    views = load_timecard_views()
+    key = str(message_id)
+    if key in views:
+        views[key]["week_end"] = week_end
+        save_timecard_views(views)
+
+
+class TimecardWeekView(discord.ui.View):
+    """Prev/Next/Refresh/Close paging around build_timecard_embed for /viewtimecard.
+
+    Two modes: **persistent** (timeout=None, stable custom_ids, JSON-backed,
+    re-attached on restart) for non-ephemeral messages; and **session** (timeout=300)
+    for ephemeral ones — which strip their own buttons on timeout/shutdown."""
+
+    def __init__(self, cog, emp_id: int, ename: str, week_end_dt: datetime, author_id: int,
+                 *, persistent: bool = False, token: str | None = None):
+        super().__init__(timeout=None if persistent else 300)
         self.cog = cog
         self.emp_id = emp_id
         self.ename = ename
         self.week_end_dt = week_end_dt
         self.author_id = author_id
+        self.persistent = persistent
+        self.token = token
+        self.message: discord.Message | None = None   # set after send / on re-attach
+        specs = [("◀ Prev week", "prev", self._prev), ("Next week ▶", "next", self._next),
+                 ("🔄 Refresh", "refresh", self._refresh), ("✖ Close", "close", self._close)]
+        for label, key, cb in specs:
+            style = discord.ButtonStyle.danger if key == "close" else discord.ButtonStyle.secondary
+            # Persistent views require a stable custom_id on every item; session views
+            # let py-cord auto-generate them.
+            btn = discord.ui.Button(label=label, style=style,
+                                    custom_id=(f"tcv:{token}:{key}" if persistent else None))
+            btn.callback = cb
+            self.add_item(btn)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.author_id:
@@ -1081,20 +1147,60 @@ class TimecardWeekView(discord.ui.View):
             return False
         return True
 
+    def _persist_week(self):
+        if self.persistent and self.message is not None:
+            update_timecard_view_week(self.message.id, self.week_end_dt.strftime("%Y-%m-%d"))
+
     async def _rerender(self, interaction: discord.Interaction):
-        embed = await build_timecard_embed(self.cog, self.emp_id, self.ename, self.week_end_dt)
-        await interaction.response.edit_message(embed=embed, view=self)
+        try:
+            embed = await build_timecard_embed(self.cog, self.emp_id, self.ename, self.week_end_dt)
+            await interaction.response.edit_message(embed=embed, view=self)
+        except discord.NotFound:
+            pass  # message/interaction expired — nothing to update
+        except Exception as e:  # noqa: BLE001 - never let a stale press bubble to a crash
+            log.warning(f"[Timecard] rerender failed: {e}")
 
-    @discord.ui.button(label="◀ Prev week", style=discord.ButtonStyle.secondary)
-    async def prev_week(self, button: discord.ui.Button, interaction: discord.Interaction):
+    async def _prev(self, interaction: discord.Interaction):
         self.week_end_dt -= timedelta(days=7)
+        self._persist_week()
         await self._rerender(interaction)
 
-    @discord.ui.button(label="Next week ▶", style=discord.ButtonStyle.secondary)
-    async def next_week(self, button: discord.ui.Button, interaction: discord.Interaction):
+    async def _next(self, interaction: discord.Interaction):
         self.week_end_dt += timedelta(days=7)
+        self._persist_week()
         await self._rerender(interaction)
 
-    @discord.ui.button(label="🔄 Refresh", style=discord.ButtonStyle.secondary)
-    async def refresh(self, button: discord.ui.Button, interaction: discord.Interaction):
+    async def _refresh(self, interaction: discord.Interaction):
         await self._rerender(interaction)
+
+    async def _close(self, interaction: discord.Interaction):
+        # Close = remove the message. Persistent (real channel) messages are deleted;
+        # ephemeral ones can't be hard-deleted by a bot, so they're blanked instead.
+        self.stop()
+        if self.persistent and self.message is not None:
+            remove_timecard_view(self.message.id)
+        try:
+            if self.persistent:
+                await interaction.response.defer()
+                await (self.message or interaction.message).delete()
+            else:
+                await interaction.response.edit_message(content="🗒️ Timecard view closed.", embed=None, view=None)
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"[Timecard] close failed: {e}")
+
+    async def on_timeout(self):
+        # Session (ephemeral) views: strip the buttons once we stop listening.
+        if self.message is not None:
+            try:
+                await self.message.edit(view=None)
+            except Exception:  # noqa: BLE001 - token may already be expired
+                pass
+
+    async def on_error(self, error, item, interaction):  # noqa: D401
+        log.warning(f"[Timecard] view error on {getattr(item, 'custom_id', item)}: {error}")
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    "This timecard view has expired — run /viewtimecard again.", ephemeral=True)
+        except Exception:  # noqa: BLE001
+            pass

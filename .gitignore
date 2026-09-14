@@ -158,6 +158,8 @@ config.properties
 *.db-shm
 *.db-journal
 *.db.backup_*
+# Persistent /viewtimecard view state (runtime data, not source).
+timecard_views.json
 test env/dbTestData.sql
 *.xlsx
 
