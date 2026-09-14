@@ -50,6 +50,16 @@ def utc_str_to_local_str(utc_str: str) -> str:
     return utc.astimezone(_timezone()).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def quarter_hour_minutes(hours) -> int:
+    """Round an hour amount to the quarter-hour grid and return whole minutes.
+
+    The single source of truth for the 15-minute grid the schema enforces
+    (``work_time.timeSpent % 15 == 0``). Callers layer their own floor/range
+    policy on top -- a running worktime floors to 15 min, an inbound timesheet
+    allows 0, a manual entry rejects out-of-range -- but the rounding lives here."""
+    return int(round((hours or 0) * 4) / 4 * 60)
+
+
 async def enqueue(db: Database, entity_type: str, entity_id: int, op: str, payload: dict | None = None):
     """Add a change to the Odoo outbox (called right after a local commit)."""
     await db.execute(

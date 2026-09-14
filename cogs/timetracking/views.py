@@ -459,11 +459,11 @@ def round_quarter_hours(hours: float) -> float:
     """Round a raw hour span to the nearest quarter-hour, floored at 0.25h.
 
     Shared by End-Work-Now and the Odoo check-out auto-close so both turn a span
-    into billable hours the same way. (For non-negative spans this matches the
-    old ``round(h*4)/4 or 0.25`` exactly; it additionally floors negatives from
-    clock skew to 0.25h.)"""
-    q = round(hours * 4) / 4
-    return q if q >= 0.25 else 0.25
+    into billable hours the same way. Uses the canonical quarter-hour grid
+    (``sync.quarter_hour_minutes``); for non-negative spans this matches the old
+    ``round(h*4)/4 or 0.25`` exactly, and additionally floors clock-skew
+    negatives to 0.25h."""
+    return max(0.25, sync.quarter_hour_minutes(hours) / 60)
 
 
 async def finalize_worktime(db: Database, worktime_id: int, hours: float) -> int:

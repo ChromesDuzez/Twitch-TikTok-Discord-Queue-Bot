@@ -105,7 +105,7 @@ def _parse_punch_time(raw: str) -> str:
 
 def _hours_to_minutes(hours: float) -> int:
     """Hours -> minutes rounded to the quarter hour (the schema requires % 15 == 0)."""
-    minutes = int(round((hours or 0) * 4) / 4 * 60)
+    minutes = sync.quarter_hour_minutes(hours)
     if minutes < 0 or minutes > 1440:
         raise ValueError("Hours must be between 0 and 24.")
     return minutes

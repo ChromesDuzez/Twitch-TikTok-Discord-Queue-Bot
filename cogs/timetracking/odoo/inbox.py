@@ -55,7 +55,7 @@ def _punch_type_for_project(project_id) -> str:
 
 def _quarter_hour_minutes(hours) -> int:
     """Hours -> minutes on the quarter-hour grid, clamped to the schema range."""
-    return max(0, min(1440, int(round((hours or 0) * 4) / 4 * 60)))
+    return max(0, min(1440, sync.quarter_hour_minutes(hours)))
 
 
 def _employee_field_map() -> dict:
