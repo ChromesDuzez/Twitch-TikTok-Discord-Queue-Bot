@@ -51,7 +51,7 @@ _MANAGEMENT_COMMANDS = {
     "viewtimecard",
     "synccustomers", "linkcustomer", "unlinkcustomer", "unlinkedcustomers",
     "addcustomer", "editcustomer", "mergecustomers", "archivecustomer", "unarchivecustomer",
-    "deletecustomer", "purgeimportedcontacts", "reconcileattendance", "configureprojects", "configureroles", "configurecategories",
+    "deletecustomer", "purgeimportedcontacts", "reconcileattendance", "resync", "configureprojects", "configureroles", "configurecategories",
     "addemployee", "linkemployee", "unlinkemployee", "archiveemployee", "unarchiveemployee",
     "setpay", "payhistory", "bankadjust", "bankbalance",
     "creategroup", "addtogroup", "removefromgroup", "groupmembers",
@@ -1605,6 +1605,45 @@ class TimeTracking(commands.Cog):
                      "name": name_by_odoo.get(eo, f"Odoo emp {eo}")}
             (dups if (eo, a["check_in"]) in owned_slots else orphans).append(entry)
         return dups, orphans
+
+    @discord.slash_command(name="resync", description="Force-push queued changes to Odoo now (also retries items that had failed).")
+    @is_timecard_admin()
+    async def resync(self, ctx: discord.ApplicationContext):
+        if not await self._pay_channel_guard(ctx):
+            return
+        if not self.client.loaded:
+            await ctx.respond("Odoo isn't configured — nothing to push.", ephemeral=self._eph(ctx))
+            return
+        db = await self._ensure_db()   # also starts self.sync if it isn't running
+        await ctx.defer(ephemeral=self._eph(ctx))
+        # Requeue anything that had given up; the normal drain only touches 'pending'.
+        requeued = (await db.fetchone("SELECT COUNT(*) c FROM odoo_outbox WHERE status = 'failed'"))["c"]
+        await db.execute("UPDATE odoo_outbox SET status = 'pending', attempts = 0, last_error = NULL WHERE status = 'failed'")
+        total_pending = (await db.fetchone("SELECT COUNT(*) c FROM odoo_outbox WHERE status = 'pending'"))["c"]
+        try:
+            for _ in range(20):   # drain does 50/pass; loop until empty or no progress (retries waiting on deps)
+                before = (await db.fetchone("SELECT COUNT(*) c FROM odoo_outbox WHERE status = 'pending'"))["c"]
+                if before == 0:
+                    break
+                await self.sync.drain()
+                after = (await db.fetchone("SELECT COUNT(*) c FROM odoo_outbox WHERE status = 'pending'"))["c"]
+                if after >= before:
+                    break
+        except Exception as e:  # noqa: BLE001
+            log.exception("[Resync] drain failed")
+            await ctx.followup.send(f"Sync run hit an error: {e}", ephemeral=self._eph(ctx))
+            return
+        still_pending = (await db.fetchone("SELECT COUNT(*) c FROM odoo_outbox WHERE status = 'pending'"))["c"]
+        failed = (await db.fetchone("SELECT COUNT(*) c FROM odoo_outbox WHERE status = 'failed'"))["c"]
+        pushed = total_pending - still_pending
+        timecard_log.info(f"[Resync] {ctx.author} forced a sync push: requeued {requeued} failed, "
+                          f"pushed {pushed}; now {still_pending} pending, {failed} failed.")
+        await ctx.followup.send(
+            f"🔁 Pushed to Odoo — requeued **{requeued}** previously-failed item(s), sent **{pushed}**. "
+            f"Now: **{still_pending}** pending, **{failed}** failed."
+            + (" (Pending items are waiting on a dependency and will retry automatically.)" if still_pending else "")
+            + (f" ⚠️ {failed} still failing — check the log for the Odoo error." if failed else ""),
+            ephemeral=self._eph(ctx))
 
     @discord.slash_command(name="reconcileattendance", description="Find & clean up duplicate/orphaned Odoo attendances left by failed syncs.")
     @is_timecard_admin()
