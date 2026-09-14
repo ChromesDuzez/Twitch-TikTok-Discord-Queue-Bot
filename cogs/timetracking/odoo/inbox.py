@@ -437,10 +437,10 @@ class InboxWorker:
     async def _close_open_worktimes(self, punch_id: int, end_local_str: str) -> None:
         """End any open jobsite worktime on a punch that Odoo just clocked out.
 
-        Mirrors the "End Work Now" button: duration = timeStarted -> the check-out
-        time, rounded to the nearest quarter-hour (min 0.25h), then the finished
-        timesheet line is enqueued to Odoo. Without this an open Service/
-        Construction/Office worktime would be left stranded at 0h.
+        Behaves exactly like the "End Work Now" button -- it reuses the same
+        ``round_quarter_hours`` + ``finalize_worktime`` helpers -- but derives the
+        span from timeStarted -> the Odoo check-out time instead of "now". Without
+        this an open Service/Construction/Office worktime would be stranded at 0h.
         """
         rows = await self.db.fetchall(
             "SELECT id, punchType, timeStarted FROM work_time "
@@ -449,6 +449,9 @@ class InboxWorker:
         )
         if not rows:
             return
+        # Local import mirrors _refresh_employee_clock -- avoids an import cycle and
+        # keeps "how a worktime is finished" defined once, in views.
+        from ..views import round_quarter_hours, finalize_worktime
         try:
             end_dt = datetime.strptime(end_local_str[:19], "%Y-%m-%d %H:%M:%S")
         except (TypeError, ValueError):
@@ -460,16 +463,9 @@ class InboxWorker:
             except (TypeError, ValueError):
                 log.warning(f"[Inbox] worktime {wt['id']} has an unparseable start time; skipping auto-close.")
                 continue
-            hours = (end_dt - started).total_seconds() / 3600
-            nearest_quarter = round(hours * 4) / 4 or 0.25
-            # Guard against clock skew / bad data: keep timeSpent within the column's
-            # CHECK bounds (multiple of 15, 15..1440) so the inbox worker can't wedge.
-            minutes = max(15, min(int(nearest_quarter * 60), 1440))
-            await self.db.execute(
-                "UPDATE work_time SET timeSpent = ? WHERE id = ?", (minutes, wt["id"])
-            )
-            # Push the timesheet line now that its final hours are known (same as the button).
-            await sync.enqueue(self.db, "worktime", wt["id"], "create")
+            span = (end_dt - started).total_seconds() / 3600
+            hours = round_quarter_hours(span)  # floors at 0.25h, tames clock skew
+            minutes = await finalize_worktime(self.db, wt["id"], hours)
             log.info(
                 f"[Inbox] Odoo check-out ended open {wt['punchType']} worktime {wt['id']} "
                 f"({minutes / 60:g}h) on punch {punch_id}."

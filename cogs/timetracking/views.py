@@ -455,6 +455,34 @@ class StartWorkButton(discord.ui.Button):
             await reply(f"{self.punch_type} work started for {customer_name}.")
 
 
+def round_quarter_hours(hours: float) -> float:
+    """Round a raw hour span to the nearest quarter-hour, floored at 0.25h.
+
+    Shared by End-Work-Now and the Odoo check-out auto-close so both turn a span
+    into billable hours the same way. (For non-negative spans this matches the
+    old ``round(h*4)/4 or 0.25`` exactly; it additionally floors negatives from
+    clock skew to 0.25h.)"""
+    q = round(hours * 4) / 4
+    return q if q >= 0.25 else 0.25
+
+
+async def finalize_worktime(db: Database, worktime_id: int, hours: float) -> int:
+    """Record a worktime's final duration and enqueue its Odoo timesheet line.
+
+    The single place a worktime becomes "done": the End-Work-Now / End-Work-Custom
+    buttons and the inbox's Odoo-check-out auto-close both go through here, so any
+    future change to what finishing a worktime entails (extra Odoo fields, more
+    enqueues, hooks) is made once. Returns the stored minutes; caps at the
+    ``timeSpent`` CHECK ceiling (24h) so a runaway span can't wedge the write."""
+    minutes = min(int(hours * 60), 1440)
+    await db.execute(
+        "UPDATE work_time SET timeSpent = ? WHERE id = ?", (minutes, worktime_id)
+    )
+    # Enqueue the Odoo timesheet now that the final hours are known.
+    await sync.enqueue(db, "worktime", worktime_id, "create")
+    return minutes
+
+
 class EndWorkButton(discord.ui.Button):
     def __init__(self, punch_type: str, custom: bool):
         self.punch_type = punch_type
@@ -483,7 +511,7 @@ class EndWorkButton(discord.ui.Button):
             return
         # timeStarted was stored as an ISO string historically; both parse via [:19].
         hours = (datetime.now() - started).total_seconds() / 3600
-        nearest_quarter = round(hours * 4) / 4 or 0.25
+        nearest_quarter = round_quarter_hours(hours)
         await interaction.response.defer()
         await self._finish(interaction, nearest_quarter, already_deferred=True)
 
@@ -498,12 +526,7 @@ class EndWorkButton(discord.ui.Button):
                 await interaction.response.send_message(msg, ephemeral=True)
             return
         worktime_id = state.open_worktime
-        await view.db.execute(
-            "UPDATE work_time SET timeSpent = ? WHERE id = ?",
-            (int(hours * 60), worktime_id),
-        )
-        # Enqueue the Odoo timesheet now that the final hours are known.
-        await sync.enqueue(view.db, "worktime", worktime_id, "create")
+        await finalize_worktime(view.db, worktime_id, hours)
         await render_clock(view.cog, view.message, view.employee_id)
         crow = await view.db.fetchone(
             "SELECT c.name FROM work_time wt LEFT JOIN customer c ON wt.customerID = c.id WHERE wt.id = ?",
