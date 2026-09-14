@@ -14,7 +14,7 @@ from datetime import datetime, timedelta
 
 import discord
 
-from botlog import timecard_log
+from botlog import log, timecard_log
 from .db import Database
 from .modals import Confirm, CustomerInputModal, CustomerSelectMenu, EditPunchTimeModal, GetTimeSpent
 from .perms import CLOCK_ROLES, has_perms
@@ -170,6 +170,33 @@ class ClockInButton(discord.ui.Button):
             return
 
         await interaction.response.defer()
+
+        # Desync guard: Discord shows clocked-out, but if Odoo already has an OPEN
+        # attendance for this employee (a missed update), adopt that shift instead of
+        # creating a duplicate/overlapping attendance. Never blocks clock-in on an
+        # Odoo hiccup — on any error we fall through to the normal path.
+        if view.cog.client.loaded:
+            emp = await db.fetchone("SELECT odooId FROM employee WHERE id = ?", (view.employee_id,))
+            if emp and emp["odooId"]:
+                open_att = None
+                try:
+                    open_att = await view.cog.client.find_open_attendance(emp["odooId"])
+                except Exception as e:  # noqa: BLE001
+                    log.warning(f"[Clock] open-attendance check failed for employee {view.employee_id}: {e}")
+                if open_att:
+                    if view.cog.inbox is not None:
+                        try:
+                            await view.cog.inbox._reconcile_attendance(open_att["id"])  # import as local shift
+                        except Exception as e:  # noqa: BLE001
+                            log.warning(f"[Clock] adopting open attendance {open_att['id']} failed: {e}")
+                    await render_clock(view.cog, view.message, view.employee_id)
+                    timecard_log.info(
+                        f"[Clock] {interaction.user}'s clock-in for employee {view.employee_id} found an open "
+                        f"Odoo attendance ({open_att['id']}) — adopted it, no duplicate created.")
+                    await interaction.followup.send(
+                        "You're already clocked in (synced from Odoo).", ephemeral=True)
+                    return
+
         now_str = sync.now_local_str()
         approved = _is_standard_actor(interaction.user)
 

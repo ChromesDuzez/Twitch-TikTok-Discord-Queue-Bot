@@ -323,6 +323,17 @@ class OdooClient:
             offset += page_size
         return out
 
+    async def find_open_attendance(self, employee_odoo_id: int):
+        """The employee's currently-OPEN attendance (checked in, no check-out) or None.
+        Used at clock-in to catch a desync where Odoo already has them clocked in but
+        Discord missed the update. Odoo stores an empty check-out as False."""
+        rows = await self.call(
+            "/hr.attendance/search_read",
+            {"domain": [["employee_id", "=", employee_odoo_id], ["check_out", "=", False]],
+             "fields": ["id", "check_in"], "order": "check_in desc", "limit": 1},
+        )
+        return rows[0] if rows else None
+
     async def attendance_create(self, employee_odoo_id: int, check_in_utc: str):
         """Create an hr.attendance check-in. Returns the new attendance id."""
         result = await self.call(
