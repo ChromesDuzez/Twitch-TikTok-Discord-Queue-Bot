@@ -2101,7 +2101,7 @@ class TimeTracking(commands.Cog):
             note = ""
         await ctx.respond(f"Added {worktype} worktime #{wt_id} ({hours:g}h) to punch #{punch}.{note}", ephemeral=self._eph(ctx))
 
-    @discord.slash_command(name="editworktime", description="Edit a worktime entry's type, hours, or customer.")
+    @discord.slash_command(name="editworktime", description="Edit a worktime's type, hours, customer, or move it to another shift.")
     @is_timecard_admin()
     async def editworktime(
         self, ctx: discord.ApplicationContext,
@@ -2110,11 +2110,12 @@ class TimeTracking(commands.Cog):
         hours: discord.Option(float, default=None, description="New hours (quarter-hour)"),  # type: ignore
         customer: discord.Option(str, default=None, description="New customer", autocomplete=customer_autocomplete),  # type: ignore
         task: discord.Option(str, default=None, description="Odoo task to (re)link", autocomplete=task_autocomplete),  # type: ignore
+        punch: discord.Option(str, default=None, description="Move it to a different shift (punch)", autocomplete=punch_autocomplete),  # type: ignore
     ):
         db = await self._ensure_db()
         # An Odoo task lookup + clock refresh can exceed Discord's 3s window; defer first.
         await ctx.defer(ephemeral=self._eph(ctx))
-        worktime, customer, task = _opt_int(worktime), _opt_int(customer), _opt_int(task)
+        worktime, customer, task, punch = _opt_int(worktime), _opt_int(customer), _opt_int(task), _opt_int(punch)
         if worktime is None:
             await ctx.respond("Pick a worktime from the autocomplete list.", ephemeral=self._eph(ctx))
             return
@@ -2156,22 +2157,44 @@ class TimeTracking(commands.Cog):
             sets.append("odooTaskId = ?"); params.append(task)
             sets.append("odooProjectId = ?"); params.append(pid)
             changes.append(f"Odoo task → {task}")
-        if not sets:
-            await ctx.respond("Nothing to change — provide a new type, hours, customer, or task.", ephemeral=self._eph(ctx))
+        if punch is not None and await db.fetchone("SELECT 1 FROM punch_clock WHERE id = ?", (punch,)) is None:
+            await ctx.respond("That target punch/shift doesn't exist.", ephemeral=self._eph(ctx))
             return
-        await db.execute(f"UPDATE work_time SET {', '.join(sets)} WHERE id = ?", (*params, worktime))
-        push = self.client.loaded and (wt["odooId"] or task is not None)
-        if push:
-            await sync.enqueue(db, "worktime", worktime, "edit")
+        if not sets and punch is None:
+            await ctx.respond("Nothing to change — provide a new type, hours, customer, task, or punch.", ephemeral=self._eph(ctx))
+            return
+        # The worktime's current employee (before any move) — always refresh their clock.
         prow = await db.fetchone(
             "SELECT pc.employeeID, e.name FROM punch_clock pc JOIN employee e ON pc.employeeID = e.id "
             "WHERE pc.id = ?", (wt["punchID"],))
-        if prow:
-            await self._refresh_clock(prow["employeeID"])
         ename = prow["name"] if prow else "?"
+        refresh_emps = {prow["employeeID"]} if prow else set()
+
+        push = False
+        if sets:
+            await db.execute(f"UPDATE work_time SET {', '.join(sets)} WHERE id = ?", (*params, worktime))
+            push = self.client.loaded and (wt["odooId"] or task is not None)
+            if push:
+                await sync.enqueue(db, "worktime", worktime, "edit")
+
+        moved = False
+        if punch is not None:
+            # Delegate the move to the shared helper (resets detached, no-ops on the
+            # same punch, and enqueues the correct Odoo shift re-link).
+            old_emp, new_emp = await reassign_worktime(self, worktime, punch, to_odoo=True)
+            if new_emp is None:
+                changes.append(f"(already on punch {punch})")
+            else:
+                moved = True
+                refresh_emps.update({old_emp, new_emp} - {None})
+                changes.append(f"moved to punch {punch}")
+
+        for e in refresh_emps - {None}:
+            await self._refresh_clock(e)
         timecard_log.info(f"[Work] {ctx.author} edited worktime {worktime} for {ename}: {'; '.join(changes)}.")
-        note = " — change queued to Odoo." if push else ""
-        await ctx.respond(f"Updated worktime #{worktime}.{note}", ephemeral=self._eph(ctx))
+        note = " — change queued to Odoo." if (push or moved) else ""
+        moved_note = f" Moved onto punch #{punch}." if moved else ""
+        await ctx.respond(f"Updated worktime #{worktime}.{note}{moved_note}", ephemeral=self._eph(ctx))
 
     @discord.slash_command(name="deleteworktime", description="Delete a single worktime entry.")
     @is_timecard_admin()
