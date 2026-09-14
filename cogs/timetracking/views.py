@@ -1112,16 +1112,23 @@ def update_timecard_view_week(message_id, week_end: str) -> None:
         save_timecard_views(views)
 
 
+# Ephemeral (session) views listen this long. 15 min is the ceiling — Discord's
+# ephemeral interaction token expires at 15 min, after which the buttons can't be
+# edited/answered anyway.
+SESSION_VIEW_TIMEOUT = 900
+
+
 class TimecardWeekView(discord.ui.View):
     """Prev/Next/Refresh/Close paging around build_timecard_embed for /viewtimecard.
 
     Two modes: **persistent** (timeout=None, stable custom_ids, JSON-backed,
-    re-attached on restart) for non-ephemeral messages; and **session** (timeout=300)
-    for ephemeral ones — which strip their own buttons on timeout/shutdown."""
+    re-attached on restart) for non-ephemeral messages; and **session**
+    (SESSION_VIEW_TIMEOUT) for ephemeral ones — which strip their own buttons on
+    timeout/shutdown."""
 
     def __init__(self, cog, emp_id: int, ename: str, week_end_dt: datetime, author_id: int,
                  *, persistent: bool = False, token: str | None = None):
-        super().__init__(timeout=None if persistent else 300)
+        super().__init__(timeout=None if persistent else SESSION_VIEW_TIMEOUT)
         self.cog = cog
         self.emp_id = emp_id
         self.ename = ename
