@@ -131,6 +131,14 @@ def _opt_int(raw) -> int | None:
         return None
 
 
+def _odoo_id(val) -> int | None:
+    """Extract the id from an Odoo many2one value, which reads back as
+    ``[id, display_name]`` (or ``False`` when empty)."""
+    if isinstance(val, (list, tuple)):
+        return val[0] if val else None
+    return val or None
+
+
 class TimeTracking(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -848,33 +856,40 @@ class TimeTracking(commands.Cog):
         return out
 
     async def task_autocomplete(self, ctx: discord.AutocompleteContext):
-        """Odoo tasks for the chosen customer, ranked by planned-start proximity
-        to the punch time (used to link a manually-added worktime to Odoo)."""
+        """Odoo tasks to link a worktime to, ranked by planned-start proximity to the
+        punch time. Scoped to the project being (re)linked when there is one (a
+        `project:` option or the edited worktime's current project), so the task list
+        follows the project; otherwise falls back to the chosen customer's tasks."""
         if self.db is None or not self.client.loaded:
             return []
         opts = ctx.options or {}
         customer_id = _opt_int(opts.get("customer"))
+        project_id = _opt_int(opts.get("project"))  # /editworktime: scope tasks to this project
         punch_in = None
-        wt_id = _opt_int(opts.get("worktime"))  # /editworktime: derive customer + punch from the entry
+        wt_id = _opt_int(opts.get("worktime"))  # /editworktime: derive customer/project + punch from the entry
         if wt_id:
             wt = await self.db.fetchone(
-                "SELECT wt.customerID, pc.punchInTime FROM work_time wt "
+                "SELECT wt.customerID, wt.odooProjectId, pc.punchInTime FROM work_time wt "
                 "JOIN punch_clock pc ON wt.punchID = pc.id WHERE wt.id = ?", (wt_id,)
             )
             if wt:
                 customer_id = customer_id or wt["customerID"]
+                project_id = project_id or wt["odooProjectId"]
                 punch_in = wt["punchInTime"]
         punch_id = _opt_int(opts.get("punch"))  # /addworktime
         if punch_id and punch_in is None:
             prow = await self.db.fetchone("SELECT punchInTime FROM punch_clock WHERE id = ?", (punch_id,))
             punch_in = prow["punchInTime"] if prow else None
-        if not customer_id:
-            return []
-        crow = await self.db.fetchone("SELECT odooId FROM customer WHERE id = ?", (customer_id,))
-        if not crow or not crow["odooId"]:
-            return []  # customer isn't linked to Odoo -> no tasks to link
         try:
-            tasks = await self.client.search_tasks_for_partner(crow["odooId"], str(ctx.value or ""))
+            if project_id:
+                tasks = await self.client.search_tasks_in_project(project_id, str(ctx.value or ""))
+            else:
+                if not customer_id:
+                    return []
+                crow = await self.db.fetchone("SELECT odooId FROM customer WHERE id = ?", (customer_id,))
+                if not crow or not crow["odooId"]:
+                    return []  # customer isn't linked to Odoo -> no tasks to link
+                tasks = await self.client.search_tasks_for_partner(crow["odooId"], str(ctx.value or ""))
         except Exception as e:  # noqa: BLE001
             log.warning(f"[Odoo] task autocomplete fetch failed: {e}")
             return []
@@ -1686,9 +1701,56 @@ class TimeTracking(commands.Cog):
             (dups if (eo, a["check_in"]) in owned_slots else orphans).append(entry)
         return dups, orphans
 
-    @discord.slash_command(name="resync", description="Force-push queued changes to Odoo now (also retries items that had failed).")
+    async def _queue_unpushed(self, db, *, only_punch=None, only_worktime=None):
+        """Queue local-only rows that were never sent to Odoo (no outbox row, no
+        odooId). The `legacy` flag lives on the **punch**, so a worktime whose parent
+        punch is legacy is never pushed. Deduped against any existing pending/failed
+        outbox row. `only_*` narrows to a single id. Returns (punches, worktimes)."""
+        async def _already(entity_type, entity_id):
+            return await db.fetchone(
+                "SELECT 1 FROM odoo_outbox WHERE entity_type = ? AND entity_id = ? "
+                "AND status IN ('pending','failed') LIMIT 1", (entity_type, entity_id)) is not None
+
+        punches = worktimes = 0
+
+        # Punches never synced: the edit path creates the attendance + sets check-in/out.
+        if only_worktime is None:
+            q = ("SELECT id FROM punch_clock WHERE odooId IS NULL AND legacy = 0 "
+                 "AND punchInTime IS NOT NULL")
+            prows = await (db.fetchall(q + " AND id = ?", (only_punch,)) if only_punch is not None
+                           else db.fetchall(q))
+            for p in prows:
+                if not await _already("punch", p["id"]):
+                    await sync.enqueue(db, "punch", p["id"], "edit")
+                    punches += 1
+
+        # Worktimes never synced that have an Odoo work item + hours and a non-legacy punch.
+        if only_punch is None:
+            q = ("SELECT wt.id AS wid, pc.id AS pid, pc.odooId AS p_odoo, pc.punchInTime AS p_in "
+                 "FROM work_time wt JOIN punch_clock pc ON wt.punchID = pc.id "
+                 "WHERE wt.odooId IS NULL AND wt.timeSpent > 0 AND wt.odooProjectId IS NOT NULL "
+                 "AND pc.legacy = 0")
+            wrows = await (db.fetchall(q + " AND wt.id = ?", (only_worktime,)) if only_worktime is not None
+                           else db.fetchall(q))
+            for w in wrows:
+                # The worktime's timesheet line waits on its parent attendance, so make
+                # sure an unsynced parent punch is queued too (deduped in a full sweep).
+                if w["p_odoo"] is None and w["p_in"] is not None and not await _already("punch", w["pid"]):
+                    await sync.enqueue(db, "punch", w["pid"], "edit")
+                    punches += 1
+                if not await _already("worktime", w["wid"]):
+                    await sync.enqueue(db, "worktime", w["wid"], "create")
+                    worktimes += 1
+
+        return punches, worktimes
+
+    @discord.slash_command(name="resync", description="Force-push to Odoo now: retries failures and sends local-only items that were never synced.")
     @is_timecard_admin()
-    async def resync(self, ctx: discord.ApplicationContext):
+    async def resync(
+        self, ctx: discord.ApplicationContext,
+        worktime: discord.Option(str, default=None, description="Force-push one specific worktime", autocomplete=worktime_autocomplete),  # type: ignore
+        punch: discord.Option(str, default=None, description="Force-push one specific punch/shift", autocomplete=punch_autocomplete),  # type: ignore
+    ):
         if not await self._pay_channel_guard(ctx):
             return
         if not self.client.loaded:
@@ -1696,9 +1758,15 @@ class TimeTracking(commands.Cog):
             return
         db = await self._ensure_db()   # also starts self.sync if it isn't running
         await ctx.defer(ephemeral=self._eph(ctx))
+        worktime, punch = _opt_int(worktime), _opt_int(punch)
+        targeted = worktime is not None or punch is not None
         # Requeue anything that had given up; the normal drain only touches 'pending'.
         requeued = (await db.fetchone("SELECT COUNT(*) c FROM odoo_outbox WHERE status = 'failed'"))["c"]
         await db.execute("UPDATE odoo_outbox SET status = 'pending', attempts = 0, last_error = NULL WHERE status = 'failed'")
+        # Queue local-only items that were never enqueued (targeted id, or a full sweep).
+        qp, qw = await self._queue_unpushed(
+            db, only_punch=punch, only_worktime=worktime) if targeted else await self._queue_unpushed(db)
+        queued = qp + qw
         total_pending = (await db.fetchone("SELECT COUNT(*) c FROM odoo_outbox WHERE status = 'pending'"))["c"]
         try:
             for _ in range(20):   # drain does 50/pass; loop until empty or no progress (retries waiting on deps)
@@ -1717,12 +1785,17 @@ class TimeTracking(commands.Cog):
         failed = (await db.fetchone("SELECT COUNT(*) c FROM odoo_outbox WHERE status = 'failed'"))["c"]
         pushed = total_pending - still_pending
         timecard_log.info(f"[Resync] {ctx.author} forced a sync push: requeued {requeued} failed, "
-                          f"pushed {pushed}; now {still_pending} pending, {failed} failed.")
+                          f"queued {queued} unsent, pushed {pushed}; now {still_pending} pending, {failed} failed.")
+        target_note = ""
+        if targeted and queued == 0:
+            target_note = (" Nothing new to queue for that id — it's already in Odoo, or not eligible "
+                           "(a worktime needs an Odoo project + hours, and a non-legacy punch).")
         await ctx.followup.send(
-            f"🔁 Pushed to Odoo — requeued **{requeued}** previously-failed item(s), sent **{pushed}**. "
-            f"Now: **{still_pending}** pending, **{failed}** failed."
+            f"🔁 Pushed to Odoo — requeued **{requeued}** previously-failed, queued **{queued}** never-sent, "
+            f"sent **{pushed}**. Now: **{still_pending}** pending, **{failed}** failed."
             + (" (Pending items are waiting on a dependency and will retry automatically.)" if still_pending else "")
-            + (f" ⚠️ {failed} still failing — check the log for the Odoo error." if failed else ""),
+            + (f" ⚠️ {failed} still failing — check the log for the Odoo error." if failed else "")
+            + target_note,
             ephemeral=self._eph(ctx))
 
     @discord.slash_command(name="reconcileattendance", description="Find & clean up duplicate/orphaned Odoo attendances left by failed syncs.")
@@ -2181,30 +2254,95 @@ class TimeTracking(commands.Cog):
             note = ""
         await ctx.respond(f"Added {worktype} worktime #{wt_id} ({hours:g}h) to punch #{punch}.{note}", ephemeral=self._eph(ctx))
 
-    @discord.slash_command(name="editworktime", description="Edit a worktime's type, hours, customer, or move it to another shift.")
+    async def _resolve_worktime_link(self, wt, worktype, project, task):
+        """Resolve a worktime's new (project_id, task_id, partner_id) from a
+        /editworktime task/project selection, enforcing: construction = project only;
+        service = a task inside a project; a task must belong to its project.
+
+        Returns (new_project, new_task, partner_id, error_message). On any error the
+        first three are None and error_message is a user-facing string. Requires
+        self.client.loaded (callers guard that)."""
+        if project is not None:
+            prj = await self.client.read_record("project.project", project, ["partner_id"])
+            if not prj:
+                return None, None, None, "That Odoo project doesn't exist."
+            if task is None:
+                # Construction / project-level: clear any task.
+                return project, None, _odoo_id(prj.get("partner_id")), None
+            # Project + task: the task must live in that project.
+            trec = await self.client.read_record("project.task", task, ["project_id", "partner_id"])
+            if not trec:
+                return None, None, None, "That Odoo task doesn't exist."
+            if _odoo_id(trec.get("project_id")) != project:
+                return None, None, None, "That task isn't in the selected project — pick a task from that project."
+            return project, task, _odoo_id(trec.get("partner_id")) or _odoo_id(prj.get("partner_id")), None
+
+        # Task only: validate against the worktime's current (effective) project.
+        trec = await self.client.read_record("project.task", task, ["project_id", "partner_id"])
+        if not trec:
+            return None, None, None, "That Odoo task doesn't exist."
+        eff_project = wt["odooProjectId"]
+        if not eff_project:
+            # Defensive — start-of-worktime normally sets the project. Construction is
+            # project-based (needs an explicit project); service falls back to Field Service.
+            ptype = worktype or wt["punchType"]
+            if ptype == "Service":
+                eff_project = _opt_int(os.getenv("ODOO_FIELD_SERVICE_PROJECT_ID"))
+                if not eff_project:
+                    return None, None, None, "No Field Service project is configured (ODOO_FIELD_SERVICE_PROJECT_ID)."
+            else:
+                return None, None, None, "This worktime has no project yet — set `project:` too (construction is project-based)."
+        if _odoo_id(trec.get("project_id")) != eff_project:
+            return None, None, None, "That task isn't in this worktime's project — set `project:` too to move it."
+        return eff_project, task, _odoo_id(trec.get("partner_id")), None
+
+    @discord.slash_command(name="editworktime", description="Edit a worktime's type, hours, customer, task/project, or move it to another shift.")
     @is_timecard_admin()
     async def editworktime(
         self, ctx: discord.ApplicationContext,
         worktime: discord.Option(str, description="The worktime to edit", autocomplete=worktime_autocomplete),  # type: ignore
         worktype: discord.Option(str, default=None, description="New type", choices=WORKTYPES),  # type: ignore
         hours: discord.Option(float, default=None, description="New hours (quarter-hour)"),  # type: ignore
-        customer: discord.Option(str, default=None, description="New customer", autocomplete=customer_autocomplete),  # type: ignore
-        task: discord.Option(str, default=None, description="Odoo task to (re)link", autocomplete=task_autocomplete),  # type: ignore
+        customer: discord.Option(str, default=None, description="New customer (offline only — otherwise follows the task/project)", autocomplete=customer_autocomplete),  # type: ignore
+        task: discord.Option(str, default=None, description="Odoo task to (re)link — service work (within a project)", autocomplete=task_autocomplete),  # type: ignore
+        project: discord.Option(str, default=None, description="Odoo project to (re)link — construction jobs", autocomplete=project_autocomplete),  # type: ignore
         punch: discord.Option(str, default=None, description="Move it to a different shift (punch)", autocomplete=punch_autocomplete),  # type: ignore
     ):
         db = await self._ensure_db()
         # An Odoo task lookup + clock refresh can exceed Discord's 3s window; defer first.
         await ctx.defer(ephemeral=self._eph(ctx))
-        worktime, customer, task, punch = _opt_int(worktime), _opt_int(customer), _opt_int(task), _opt_int(punch)
+        worktime, customer, task, project, punch = (
+            _opt_int(worktime), _opt_int(customer), _opt_int(task), _opt_int(project), _opt_int(punch))
         if worktime is None:
             await ctx.respond("Pick a worktime from the autocomplete list.", ephemeral=self._eph(ctx))
             return
         wt = await db.fetchone(
-            "SELECT punchID, odooId, punchType, timeSpent, customerID FROM work_time WHERE id = ?", (worktime,)
+            "SELECT punchID, odooId, punchType, timeSpent, customerID, odooProjectId, odooTaskId "
+            "FROM work_time WHERE id = ?", (worktime,)
         )
         if wt is None:
             await ctx.respond("That worktime doesn't exist.", ephemeral=self._eph(ctx))
             return
+        # Parent punch: the legacy flag lives HERE (never sync a legacy punch's worktime),
+        # and this is the employee whose clock we refresh.
+        prow = await db.fetchone(
+            "SELECT pc.employeeID, pc.legacy, e.name FROM punch_clock pc JOIN employee e ON pc.employeeID = e.id "
+            "WHERE pc.id = ?", (wt["punchID"],))
+        ename = prow["name"] if prow else "?"
+        punch_legacy = bool(prow and prow["legacy"])
+        refresh_emps = {prow["employeeID"]} if prow else set()
+
+        # When Odoo is connected the customer follows the Odoo work item (task/project);
+        # a manual customer change would desync Discord from Odoo.
+        if customer is not None and self.client.loaded:
+            await ctx.respond(
+                "When Odoo is connected a worktime's customer follows its Odoo task/project — "
+                "set `task:` (service) or `project:` (construction) instead.", ephemeral=self._eph(ctx))
+            return
+        if (task is not None or project is not None) and not self.client.loaded:
+            await ctx.respond("Odoo isn't connected — can't (re)link a task or project.", ephemeral=self._eph(ctx))
+            return
+
         sets, params, changes = [], [], []  # changes = human "field: old → new" for the log
         if worktype is not None:
             sets.append("punchType = ?"); params.append(worktype)
@@ -2217,7 +2355,7 @@ class TimeTracking(commands.Cog):
                 return
             sets.append("timeSpent = ?"); params.append(mins)
             changes.append(f"hours {(wt['timeSpent'] or 0) / 60:g}h → {hours:g}h")
-        if customer is not None:
+        if customer is not None:  # offline-only (guarded above when Odoo is connected)
             newc = await db.fetchone("SELECT name FROM customer WHERE id = ?", (customer,))
             if newc is None:
                 await ctx.respond("That customer doesn't exist.", ephemeral=self._eph(ctx))
@@ -2225,35 +2363,48 @@ class TimeTracking(commands.Cog):
             oldc = await db.fetchone("SELECT name FROM customer WHERE id = ?", (wt["customerID"],))
             sets.append("customerID = ?"); params.append(customer)
             changes.append(f"customer {oldc['name'] if oldc else wt['customerID']} → {newc['name']}")
-        if task is not None and self.client.loaded:
+
+        # ---- Odoo task/project (re)link -----------------------------------------
+        # Construction posts at project level (project only); service posts to a task
+        # inside a project. A task must belong to its project; the customer is derived
+        # from the work item's partner so Discord can't drift from Odoo.
+        customer_note = ""
+        if task is not None or project is not None:
             try:
-                pid = await self.client.get_task_project(task)
+                new_project, new_task, link_partner, err = await self._resolve_worktime_link(
+                    wt, worktype, project, task)
             except Exception as e:  # noqa: BLE001
-                log.warning(f"[Odoo] task project lookup failed: {e}")
-                pid = None
-            if not pid:
-                await ctx.respond("Couldn't resolve that Odoo task's project.", ephemeral=self._eph(ctx))
+                log.warning(f"[Odoo] worktime link lookup failed: {e}")
+                await ctx.respond("Couldn't reach Odoo to resolve that task/project — try again.", ephemeral=self._eph(ctx))
                 return
-            sets.append("odooTaskId = ?"); params.append(task)
-            sets.append("odooProjectId = ?"); params.append(pid)
-            changes.append(f"Odoo task → {task}")
+            if err:
+                await ctx.respond(err, ephemeral=self._eph(ctx))
+                return
+            sets.append("odooProjectId = ?"); params.append(new_project)
+            sets.append("odooTaskId = ?"); params.append(new_task)
+            changes.append(f"Odoo project → {new_project}"
+                           + (f", task → {new_task}" if new_task else ", task cleared"))
+            if link_partner:
+                crow = await db.fetchone("SELECT id, name FROM customer WHERE odooId = ?", (link_partner,))
+                if crow and crow["id"] != wt["customerID"]:
+                    sets.append("customerID = ?"); params.append(crow["id"])
+                    changes.append(f"customer → {crow['name']}")
+                elif not crow:
+                    customer_note = " ⚠️ No local customer is linked to that Odoo customer — set it with /linkcustomer."
+
         if punch is not None and await db.fetchone("SELECT 1 FROM punch_clock WHERE id = ?", (punch,)) is None:
             await ctx.respond("That target punch/shift doesn't exist.", ephemeral=self._eph(ctx))
             return
         if not sets and punch is None:
-            await ctx.respond("Nothing to change — provide a new type, hours, customer, task, or punch.", ephemeral=self._eph(ctx))
+            await ctx.respond("Nothing to change — provide a new type, hours, customer, task, project, or punch.", ephemeral=self._eph(ctx))
             return
-        # The worktime's current employee (before any move) — always refresh their clock.
-        prow = await db.fetchone(
-            "SELECT pc.employeeID, e.name FROM punch_clock pc JOIN employee e ON pc.employeeID = e.id "
-            "WHERE pc.id = ?", (wt["punchID"],))
-        ename = prow["name"] if prow else "?"
-        refresh_emps = {prow["employeeID"]} if prow else set()
 
         push = False
         if sets:
             await db.execute(f"UPDATE work_time SET {', '.join(sets)} WHERE id = ?", (*params, worktime))
-            push = self.client.loaded and (wt["odooId"] or task is not None)
+            # Push unless Odoo is off or the parent punch is legacy (legacy never syncs).
+            # _sync_worktime_edit creates the line if it isn't in Odoo yet (has project + hours).
+            push = self.client.loaded and not punch_legacy
             if push:
                 await sync.enqueue(db, "worktime", worktime, "edit")
 
@@ -2274,7 +2425,7 @@ class TimeTracking(commands.Cog):
         timecard_log.info(f"[Work] {ctx.author} edited worktime {worktime} for {ename}: {'; '.join(changes)}.")
         note = " — change queued to Odoo." if (push or moved) else ""
         moved_note = f" Moved onto punch #{punch}." if moved else ""
-        await ctx.respond(f"Updated worktime #{worktime}.{note}{moved_note}", ephemeral=self._eph(ctx))
+        await ctx.respond(f"Updated worktime #{worktime}.{note}{moved_note}{customer_note}", ephemeral=self._eph(ctx))
 
     @discord.slash_command(name="deleteworktime", description="Delete a single worktime entry.")
     @is_timecard_admin()

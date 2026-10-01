@@ -399,6 +399,34 @@ class OdooClient:
             return pid[0] if isinstance(pid, (list, tuple)) else pid
         return None
 
+    async def search_tasks_in_project(self, project_id: int, name: str = "", limit: int = 40):
+        """Open tasks that belong to a given project, for scoping /editworktime's
+        task picker to the project being (re)linked.
+
+        Returns rows with id, display_name, project_id, planned_date_begin (same
+        shape as search_tasks_for_partner, so the caller ranks them identically).
+        """
+        domain = [["project_id", "=", project_id], ["is_closed", "=", False]]
+        if name:
+            domain.append(["name", "ilike", name])  # stored field (display_name isn't)
+        try:
+            return await self.call(
+                "/project.task/search_read",
+                {
+                    "domain": domain,
+                    "fields": ["id", "display_name", "project_id", "planned_date_begin"],
+                    "order": "planned_date_begin asc",
+                    "limit": limit,
+                },
+            )
+        except Exception as e:  # noqa: BLE001
+            # planned_date_begin needs the project-planning feature; fall back without it.
+            log.warning(f"[Odoo] project-task search with planned_date_begin failed ({e}); retrying without it.")
+            return await self.call(
+                "/project.task/search_read",
+                {"domain": domain, "fields": ["id", "display_name", "project_id"], "limit": limit},
+            )
+
     async def search_service_tasks(self, name: str, project_id: int, months: int = 6, limit: int = 15):
         """Open Field Service tasks for a customer whose deadline is within
         ``months`` months (past or future) of today.
