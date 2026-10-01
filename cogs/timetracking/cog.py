@@ -770,21 +770,26 @@ class TimeTracking(commands.Cog):
                 for r in rows if term in str(r["name"] or "").lower()][:25]
 
     async def punch_autocomplete(self, ctx: discord.AutocompleteContext):
-        """Recent punches, shown as 'Name · MM-DD HH:MM→out (#id)' (value = punch id
-        as a string, so the option is text-typed and filterable by employee name)."""
+        """Punches, shown as 'Name · MM-DD HH:MM→out (#id)' (value = punch id as a
+        string). Typing a number looks the id up across ALL history (not just the recent
+        window); otherwise shows recent punches, filterable by employee name."""
         if self.db is None:
             return []
-        rows = await self.db.fetchall(
-            "SELECT pc.id, e.name, pc.punchInTime, pc.punchOutTime FROM punch_clock pc "
-            "JOIN employee e ON pc.employeeID = e.id ORDER BY pc.id DESC LIMIT 300"
-        )
-        term = str(ctx.value or "").lower()
+        term = str(ctx.value or "").strip()
+        base = ("SELECT pc.id, e.name, pc.punchInTime, pc.punchOutTime FROM punch_clock pc "
+                "JOIN employee e ON pc.employeeID = e.id ")
+        if term.isdigit():
+            rows = await self.db.fetchall(
+                base + "WHERE CAST(pc.id AS TEXT) LIKE ? ORDER BY pc.id DESC LIMIT 25", (term + "%",))
+        else:
+            rows = await self.db.fetchall(base + "ORDER BY pc.id DESC LIMIT 300")
+        tl = term.lower()
         out = []
         for r in rows:
             pin = (r["punchInTime"] or "")[5:16] or "?"
             pout = (r["punchOutTime"] or "")[5:16] or "open"
             label = f"{r['name']} · {pin}→{pout} (#{r['id']})"
-            if term in label.lower():
+            if term.isdigit() or tl in label.lower():
                 out.append(discord.OptionChoice(name=label[:100], value=str(r["id"])))
             if len(out) >= 25:
                 break
@@ -835,21 +840,26 @@ class TimeTracking(commands.Cog):
         return out
 
     async def worktime_autocomplete(self, ctx: discord.AutocompleteContext):
-        """Recent worktime entries, shown as 'Name · Type Nh Customer (#id)'."""
+        """Worktime entries, shown as 'Name · Type Nh Customer (#id)'. Typing a number
+        looks the id up across ALL history (ids come from /viewtimecard, which can
+        reference entries older than the recent window); otherwise shows recent ones."""
         if self.db is None:
             return []
-        rows = await self.db.fetchall(
-            "SELECT wt.id, e.name AS ename, wt.punchType, wt.timeSpent, c.name AS cname "
-            "FROM work_time wt JOIN punch_clock pc ON wt.punchID = pc.id "
-            "JOIN employee e ON pc.employeeID = e.id LEFT JOIN customer c ON wt.customerID = c.id "
-            "ORDER BY wt.id DESC LIMIT 300"
-        )
-        term = str(ctx.value or "").lower()
+        term = str(ctx.value or "").strip()
+        base = ("SELECT wt.id, e.name AS ename, wt.punchType, wt.timeSpent, c.name AS cname "
+                "FROM work_time wt JOIN punch_clock pc ON wt.punchID = pc.id "
+                "JOIN employee e ON pc.employeeID = e.id LEFT JOIN customer c ON wt.customerID = c.id ")
+        if term.isdigit():
+            rows = await self.db.fetchall(
+                base + "WHERE CAST(wt.id AS TEXT) LIKE ? ORDER BY wt.id DESC LIMIT 25", (term + "%",))
+        else:
+            rows = await self.db.fetchall(base + "ORDER BY wt.id DESC LIMIT 300")
+        tl = term.lower()
         out = []
         for r in rows:
             label = f"{r['ename']} · {r['punchType']} {r['timeSpent'] / 60:g}h" \
                     f"{(' ' + r['cname']) if r['cname'] else ''} (#{r['id']})"
-            if term in label.lower():
+            if term.isdigit() or tl in label.lower():
                 out.append(discord.OptionChoice(name=label[:100], value=str(r["id"])))
             if len(out) >= 25:
                 break
