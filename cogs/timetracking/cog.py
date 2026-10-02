@@ -1711,6 +1711,22 @@ class TimeTracking(commands.Cog):
             (dups if (eo, a["check_in"]) in owned_slots else orphans).append(entry)
         return dups, orphans
 
+    async def _drain_outbox(self, db, passes: int = 20):
+        """Drive the Odoo outbox to empty (or until a pass makes no progress — items
+        waiting on a dependency). Returns (pending, failed) counts afterward. Shared by
+        /resync and /abandonedworktime's push."""
+        for _ in range(passes):   # drain does 50/pass
+            before = (await db.fetchone("SELECT COUNT(*) c FROM odoo_outbox WHERE status = 'pending'"))["c"]
+            if before == 0:
+                break
+            await self.sync.drain()
+            after = (await db.fetchone("SELECT COUNT(*) c FROM odoo_outbox WHERE status = 'pending'"))["c"]
+            if after >= before:
+                break
+        pending = (await db.fetchone("SELECT COUNT(*) c FROM odoo_outbox WHERE status = 'pending'"))["c"]
+        failed = (await db.fetchone("SELECT COUNT(*) c FROM odoo_outbox WHERE status = 'failed'"))["c"]
+        return pending, failed
+
     async def _queue_unpushed(self, db, *, only_punch=None, only_worktime=None):
         """Queue local-only rows that were never sent to Odoo (no outbox row, no
         odooId). The `legacy` flag lives on the **punch**, so a worktime whose parent
@@ -1779,20 +1795,11 @@ class TimeTracking(commands.Cog):
         queued = qp + qw
         total_pending = (await db.fetchone("SELECT COUNT(*) c FROM odoo_outbox WHERE status = 'pending'"))["c"]
         try:
-            for _ in range(20):   # drain does 50/pass; loop until empty or no progress (retries waiting on deps)
-                before = (await db.fetchone("SELECT COUNT(*) c FROM odoo_outbox WHERE status = 'pending'"))["c"]
-                if before == 0:
-                    break
-                await self.sync.drain()
-                after = (await db.fetchone("SELECT COUNT(*) c FROM odoo_outbox WHERE status = 'pending'"))["c"]
-                if after >= before:
-                    break
+            still_pending, failed = await self._drain_outbox(db)
         except Exception as e:  # noqa: BLE001
             log.exception("[Resync] drain failed")
             await ctx.followup.send(f"Sync run hit an error: {e}", ephemeral=self._eph(ctx))
             return
-        still_pending = (await db.fetchone("SELECT COUNT(*) c FROM odoo_outbox WHERE status = 'pending'"))["c"]
-        failed = (await db.fetchone("SELECT COUNT(*) c FROM odoo_outbox WHERE status = 'failed'"))["c"]
         pushed = total_pending - still_pending
         timecard_log.info(f"[Resync] {ctx.author} forced a sync push: requeued {requeued} failed, "
                           f"queued {queued} unsent, pushed {pushed}; now {still_pending} pending, {failed} failed.")
@@ -2706,15 +2713,73 @@ class TimeTracking(commands.Cog):
             sql += " LIMIT ?"; params.append(limit)
         return await db.fetchall(sql, tuple(params))
 
-    @discord.slash_command(name="abandonedworktime", description="List worktimes stranded at 0h on a finished shift (never ended before clock-out).")
+    async def _push_abandoned_worktime(self, db, worktime_id: int):
+        """Enqueue ONE abandoned worktime (0h, finished non-legacy shift, with an Odoo
+        project, not yet synced) as a 0h Odoo placeholder (allow_zero). Ensures the parent
+        attendance is queued too. Returns a user-facing error string, or None on success."""
+        row = await db.fetchone(
+            "SELECT wt.id, wt.timeSpent, wt.odooId, wt.odooProjectId, wt.punchID, "
+            "pc.odooId AS p_odoo, pc.punchOutTime, pc.legacy "
+            "FROM work_time wt JOIN punch_clock pc ON wt.punchID = pc.id WHERE wt.id = ?",
+            (worktime_id,))
+        if row is None:
+            return f"Worktime #{worktime_id} doesn't exist."
+        if row["odooId"] is not None:
+            return f"Worktime #{worktime_id} is already in Odoo."
+        if row["legacy"]:
+            return f"Worktime #{worktime_id}'s shift is legacy — legacy work is never synced."
+        if not row["punchOutTime"]:
+            return f"Worktime #{worktime_id}'s shift is still open — it isn't abandoned."
+        if row["timeSpent"]:
+            return f"Worktime #{worktime_id} has hours — push it with /resync or /editworktime, not here."
+        if not row["odooProjectId"]:
+            return f"Worktime #{worktime_id} has no Odoo project — set one with `/editworktime project:` first."
+        # The timesheet line waits on the parent attendance; queue it if unsynced.
+        if row["p_odoo"] is None:
+            dup = await db.fetchone(
+                "SELECT 1 FROM odoo_outbox WHERE entity_type='punch' AND entity_id=? "
+                "AND status IN ('pending','failed') LIMIT 1", (row["punchID"],))
+            if dup is None:
+                await sync.enqueue(db, "punch", row["punchID"], "edit")
+        await sync.enqueue(db, "worktime", worktime_id, "create", {"allow_zero": True})
+        return None
+
+    @discord.slash_command(name="abandonedworktime", description="List worktimes stranded at 0h on a finished shift, or push one to Odoo as a 0h placeholder.")
     @is_timecard_admin()
     async def abandonedworktime(
         self, ctx: discord.ApplicationContext,
-        employee: discord.Option(str, default=None, description="Only this employee", autocomplete=employee_autocomplete),  # type: ignore
-        since: discord.Option(str, default=None, description="Only on/after this date [YYYY-MM-DD]"),  # type: ignore
+        employee: discord.Option(str, default=None, description="List: only this employee", autocomplete=employee_autocomplete),  # type: ignore
+        since: discord.Option(str, default=None, description="List: only on/after this date [YYYY-MM-DD]"),  # type: ignore
+        push: discord.Option(str, default=None, description="Push ONE abandoned worktime to Odoo by #id (0h placeholder + note)", autocomplete=worktime_autocomplete),  # type: ignore
     ):
         db = await self._ensure_db()
         await ctx.defer(ephemeral=self._eph(ctx))
+
+        # ---- push one by id (manual, deliberate; never a mass/auto sweep) ----
+        push_id = _opt_int(push)
+        if push_id is not None:
+            if not self.client.loaded:
+                await ctx.respond("Odoo isn't connected — can't push.", ephemeral=self._eph(ctx))
+                return
+            err = await self._push_abandoned_worktime(db, push_id)
+            if err:
+                await ctx.respond(err, ephemeral=self._eph(ctx))
+                return
+            try:
+                pending, failed = await self._drain_outbox(db)
+            except Exception as e:  # noqa: BLE001
+                log.exception("[Abandoned] push drain failed")
+                await ctx.respond(f"Queued #{push_id}, but the sync run errored: {e}", ephemeral=self._eph(ctx))
+                return
+            now = await db.fetchone("SELECT odooId FROM work_time WHERE id = ?", (push_id,))
+            if now and now["odooId"]:
+                timecard_log.info(f"[Abandoned] {ctx.author} pushed abandoned worktime #{push_id} to Odoo (0h placeholder).")
+                await ctx.respond(f"✅ Pushed abandoned worktime **#{push_id}** to Odoo as a **0h placeholder** (flagged as abandoned in the line description).", ephemeral=self._eph(ctx))
+            else:
+                await ctx.respond(f"Queued worktime **#{push_id}** but it hasn't posted yet (now {pending} pending, {failed} failed) — its attendance may still be syncing; check the log or try /resync.", ephemeral=self._eph(ctx))
+            return
+
+        # ---- list (view) ----
         emp_id = None
         if employee:
             try:
@@ -2740,7 +2805,9 @@ class TimeTracking(commands.Cog):
             synced = "synced" if r["odooId"] else "⚠️ not in Odoo"
             detached = " · detached" if r["detached"] else ""
             lines.append(f"`#{r['id']}` · {r['ename']} · {r['punchType']} · {day}{cust} · {synced}{detached}")
-        header = f"**{len(rows)} abandoned worktime(s)** (0h on a finished shift). Set hours with `/editworktime <id> hours:<n>` — that pushes/creates it in Odoo."
+        header = (f"**{len(rows)} abandoned worktime(s)** (0h on a finished shift). "
+                  f"Set real hours with `/editworktime <id> hours:<n>`, or push one as-is with "
+                  f"`/abandonedworktime push:<id>` (a 0h placeholder, flagged abandoned in Odoo).")
         more = f"\n…and **{len(rows) - SHOWN}** more — filter with `employee:`/`since:` to narrow." if len(rows) > SHOWN else ""
         await ctx.respond(header + "\n" + "\n".join(lines) + more, ephemeral=self._eph(ctx))
 

@@ -60,6 +60,16 @@ def quarter_hour_minutes(hours) -> int:
     return int(round((hours or 0) * 4) / 4 * 60)
 
 
+def worktime_description(punch_type, minutes) -> str:
+    """The timesheet-line description pushed to Odoo. A zero-duration line (an
+    'abandoned' worktime that was never ended before clock-out) keeps the normal
+    label but is flagged so it's visibly a placeholder in Odoo, not a real 0h log."""
+    base = f"{punch_type} work (Discord timecard)"
+    if not minutes:
+        return base + " — abandoned worktime (never ended before clock-out; 0h placeholder)"
+    return base
+
+
 async def enqueue(db: Database, entity_type: str, entity_id: int, op: str, payload: dict | None = None):
     """Add a change to the Odoo outbox (called right after a local commit)."""
     await db.execute(
@@ -140,7 +150,7 @@ class SyncWorker:
         if entity_type == "punch" and op == "edit":
             return await self._sync_punch_edit(entity_id)
         if entity_type == "worktime" and op == "create":
-            return await self._sync_worktime(entity_id)
+            return await self._sync_worktime(entity_id, allow_zero=bool(payload.get("allow_zero")))
         if entity_type == "worktime" and op == "edit":
             return await self._sync_worktime_edit(entity_id)
         if entity_type == "worktime" and op == "reassign":
@@ -326,21 +336,23 @@ class SyncWorker:
         if wt is None:
             return True
         if wt["odooId"] is None:
-            # Not synced yet -- create it if it now has a work item and hours.
+            # Not synced yet -- create it only once it has a work item AND hours. A 0h
+            # "abandoned" worktime is pushed only by the explicit manual action, never as
+            # a side effect of an unrelated edit.
             if wt["odooProjectId"] and wt["timeSpent"]:
                 return await self._sync_worktime(worktime_id)
-            return True  # local-only worktime; nothing in Odoo to edit
+            return True  # local-only / still 0h: nothing to push here
         await self.client.update_timesheet(
             wt["odooId"],
             hours=(wt["timeSpent"] or 0) / 60,
             project_id=wt["odooProjectId"] or None,
             task_id=wt["odooTaskId"],
-            description=f"{wt['punchType']} work (Discord timecard)",
+            description=worktime_description(wt["punchType"], wt["timeSpent"]),
         )
         log.info(f"[Outbox] Updated timesheet {wt['odooId']} (worktime {worktime_id}) in Odoo.")
         return True
 
-    async def _sync_worktime(self, worktime_id: int):
+    async def _sync_worktime(self, worktime_id: int, *, allow_zero: bool = False):
         wt = await self.db.fetchone(
             "SELECT punchID, punchType, timeSpent, timeStarted, odooId, odooTaskId, odooProjectId "
             "FROM work_time WHERE id = ?",
@@ -349,7 +361,7 @@ class SyncWorker:
         if wt is None or wt["odooId"] is not None:
             return True  # gone or already timesheeted
         punch = await self.db.fetchone(
-            "SELECT employeeID, odooId, legacy FROM punch_clock WHERE id = ?", (wt["punchID"],)
+            "SELECT employeeID, odooId, legacy, punchOutTime FROM punch_clock WHERE id = ?", (wt["punchID"],)
         )
         if punch is None or punch["legacy"]:
             return True  # legacy worktime (historical): never sync
@@ -358,7 +370,11 @@ class SyncWorker:
             # Local record stays authoritative; nothing to post.
             return False
         if not wt["timeSpent"]:
-            return True  # still open / zero hours -- nothing to post yet
+            # Normal paths never post a 0h line (open/in-progress, or an incidental
+            # reassign/restore). Only the explicit manual push (allow_zero) posts one,
+            # and only for a FINISHED shift -- a 0h "abandoned" placeholder.
+            if not (allow_zero and punch["punchOutTime"]):
+                return True
 
         emp_odoo = await self._employee_odoo_id(punch["employeeID"])
         if not emp_odoo:
@@ -367,9 +383,9 @@ class SyncWorker:
         if punch["odooId"] is None:
             return "retry"
 
-        hours = wt["timeSpent"] / 60
+        hours = (wt["timeSpent"] or 0) / 60
         work_date = str(wt["timeStarted"])[:10]
-        description = f"{wt['punchType']} work (Discord timecard)"
+        description = worktime_description(wt["punchType"], wt["timeSpent"])
         line_id = await self.client.add_timesheet(
             project_id=wt["odooProjectId"],
             date=work_date,
