@@ -49,7 +49,7 @@ TIMECARD_VIEW_TTL_HOURS = 24   # persistent /viewtimecard views lose their butto
 _MANAGEMENT_COMMANDS = {
     "addpunch", "editpunch", "deletepunch",
     "addworktime", "editworktime", "deleteworktime", "reassignworktime",
-    "viewtimecard",
+    "viewtimecard", "abandonedworktime",
     "synccustomers", "linkcustomer", "unlinkcustomer", "unlinkedcustomers",
     "addcustomer", "editcustomer", "mergecustomers", "archivecustomer", "unarchivecustomer",
     "deletecustomer", "purgeimportedcontacts", "reconcileattendance", "resync", "configureprojects", "configureroles", "configurecategories",
@@ -2683,6 +2683,66 @@ class TimeTracking(commands.Cog):
                 self._save_timecard_view(msg, emp_id, erow["name"], eow, ctx.user.id, token)
             except Exception as e:  # noqa: BLE001
                 log.warning(f"[Timecard] couldn't persist view: {e}")
+
+    async def _abandoned_worktimes(self, db, *, employee_id=None, since=None, limit=None):
+        """Worktimes stranded at 0h on a CLOSED, non-legacy shift — i.e. a jobsite
+        worktime that was never ended before the employee clocked out (the pre-fix
+        'abandoned' case). Open shifts are legitimate in-progress work and excluded.
+        Returns rows newest-first; `limit` caps the result."""
+        sql = (
+            "SELECT wt.id, e.name AS ename, wt.punchType, wt.timeStarted, wt.odooId, "
+            "wt.detached, c.name AS cname "
+            "FROM work_time wt JOIN punch_clock pc ON wt.punchID = pc.id "
+            "JOIN employee e ON pc.employeeID = e.id LEFT JOIN customer c ON wt.customerID = c.id "
+            "WHERE wt.timeSpent = 0 AND pc.punchOutTime IS NOT NULL AND pc.legacy = 0"
+        )
+        params = []
+        if employee_id is not None:
+            sql += " AND pc.employeeID = ?"; params.append(employee_id)
+        if since:
+            sql += " AND wt.timeStarted >= ?"; params.append(since)
+        sql += " ORDER BY wt.timeStarted DESC, wt.id DESC"
+        if limit:
+            sql += " LIMIT ?"; params.append(limit)
+        return await db.fetchall(sql, tuple(params))
+
+    @discord.slash_command(name="abandonedworktime", description="List worktimes stranded at 0h on a finished shift (never ended before clock-out).")
+    @is_timecard_admin()
+    async def abandonedworktime(
+        self, ctx: discord.ApplicationContext,
+        employee: discord.Option(str, default=None, description="Only this employee", autocomplete=employee_autocomplete),  # type: ignore
+        since: discord.Option(str, default=None, description="Only on/after this date [YYYY-MM-DD]"),  # type: ignore
+    ):
+        db = await self._ensure_db()
+        await ctx.defer(ephemeral=self._eph(ctx))
+        emp_id = None
+        if employee:
+            try:
+                emp_id = int(employee[2:-1])
+            except (ValueError, IndexError):
+                await ctx.respond(f"'{employee}' is not a valid user mention.", ephemeral=self._eph(ctx))
+                return
+        if since:
+            try:
+                since = datetime.strptime(since, "%Y-%m-%d").strftime("%Y-%m-%d")
+            except ValueError:
+                await ctx.respond("Invalid date — use YYYY-MM-DD.", ephemeral=self._eph(ctx))
+                return
+        rows = await self._abandoned_worktimes(db, employee_id=emp_id, since=since)
+        if not rows:
+            await ctx.respond("✅ No abandoned worktimes found (nothing stranded at 0h on a finished shift).", ephemeral=self._eph(ctx))
+            return
+        SHOWN = 25
+        lines = []
+        for r in rows[:SHOWN]:
+            day = str(r["timeStarted"] or "")[:10] or "?"
+            cust = f" · {r['cname']}" if r["cname"] else ""
+            synced = "synced" if r["odooId"] else "⚠️ not in Odoo"
+            detached = " · detached" if r["detached"] else ""
+            lines.append(f"`#{r['id']}` · {r['ename']} · {r['punchType']} · {day}{cust} · {synced}{detached}")
+        header = f"**{len(rows)} abandoned worktime(s)** (0h on a finished shift). Set hours with `/editworktime <id> hours:<n>` — that pushes/creates it in Odoo."
+        more = f"\n…and **{len(rows) - SHOWN}** more — filter with `employee:`/`since:` to narrow." if len(rows) > SHOWN else ""
+        await ctx.respond(header + "\n" + "\n".join(lines) + more, ephemeral=self._eph(ctx))
 
     # ---- employee groups (prerequisite for group-scoped reports) ----------
 
