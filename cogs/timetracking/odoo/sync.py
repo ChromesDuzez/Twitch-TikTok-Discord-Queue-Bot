@@ -105,6 +105,9 @@ class SyncWorker:
                     # it's added later); gates deletion support. ~every 10th pass.
                     if probe % 10 == 0:
                         await self.client.check_shift_field()
+                    # Detect the Odoo major version once (self-heals until it sticks).
+                    if self.client.odoo_version is None:
+                        await self.client.detect_version()
                     probe += 1
                     await self.drain()
             except asyncio.CancelledError:

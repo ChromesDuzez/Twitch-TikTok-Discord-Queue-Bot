@@ -20,6 +20,7 @@ from .db import Database, db_dir
 from .modals import Confirm, CustomerInputModal, CustomerSelectMenu, EditPunchTimeModal, GetTimeSpent
 from .perms import CLOCK_ROLES, has_perms
 from .odoo import sync
+from .costing import punch_span
 from .state import ClockState, _as_bool, load_state
 
 CLOCK_ICON = (
@@ -1026,22 +1027,34 @@ async def build_timecard_embed(cog, emp_id: int, ename: str, week_end_dt: dateti
     hours, customer, sync status). Surfaces the ids the edit commands key off of,
     and unlike the reports it *shows* detached worktime so it can be spotted."""
     db = cog.db
+    client = getattr(cog, "client", None)
+    linkable = bool(client and client.loaded)
     week_start = week_end_dt - timedelta(days=6)
     lo = week_start.strftime("%Y-%m-%d")
     hi = (week_end_dt + timedelta(days=1)).strftime("%Y-%m-%d")
     punches = await db.fetchall(
-        "SELECT id, punchInTime, punchOutTime, punchInApproval, punchOutApproval, odooId, legacy "
+        "SELECT id, punchInTime, punchOutTime, punchInApproval, punchOutApproval, odooId, legacy, "
+        "ignoreLunchBreak "
         "FROM punch_clock WHERE employeeID = ? AND punchInTime >= ? AND punchInTime < ? "
         "ORDER BY punchInTime",
         (emp_id, lo, hi),
     )
     lines, week_minutes = [], 0
+    week_gross = week_net = 0.0   # shift hours on the clock / after the lunch rule
     for p in punches:
         try:
             day = datetime.strptime(p["punchInTime"][:19], "%Y-%m-%d %H:%M:%S").strftime("%a %m-%d")
         except (ValueError, TypeError):
             day = (p["punchInTime"] or "?")[:10]
+        # Shift duration + net (lunch-adjusted), using the same costing primitive the reports use.
+        try:
+            gross, _lunch, net = punch_span(p["punchInTime"], p["punchOutTime"], p["ignoreLunchBreak"])
+        except (ValueError, TypeError):
+            gross = net = 0.0
+        week_gross += gross
+        week_net += net
         pout = _hm(p["punchOutTime"]) if p["punchOutTime"] else "open"
+        dur = f"  ({gross:g}h)" if p["punchOutTime"] else ""
         marks = []
         if not p["punchOutTime"]:
             marks.append("🟡")
@@ -1050,9 +1063,10 @@ async def build_timecard_embed(cog, emp_id: int, ename: str, week_end_dt: dateti
             marks.append("🗄️")
         elif p["odooId"]:
             marks.append("☁️")
-        lines.append(f"**▸ #{p['id']} · {day}  {_hm(p['punchInTime'])}→{pout}**  {' '.join(marks)}")
+        lines.append(f"**▸ #{p['id']} · {day}  {_hm(p['punchInTime'])}→{pout}{dur}**  {' '.join(marks)}")
         wts = await db.fetchall(
-            "SELECT wt.id, wt.punchType, wt.timeSpent, wt.odooId, wt.detached, c.name AS cname "
+            "SELECT wt.id, wt.punchType, wt.timeSpent, wt.odooId, wt.detached, wt.odooProjectId, "
+            "wt.odooTaskId, c.name AS cname, c.odooId AS codoo "
             "FROM work_time wt LEFT JOIN customer c ON wt.customerID = c.id "
             "WHERE wt.punchID = ? ORDER BY wt.timeStarted, wt.id",
             (p["id"],),
@@ -1061,7 +1075,6 @@ async def build_timecard_embed(cog, emp_id: int, ename: str, week_end_dt: dateti
             lines.append("　• _no worktime_")
         for w in wts:
             hrs = (w["timeSpent"] or 0) / 60
-            cust = f" · {w['cname']}" if w["cname"] else ""
             if w["detached"]:
                 tag = "⛔ detached"
             elif w["odooId"]:
@@ -1070,10 +1083,25 @@ async def build_timecard_embed(cog, emp_id: int, ename: str, week_end_dt: dateti
                 tag = "local"
             if not w["detached"]:
                 week_minutes += (w["timeSpent"] or 0)
-            lines.append(f"　• #{w['id']} {w['punchType']} {hrs:g}h{cust}  ({tag})")
+            # Link the "#id type Xh" span to the Odoo work item: a Service worktime's
+            # Field Service task, else its project's timesheets. Plain text when offline.
+            label = f"#{w['id']} {w['punchType']} {hrs:g}h"
+            wt_url = (client.fs_task_url(w["odooTaskId"]) if w["odooTaskId"]
+                      else client.project_url(w["odooProjectId"])) if linkable else None
+            if wt_url:
+                label = f"[{label}]({wt_url})"
+            # Customer name -> the Odoo contact (Office has no customer, so no link).
+            cust = ""
+            if w["cname"]:
+                cust_url = client.partner_url(w["codoo"]) if linkable else None
+                cname = f"[{w['cname']}]({cust_url})" if cust_url else w["cname"]
+                cust = f" · {cname}"
+            lines.append(f"　• {label}{cust}  ({tag})")
     if not punches:
         lines.append("_No punches this week._")
-    desc = "\n".join(lines)
+    body = "\n".join(lines)
+    desc = (f"**Σ {week_gross:g}h clocked · {week_net:g}h after lunch**\n{body}"
+            if punches else body)
     if len(desc) > 4000:
         desc = desc[:3980] + "\n… _(truncated — narrow the week)_"
     embed = discord.Embed(

@@ -67,6 +67,9 @@ class OdooClient:
         # Set by check_shift_field(): whether the Studio shift field exists.
         # Deletion support is gated on this (see services/webhook.py).
         self.shift_field_available = False
+        # Set by detect_version(): the connected Odoo major series (e.g. 19). Foundation
+        # for upcoming Odoo 19/20 support (Field Service moved into Planning in v20).
+        self.odoo_version: int | None = None
 
     # ---- core --------------------------------------------------------------
 
@@ -143,6 +146,62 @@ class OdooClient:
                         "enabled" if available else "DISABLED")
         self.shift_field_available = available
         return available
+
+    async def detect_version(self) -> int | None:
+        """Probe the connected Odoo's major series and cache it on ``odoo_version``.
+
+        Reads ``ir.module.module`` row name='base' -> ``latest_version`` (e.g.
+        "19.0.1.3") and keeps the leading integer. Best-effort: leaves the cached
+        value unchanged on any error. Foundation for Odoo 19/20 support."""
+        if not self.loaded:
+            return self.odoo_version
+        try:
+            rows = await self.call(
+                "/ir.module.module/search_read",
+                {"domain": [["name", "=", "base"]], "fields": ["latest_version"], "limit": 1},
+            )
+            raw = str((rows or [{}])[0].get("latest_version") or "")
+            major = raw.split(".", 1)[0]
+            if major.isdigit():
+                if self.odoo_version != int(major):
+                    log.info(f"[Odoo] Detected Odoo major version {major} (base {raw}).")
+                self.odoo_version = int(major)
+        except Exception as e:  # noqa: BLE001 - best-effort probe
+            log.warning(f"[Odoo] version detection failed: {e}")
+        return self.odoo_version
+
+    # ---- web deep-links (for /viewtimecard) -------------------------------
+    # These build human-facing Odoo web URLs, NOT API endpoints. ODOO_URL is the
+    # JSON-2 API base (".../json/2"); web_root strips that back to the host.
+
+    @property
+    def web_root(self) -> str | None:
+        """The Odoo host root for web links (scheme://host), derived from the API url."""
+        if not self.url:
+            return None
+        from urllib.parse import urlparse
+        p = urlparse(self.url)
+        return f"{p.scheme}://{p.netloc}" if p.scheme and p.netloc else None
+
+    def fs_task_url(self, task_id) -> str | None:
+        """Web link to a Field Service task (Service worktime)."""
+        root = self.web_root
+        return f"{root}/odoo/field-service/{task_id}" if root and task_id else None
+
+    def project_url(self, project_id) -> str | None:
+        """Web link to a project's timesheets (Construction/Office worktime).
+
+        NOTE: ``action-578`` may be specific to our Odoo database — it's the project
+        timesheets action id as it appears in our URLs. Possible future bug: if these
+        links 404 on another instance / Odoo 20, this action id likely needs correcting
+        (or replacing with a cleaner project path)."""
+        root = self.web_root
+        return f"{root}/odoo/action-578/{project_id}/project-timesheets" if root and project_id else None
+
+    def partner_url(self, partner_id) -> str | None:
+        """Web link to a customer's contact record."""
+        root = self.web_root
+        return f"{root}/odoo/contacts/{partner_id}" if root and partner_id else None
 
     async def unlink(self, model: str, odoo_id: int):
         """Delete a record in Odoo by id."""
