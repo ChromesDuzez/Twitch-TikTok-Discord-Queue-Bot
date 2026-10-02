@@ -2691,10 +2691,11 @@ class TimeTracking(commands.Cog):
             except Exception as e:  # noqa: BLE001
                 log.warning(f"[Timecard] couldn't persist view: {e}")
 
-    async def _abandoned_worktimes(self, db, *, employee_id=None, since=None, limit=None):
+    async def _abandoned_worktimes(self, db, *, employee_id=None, since=None, limit=None, synced=None):
         """Worktimes stranded at 0h on a CLOSED, non-legacy shift — i.e. a jobsite
         worktime that was never ended before the employee clocked out (the pre-fix
         'abandoned' case). Open shifts are legitimate in-progress work and excluded.
+        `synced`: None = all, False = only not-yet-in-Odoo, True = only pushed to Odoo.
         Returns rows newest-first; `limit` caps the result."""
         sql = (
             "SELECT wt.id, e.name AS ename, wt.punchType, wt.timeStarted, wt.odooId, "
@@ -2708,6 +2709,10 @@ class TimeTracking(commands.Cog):
             sql += " AND pc.employeeID = ?"; params.append(employee_id)
         if since:
             sql += " AND wt.timeStarted >= ?"; params.append(since)
+        if synced is True:
+            sql += " AND wt.odooId IS NOT NULL"
+        elif synced is False:
+            sql += " AND wt.odooId IS NULL"
         sql += " ORDER BY wt.timeStarted DESC, wt.id DESC"
         if limit:
             sql += " LIMIT ?"; params.append(limit)
@@ -2750,6 +2755,7 @@ class TimeTracking(commands.Cog):
         self, ctx: discord.ApplicationContext,
         employee: discord.Option(str, default=None, description="List: only this employee", autocomplete=employee_autocomplete),  # type: ignore
         since: discord.Option(str, default=None, description="List: only on/after this date [YYYY-MM-DD]"),  # type: ignore
+        show: discord.Option(str, default="unsynced", choices=["unsynced", "synced", "all"], description="List: unsynced (default), synced (already in Odoo), or all"),  # type: ignore
         push: discord.Option(str, default=None, description="Push ONE abandoned worktime to Odoo by #id (0h placeholder + note)", autocomplete=worktime_autocomplete),  # type: ignore
     ):
         db = await self._ensure_db()
@@ -2793,19 +2799,24 @@ class TimeTracking(commands.Cog):
             except ValueError:
                 await ctx.respond("Invalid date — use YYYY-MM-DD.", ephemeral=self._eph(ctx))
                 return
-        rows = await self._abandoned_worktimes(db, employee_id=emp_id, since=since)
+        # Default hides already-synced ones: once pushed, a 0h placeholder lives in Odoo
+        # and isn't really "abandoned" anymore. `show` opens that up.
+        synced_filter = {"unsynced": False, "synced": True, "all": None}.get(show, False)
+        rows = await self._abandoned_worktimes(db, employee_id=emp_id, since=since, synced=synced_filter)
+        scope = {"unsynced": "unsynced ", "synced": "synced ", "all": ""}.get(show, "")
         if not rows:
-            await ctx.respond("✅ No abandoned worktimes found (nothing stranded at 0h on a finished shift).", ephemeral=self._eph(ctx))
+            extra = " _(synced ones are hidden by default — use `show:synced` or `show:all`.)_" if show == "unsynced" else ""
+            await ctx.respond(f"✅ No {scope}abandoned worktimes found (nothing stranded at 0h on a finished shift).{extra}", ephemeral=self._eph(ctx))
             return
         SHOWN = 25
         lines = []
         for r in rows[:SHOWN]:
             day = str(r["timeStarted"] or "")[:10] or "?"
             cust = f" · {r['cname']}" if r["cname"] else ""
-            synced = "synced" if r["odooId"] else "⚠️ not in Odoo"
+            synced = "☁️ in Odoo" if r["odooId"] else "⚠️ not in Odoo"
             detached = " · detached" if r["detached"] else ""
             lines.append(f"`#{r['id']}` · {r['ename']} · {r['punchType']} · {day}{cust} · {synced}{detached}")
-        header = (f"**{len(rows)} abandoned worktime(s)** (0h on a finished shift). "
+        header = (f"**{len(rows)} {scope}abandoned worktime(s)** (0h on a finished shift). "
                   f"Set real hours with `/editworktime <id> hours:<n>`, or push one as-is with "
                   f"`/abandonedworktime push:<id>` (a 0h placeholder, flagged abandoned in Odoo).")
         more = f"\n…and **{len(rows) - SHOWN}** more — filter with `employee:`/`since:` to narrow." if len(rows) > SHOWN else ""
