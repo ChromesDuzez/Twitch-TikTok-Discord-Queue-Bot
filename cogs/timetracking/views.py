@@ -1222,11 +1222,12 @@ class TimecardWeekView(discord.ui.View):
         self.message: discord.Message | None = None   # set after send / on re-attach
         self.page = 0            # current page within the displayed week
         self.total_pages = 1     # set by render_embed()
-        # Row 0: week navigation + refresh/close. Row 1: in-week page navigation (a busy
-        # week overflows one embed, so its lines are split across pages).
+        # Row 0: week navigation + refresh/close (◀/▶ = prev/next week). Row 1: in-week
+        # page navigation (▲/▼) for a busy week whose lines overflow one embed — up/down
+        # so it reads distinctly from the left/right week arrows.
         specs = [("◀ Prev week", "prev", self._prev, 0), ("Next week ▶", "next", self._next, 0),
                  ("🔄 Refresh", "refresh", self._refresh, 0), ("✖ Close", "close", self._close, 0),
-                 ("◀ Page", "pageprev", self._page_prev, 1), ("Page ▶", "pagenext", self._page_next, 1)]
+                 ("▲ Page", "pageprev", self._page_prev, 1), ("▼ Page", "pagenext", self._page_next, 1)]
         self._page_btns: dict[str, discord.ui.Button] = {}
         for label, key, cb, row in specs:
             style = discord.ButtonStyle.danger if key == "close" else discord.ButtonStyle.secondary
