@@ -1022,29 +1022,63 @@ def _hm(ts) -> str:
 
 
 # Discord counts RAW characters (markdown + full URLs included), and an embed description
-# maxes at 4096. We paginate a week's lines well under that so a busy week (lots of
-# hyperlinked worktime) is fully viewable across pages instead of truncated mid-link.
+# maxes at 4096. We paginate well under that so a busy week (lots of hyperlinked worktime)
+# is fully viewable across pages instead of truncated mid-link.
 _PAGE_BUDGET = 3800
 
 
-def _paginate_lines(lines: list[str], header: str) -> list[str]:
-    """Pack whole lines into page bodies that (with the repeated `header`) stay under the
-    embed budget. Never splits a line, so a hyperlink is never cut in half. Returns at
-    least one page."""
-    head_len = len(header) + 1 if header else 0   # header + its newline, on every page
+def _paginate_blocks(blocks: list[list[str]], header: str) -> list[str]:
+    """Pack punch *blocks* (a punch header line followed by its worktime lines) into page
+    bodies that, with the repeated `header`, stay under the embed budget.
+
+    A whole block is kept **together** on one page; if it won't fit in the current page's
+    remaining room it moves to the next page. Only when a single punch has more worktime
+    than fits on an entire page is it split — and then each continuation page re-states the
+    punch header tagged ``(con't)`` so the entries are never orphaned. Never splits a line,
+    so a hyperlink is never cut. Returns at least one page."""
+    cap = _PAGE_BUDGET - (len(header) + 1 if header else 0)   # line room; header repeats
     pages: list[str] = []
     cur: list[str] = []
     cur_len = 0
-    for ln in lines:
-        add = len(ln) + (1 if cur else 0)   # + newline joining to the previous line
-        if cur and head_len + cur_len + add > _PAGE_BUDGET:
+
+    def _flush():
+        nonlocal cur, cur_len
+        if cur:
             pages.append("\n".join(cur))
-            cur, cur_len = [ln], len(ln)
-        else:
-            cur.append(ln)
-            cur_len += add
-    if cur:
-        pages.append("\n".join(cur))
+            cur, cur_len = [], 0
+
+    def _place(line):
+        nonlocal cur_len
+        cur_len += len(line) + (1 if cur else 0)   # + newline when joining to prior content
+        cur.append(line)
+
+    for block in blocks:
+        block_len = sum(len(l) for l in block) + max(0, len(block) - 1)
+        if cur and cur_len + block_len + 1 <= cap:
+            for l in block:               # fits in what's left of the current page
+                _place(l)
+            continue
+        if block_len <= cap:
+            _flush()                      # whole block moves to a fresh page
+            for l in block:
+                _place(l)
+            continue
+        # Oversized: one punch with more worktime than a page holds -> split with (con't),
+        # re-stating the header atop each continuation page.
+        _flush()
+        head, items, first = block[0], block[1:], True
+        i = 0
+        while i < len(items):
+            seg_head = head if first else head + " _(con't)_"
+            cur, cur_len = [seg_head], len(seg_head)
+            progressed = False
+            while i < len(items) and cur_len + len(items[i]) + 1 <= cap:
+                _place(items[i]); i += 1; progressed = True
+            if not progressed:            # one worktime line too big to ever fit — force it
+                _place(items[i]); i += 1  # (final 4096 guard truncates if truly pathological)
+            _flush()
+            first = False
+    _flush()   # emit the final (partial) page
     return pages or [""]
 
 
@@ -1067,8 +1101,8 @@ async def build_timecard_embed(cog, emp_id: int, ename: str, week_end_dt: dateti
         "ORDER BY punchInTime",
         (emp_id, lo, hi),
     )
-    lines, week_minutes = [], 0
-    week_gross = week_net = 0.0   # shift hours on the clock / after the lunch rule
+    blocks, week_minutes = [], 0   # each block = [punch header, *its worktime lines]
+    week_gross = week_net = 0.0    # shift hours on the clock / after the lunch rule
     for p in punches:
         try:
             day = datetime.strptime(p["punchInTime"][:19], "%Y-%m-%d %H:%M:%S").strftime("%a %m-%d")
@@ -1091,7 +1125,7 @@ async def build_timecard_embed(cog, emp_id: int, ename: str, week_end_dt: dateti
             marks.append("🗄️")
         elif p["odooId"]:
             marks.append("☁️")
-        lines.append(f"**▸ #{p['id']} · {day}  {_hm(p['punchInTime'])}→{pout}{dur}**  {' '.join(marks)}")
+        block = [f"**▸ #{p['id']} · {day}  {_hm(p['punchInTime'])}→{pout}{dur}**  {' '.join(marks)}"]
         wts = await db.fetchall(
             "SELECT wt.id, wt.punchType, wt.timeSpent, wt.odooId, wt.detached, wt.odooProjectId, "
             "wt.odooTaskId, c.name AS cname, c.odooId AS codoo "
@@ -1100,7 +1134,7 @@ async def build_timecard_embed(cog, emp_id: int, ename: str, week_end_dt: dateti
             (p["id"],),
         )
         if not wts:
-            lines.append("　• _no worktime_")
+            block.append("　• _no worktime_")
         for w in wts:
             hrs = (w["timeSpent"] or 0) / 60
             if w["detached"]:
@@ -1124,12 +1158,13 @@ async def build_timecard_embed(cog, emp_id: int, ename: str, week_end_dt: dateti
                 cust_url = client.partner_url(w["codoo"]) if linkable else None
                 cname = f"[{w['cname']}]({cust_url})" if cust_url else w["cname"]
                 cust = f" · {cname}"
-            lines.append(f"　• {label}{cust}  ({tag})")
+            block.append(f"　• {label}{cust}  ({tag})")
+        blocks.append(block)
     if not punches:
-        lines.append("_No punches this week._")
+        blocks = [["_No punches this week._"]]
     header = f"**Σ {week_gross:g}h clocked · {week_net:g}h after lunch**" if punches else ""
-    # Paginate on whole-line boundaries so a busy week is fully viewable (no mid-link cut).
-    pages = _paginate_lines(lines, header)
+    # Keep each punch + its worktime together on a page (split only an oversized punch).
+    pages = _paginate_blocks(blocks, header)
     total = len(pages)
     page = max(0, min(page, total - 1))
     desc = f"{header}\n{pages[page]}" if header else pages[page]
