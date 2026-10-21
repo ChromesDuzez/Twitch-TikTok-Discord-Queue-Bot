@@ -35,7 +35,7 @@ from .reports import (
 )
 from .views import (
     ApprovePunch, DeleteApproval, DeletePunchFlow, TimecardWeekView,
-    build_timecard_embed, delete_punch_cascade, delete_worktime_local,
+    delete_punch_cascade, delete_worktime_local,
     load_timecard_views, reassign_worktime, render_clock, save_timecard_views,
 )
 
@@ -302,7 +302,8 @@ class TimeTracking(commands.Cog):
                     v = TimecardWeekView(self, e["emp_id"], e["ename"], wk, e["author_id"],
                                          persistent=True, token=e["token"])
                     v.message = msg
-                    await msg.edit(view=v)
+                    embed = await v.render_embed()   # refresh page count + page-button states
+                    await msg.edit(embed=embed, view=v)
                 except Exception as ex:  # noqa: BLE001
                     log.warning(f"[Timecard] sweep: can't re-attach {mid}: {ex}")
         if changed:
@@ -2668,28 +2669,26 @@ class TimeTracking(commands.Cog):
         else:
             d = datetime.now()
         eow = d + timedelta(days=(5 - d.weekday()) % 7)  # snap to that week's ending Saturday
-        embed = await build_timecard_embed(self, emp_id, erow["name"], eow)
-        if self._eph(ctx):
+        eph = self._eph(ctx)
+        token = None
+        if eph:
             # Session-only: dies on restart, but its buttons are stripped on timeout/shutdown.
             view = TimecardWeekView(self, emp_id, erow["name"], eow, ctx.user.id)
-            await ctx.respond(embed=embed, view=view, ephemeral=True)
-            try:
-                view.message = await ctx.interaction.original_response()
-            except Exception:  # noqa: BLE001
-                view.message = None
-            self._ephemeral_timecard_views.add(view)
         else:
             # Persistent: JSON-backed so the buttons survive a restart (re-attached in on_ready).
             import uuid
             token = uuid.uuid4().hex[:12]
             view = TimecardWeekView(self, emp_id, erow["name"], eow, ctx.user.id, persistent=True, token=token)
-            await ctx.respond(embed=embed, view=view, ephemeral=False)
-            try:
-                msg = await ctx.interaction.original_response()
-                view.message = msg
-                self._save_timecard_view(msg, emp_id, erow["name"], eow, ctx.user.id, token)
-            except Exception as e:  # noqa: BLE001
-                log.warning(f"[Timecard] couldn't persist view: {e}")
+        embed = await view.render_embed()   # also sets the page count + page-button states
+        await ctx.respond(embed=embed, view=view, ephemeral=eph)
+        try:
+            view.message = await ctx.interaction.original_response()
+        except Exception:  # noqa: BLE001
+            view.message = None
+        if eph:
+            self._ephemeral_timecard_views.add(view)
+        elif view.message is not None:
+            self._save_timecard_view(view.message, emp_id, erow["name"], eow, ctx.user.id, token)
 
     async def _abandoned_worktimes(self, db, *, employee_id=None, since=None, limit=None, synced=None):
         """Worktimes stranded at 0h on a CLOSED, non-legacy shift — i.e. a jobsite

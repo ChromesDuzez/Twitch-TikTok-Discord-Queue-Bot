@@ -1021,7 +1021,35 @@ def _hm(ts) -> str:
     return (ts or "")[11:16] or "??:??"
 
 
-async def build_timecard_embed(cog, emp_id: int, ename: str, week_end_dt: datetime) -> discord.Embed:
+# Discord counts RAW characters (markdown + full URLs included), and an embed description
+# maxes at 4096. We paginate a week's lines well under that so a busy week (lots of
+# hyperlinked worktime) is fully viewable across pages instead of truncated mid-link.
+_PAGE_BUDGET = 3800
+
+
+def _paginate_lines(lines: list[str], header: str) -> list[str]:
+    """Pack whole lines into page bodies that (with the repeated `header`) stay under the
+    embed budget. Never splits a line, so a hyperlink is never cut in half. Returns at
+    least one page."""
+    head_len = len(header) + 1 if header else 0   # header + its newline, on every page
+    pages: list[str] = []
+    cur: list[str] = []
+    cur_len = 0
+    for ln in lines:
+        add = len(ln) + (1 if cur else 0)   # + newline joining to the previous line
+        if cur and head_len + cur_len + add > _PAGE_BUDGET:
+            pages.append("\n".join(cur))
+            cur, cur_len = [ln], len(ln)
+        else:
+            cur.append(ln)
+            cur_len += add
+    if cur:
+        pages.append("\n".join(cur))
+    return pages or [""]
+
+
+async def build_timecard_embed(cog, emp_id: int, ename: str, week_end_dt: datetime,
+                               *, page: int = 0) -> tuple[discord.Embed, int]:
     """A read-only embed of one employee's week: each punch (with its id, times,
     approval + Odoo status) and its worktime entries nested beneath (id, type,
     hours, customer, sync status). Surfaces the ids the edit commands key off of,
@@ -1099,21 +1127,24 @@ async def build_timecard_embed(cog, emp_id: int, ename: str, week_end_dt: dateti
             lines.append(f"　• {label}{cust}  ({tag})")
     if not punches:
         lines.append("_No punches this week._")
-    body = "\n".join(lines)
-    desc = (f"**Σ {week_gross:g}h clocked · {week_net:g}h after lunch**\n{body}"
-            if punches else body)
-    if len(desc) > 4000:
-        desc = desc[:3980] + "\n… _(truncated — narrow the week)_"
-    embed = discord.Embed(
-        title=f"{ename} — week ending {week_end_dt.strftime('%Y-%m-%d')}",
-        description=desc,
-        color=0x5865F2,
-    )
+    header = f"**Σ {week_gross:g}h clocked · {week_net:g}h after lunch**" if punches else ""
+    # Paginate on whole-line boundaries so a busy week is fully viewable (no mid-link cut).
+    pages = _paginate_lines(lines, header)
+    total = len(pages)
+    page = max(0, min(page, total - 1))
+    desc = f"{header}\n{pages[page]}" if header else pages[page]
+    if len(desc) > 4096:   # last-ditch guard (a single pathologically long line)
+        desc = desc[:4080] + "\n… _(truncated)_"
+    title = f"{ename} — week ending {week_end_dt.strftime('%Y-%m-%d')}"
+    if total > 1:
+        title += f"  ·  page {page + 1}/{total}"
+    embed = discord.Embed(title=title, description=desc, color=0x5865F2)
+    page_note = f" · page {page + 1}/{total}" if total > 1 else ""
     embed.set_footer(
-        text=f"{len(punches)} punch(es) · {week_minutes / 60:g}h worktime   |   "
+        text=f"{len(punches)} punch(es) · {week_minutes / 60:g}h worktime{page_note}   |   "
              "✅approved 🕓pending 🟡open ☁️synced ⛔detached 🗄️legacy   |   edit by the #ids"
     )
-    return embed
+    return embed, total
 
 
 # ---- /viewtimecard persistent-view store (JSON) ----------------------------
@@ -1189,16 +1220,41 @@ class TimecardWeekView(discord.ui.View):
         self.persistent = persistent
         self.token = token
         self.message: discord.Message | None = None   # set after send / on re-attach
-        specs = [("◀ Prev week", "prev", self._prev), ("Next week ▶", "next", self._next),
-                 ("🔄 Refresh", "refresh", self._refresh), ("✖ Close", "close", self._close)]
-        for label, key, cb in specs:
+        self.page = 0            # current page within the displayed week
+        self.total_pages = 1     # set by render_embed()
+        # Row 0: week navigation + refresh/close. Row 1: in-week page navigation (a busy
+        # week overflows one embed, so its lines are split across pages).
+        specs = [("◀ Prev week", "prev", self._prev, 0), ("Next week ▶", "next", self._next, 0),
+                 ("🔄 Refresh", "refresh", self._refresh, 0), ("✖ Close", "close", self._close, 0),
+                 ("◀ Page", "pageprev", self._page_prev, 1), ("Page ▶", "pagenext", self._page_next, 1)]
+        self._page_btns: dict[str, discord.ui.Button] = {}
+        for label, key, cb, row in specs:
             style = discord.ButtonStyle.danger if key == "close" else discord.ButtonStyle.secondary
             # Persistent views require a stable custom_id on every item; session views
             # let py-cord auto-generate them.
-            btn = discord.ui.Button(label=label, style=style,
+            btn = discord.ui.Button(label=label, style=style, row=row,
                                     custom_id=(f"tcv:{token}:{key}" if persistent else None))
             btn.callback = cb
             self.add_item(btn)
+            if key in ("pageprev", "pagenext"):
+                self._page_btns[key] = btn
+
+    def _sync_page_buttons(self):
+        """Enable the page buttons only when the week spans more than one page, and grey
+        out the end you're already at."""
+        multi = self.total_pages > 1
+        self._page_btns["pageprev"].disabled = (not multi) or self.page <= 0
+        self._page_btns["pagenext"].disabled = (not multi) or self.page >= self.total_pages - 1
+
+    async def render_embed(self) -> discord.Embed:
+        """Build the embed for the current week+page, caching the page count and syncing
+        the page buttons. The single place the view turns state into an embed."""
+        embed, total = await build_timecard_embed(
+            self.cog, self.emp_id, self.ename, self.week_end_dt, page=self.page)
+        self.total_pages = max(1, total)
+        self.page = max(0, min(self.page, self.total_pages - 1))
+        self._sync_page_buttons()
+        return embed
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.author_id:
@@ -1212,7 +1268,7 @@ class TimecardWeekView(discord.ui.View):
 
     async def _rerender(self, interaction: discord.Interaction):
         try:
-            embed = await build_timecard_embed(self.cog, self.emp_id, self.ename, self.week_end_dt)
+            embed = await self.render_embed()
             await interaction.response.edit_message(embed=embed, view=self)
         except discord.NotFound:
             pass  # message/interaction expired — nothing to update
@@ -1221,15 +1277,27 @@ class TimecardWeekView(discord.ui.View):
 
     async def _prev(self, interaction: discord.Interaction):
         self.week_end_dt -= timedelta(days=7)
+        self.page = 0   # new week starts at its first page
         self._persist_week()
         await self._rerender(interaction)
 
     async def _next(self, interaction: discord.Interaction):
         self.week_end_dt += timedelta(days=7)
+        self.page = 0
         self._persist_week()
         await self._rerender(interaction)
 
     async def _refresh(self, interaction: discord.Interaction):
+        await self._rerender(interaction)
+
+    async def _page_prev(self, interaction: discord.Interaction):
+        if self.page > 0:
+            self.page -= 1
+        await self._rerender(interaction)
+
+    async def _page_next(self, interaction: discord.Interaction):
+        if self.page < self.total_pages - 1:
+            self.page += 1
         await self._rerender(interaction)
 
     async def _close(self, interaction: discord.Interaction):

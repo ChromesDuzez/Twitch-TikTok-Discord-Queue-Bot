@@ -27,7 +27,7 @@ async def _seed(db):
 async def test_durations_header_and_links():
     async with db_ctx() as db:
         await _seed(db)
-        embed = await build_timecard_embed(_cog(db), 1, "Tester", WEEK_END)
+        embed, _ = await build_timecard_embed(_cog(db), 1, "Tester", WEEK_END)
         d = embed.description
         assert "(8.5h)" in d, d                                  # per-punch shift duration
         assert "Σ 8.5h clocked · 8h after lunch" in d, d         # weekly totals header
@@ -40,7 +40,7 @@ async def test_durations_header_and_links():
 async def test_plain_text_when_odoo_offline():
     async with db_ctx() as db:
         await _seed(db)
-        embed = await build_timecard_embed(_cog(db, loaded=False), 1, "Tester", WEEK_END)
+        embed, _ = await build_timecard_embed(_cog(db, loaded=False), 1, "Tester", WEEK_END)
         d = embed.description
         assert "(8.5h)" in d                 # durations still render (no Odoo needed)
         assert "Σ 8.5h clocked" in d         # header still renders
@@ -53,7 +53,7 @@ async def test_office_worktime_has_no_customer_link():
         await add_punch(db, 100, odoo=5000, pin=IN, pout=OUT)
         # Office: no customer (customerID 0) -> project link but no contact link
         await add_worktime(db, 200, 100, odoo=7003, mins=120, ptype="Office", project=3, task=None, customer=0)
-        embed = await build_timecard_embed(_cog(db), 1, "Tester", WEEK_END)
+        embed, _ = await build_timecard_embed(_cog(db), 1, "Tester", WEEK_END)
         d = embed.description
         assert "/odoo/action-578/3/project-timesheets" in d
         assert "/odoo/contacts/" not in d    # Office has no customer, so no contact link
