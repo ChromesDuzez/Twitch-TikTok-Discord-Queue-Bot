@@ -484,6 +484,37 @@ async def finalize_worktime(db: Database, worktime_id: int, hours: float) -> int
     return minutes
 
 
+async def close_open_worktimes(db: Database, punch_id: int, end_local_str: str) -> list[tuple]:
+    """End every open jobsite worktime on a punch at a given wall-clock time, exactly as
+    "End Work Now" would — duration = timeStarted -> end (quarter-hour, floored at 0.25h).
+    Used by the Odoo-check-out reconcile and the auto-clock-out so an open worktime is
+    never stranded at 0h. Returns [(worktime_id, punchType, minutes), ...] for the caller
+    to log; skips rows with an unparseable start time."""
+    rows = await db.fetchall(
+        "SELECT id, punchType, timeStarted FROM work_time "
+        "WHERE punchID = ? AND timeSpent = 0 AND detached = 0",
+        (punch_id,),
+    )
+    if not rows:
+        return []
+    try:
+        end_dt = datetime.strptime(str(end_local_str)[:19], "%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError):
+        log.warning(f"[Worktime] Can't parse end time {end_local_str!r}; not closing worktimes on punch {punch_id}.")
+        return []
+    closed = []
+    for wt in rows:
+        try:
+            started = datetime.strptime(str(wt["timeStarted"])[:19], "%Y-%m-%d %H:%M:%S")
+        except (TypeError, ValueError):
+            log.warning(f"[Worktime] worktime {wt['id']} has an unparseable start time; skipping auto-close.")
+            continue
+        span = (end_dt - started).total_seconds() / 3600
+        minutes = await finalize_worktime(db, wt["id"], round_quarter_hours(span))
+        closed.append((wt["id"], wt["punchType"], minutes))
+    return closed
+
+
 class EndWorkButton(discord.ui.Button):
     def __init__(self, punch_type: str, custom: bool):
         self.punch_type = punch_type

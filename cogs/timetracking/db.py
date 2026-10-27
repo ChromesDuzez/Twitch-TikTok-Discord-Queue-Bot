@@ -28,7 +28,7 @@ RELEASE_VERSION = "2.0"
 # version 1, the refactored schema is version 2. Drives upgrades and stamps the
 # live db filename (timetracker.v{N}.db). Bump (both here and ENV in config.py)
 # on a future schema change.
-TARGET_VERSION = 4
+TARGET_VERSION = 5
 
 # Canonical worktime categories the employee can start. NOTE: "Shop" is NOT one
 # of these -- shop time is a calculated remainder in reports, never a punch.
@@ -129,6 +129,7 @@ class Database:
                 clockMessageId UNSIGNED BIG INT   NULL DEFAULT NULL,
                 odooId         UNSIGNED BIG INT   NULL DEFAULT NULL,
                 archived       BOOLEAN            NOT NULL DEFAULT 0,
+                autoClockOutMinutes INTEGER        NULL DEFAULT NULL,
                 FOREIGN KEY (employeeTypeID) REFERENCES employee_type(id)
             );
             CREATE TABLE punch_clock (
@@ -297,6 +298,8 @@ class Database:
             await self._migrate_to_v3()
         if current < 4:
             await self._migrate_to_v4()
+        if current < 5:
+            await self._migrate_to_v5()
 
         await c.execute("UPDATE schema_version SET version = ?", (TARGET_VERSION,))
         await c.commit()
@@ -318,6 +321,8 @@ class Database:
         ("employee", "ot_rate_round", "BOOLEAN NOT NULL DEFAULT 0"),
         # Per-employee canonical category that absorbs the distribution remainder.
         ("employee", "catchall_category", "TEXT NOT NULL DEFAULT 'Shop'"),
+        # Per-employee auto-clock-out time, minutes since midnight (NULL = off).
+        ("employee", "autoClockOutMinutes", "INTEGER NULL DEFAULT NULL"),
         # Pay-run kind: 'Regular' payroll or a 'Bonus' check-run.
         ("pay_period", "kind", "TEXT NOT NULL DEFAULT 'Regular'"),
         ("punch_clock", "odooId", "UNSIGNED BIG INT NULL DEFAULT NULL"),
@@ -568,6 +573,16 @@ class Database:
         )
         await c.commit()
         log.info("[DB] Upgrade to v4 complete.")
+
+    async def _migrate_to_v5(self):
+        """v4 -> v5: per-employee auto-clock-out time (minutes since midnight,
+        quarter-hour granularity enforced in app code; NULL = disabled). Idempotent."""
+        log.info("[DB] Upgrading database to v5 (per-employee auto-clock-out)...")
+        c = self._conn
+        if not await self._column_exists("employee", "autoClockOutMinutes"):
+            await c.execute("ALTER TABLE employee ADD COLUMN autoClockOutMinutes INTEGER NULL DEFAULT NULL")
+        await c.commit()
+        log.info("[DB] Upgrade to v5 complete.")
 
     async def _rebuild_id_as_rowid(self, table: str, create_new_sql: str, columns: str):
         """Rebuild `table` from a `<table>_new` definition, copying all columns.

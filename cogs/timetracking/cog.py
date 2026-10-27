@@ -7,7 +7,7 @@ sync jobs after local commits.
 
 import asyncio
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import discord
 from discord.ext import commands
@@ -35,7 +35,7 @@ from .reports import (
 )
 from .views import (
     ApprovePunch, DeleteApproval, DeletePunchFlow, TimecardWeekView,
-    delete_punch_cascade, delete_worktime_local,
+    close_open_worktimes, delete_punch_cascade, delete_worktime_local,
     load_timecard_views, reassign_worktime, render_clock, save_timecard_views,
 )
 
@@ -60,6 +60,7 @@ _MANAGEMENT_COMMANDS = {
     "genpaycalendar", "addpayperiod", "paycalendar",
     "addleave", "addbonus", "leavehistory", "setcatchall",
     "payrollweekly", "payrollmonthly",
+    "setautoclockout", "autoclockouts",
     "createclock", "deleteclock",
 }
 
@@ -101,6 +102,52 @@ def _parse_punch_time(raw: str) -> str:
         except ValueError:
             continue
     raise ValueError(f"'{raw}' isn't a valid date/time — use `YYYY-MM-DD HH:MM` (e.g. 2026-08-19 08:00).")
+
+
+# Words that disable an auto-clock-out time.
+_AUTO_CLOCKOUT_OFF = {"", "off", "none", "disable", "disabled", "never", "no"}
+
+
+def _parse_time_of_day(raw: str | None) -> int | None:
+    """Parse a quarter-hour time-of-day 'HH:MM' -> minutes since midnight (0..1425).
+    Returns None for the 'off' words. Raises ValueError on a bad time / non-quarter-hour."""
+    s = (raw or "").strip().lower()
+    if s in _AUTO_CLOCKOUT_OFF:
+        return None
+    try:
+        t = datetime.strptime(s, "%H:%M")
+    except ValueError:
+        raise ValueError(f"'{raw}' isn't a valid time — use 24-hour `HH:MM` (e.g. `00:00` for midnight, `17:30`), or `off`.")
+    minutes = t.hour * 60 + t.minute
+    if minutes % 15 != 0:
+        raise ValueError(f"`{s}` must be on a quarter hour (:00, :15, :30, :45).")
+    return minutes
+
+
+def _fmt_minutes(minutes: int | None) -> str:
+    """Minutes-since-midnight -> 'HH:MM', or 'off' for None."""
+    if minutes is None:
+        return "off"
+    return f"{minutes // 60:02d}:{minutes % 60:02d}"
+
+
+def _auto_clockout_trigger(punch_in: datetime, minutes_of_day: int) -> datetime:
+    """The first occurrence of the configured time-of-day STRICTLY AFTER punch-in.
+    A day shift with a midnight (00:00) setting -> the following midnight; a 17:00
+    setting -> that same evening. Used to cap a forgotten open punch."""
+    base = punch_in.replace(hour=minutes_of_day // 60, minute=minutes_of_day % 60,
+                            second=0, microsecond=0)
+    if base <= punch_in:
+        base += timedelta(days=1)
+    return base
+
+
+def _default_auto_clockout_minutes() -> int | None:
+    """New-hire default, from TIMECARD_DEFAULT_AUTO_CLOCKOUT (blank/invalid = off)."""
+    try:
+        return _parse_time_of_day(os.getenv("TIMECARD_DEFAULT_AUTO_CLOCKOUT"))
+    except ValueError:
+        return None
 
 
 def _hours_to_minutes(hours: float) -> int:
@@ -152,6 +199,7 @@ class TimeTracking(commands.Cog):
         self.sync: sync.SyncWorker | None = None
         self.inbox: inbox.InboxWorker | None = None
         self._view_sweep_task: asyncio.Task | None = None
+        self._auto_clockout_task: asyncio.Task | None = None
         self._ephemeral_timecard_views: set = set()   # live session-only /viewtimecard views
         self._lock = asyncio.Lock()
         self._odoo_employees: list | None = None  # cached hr.employee list for autocomplete
@@ -207,6 +255,8 @@ class TimeTracking(commands.Cog):
                 self.inbox.start()
                 if self._view_sweep_task is None:
                     self._view_sweep_task = asyncio.create_task(self._view_sweep_loop())
+                if self._auto_clockout_task is None:
+                    self._auto_clockout_task = asyncio.create_task(self._auto_clockout_loop())
         return self.db
 
     async def enqueue_inbound(self, model: str, odoo_id: int, action=None, write_uid=None):
@@ -319,6 +369,106 @@ class TimeTracking(commands.Cog):
             except Exception as e:  # noqa: BLE001
                 log.warning(f"[Timecard] view sweep loop error: {e}")
 
+    # ---- auto-clock-out: cap forgotten open punches ------------------------
+
+    async def _auto_clockout_loop(self):
+        while True:
+            try:
+                await asyncio.sleep(60)
+                await self._run_auto_clockouts()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001 - one bad pass never kills the loop
+                log.warning(f"[AutoClockout] loop error: {e}")
+
+    async def _run_auto_clockouts(self):
+        """Clock out any still-open employee whose configured auto-clock-out time has
+        passed (the first occurrence of that time after their clock-in)."""
+        if self.db is None:
+            return
+        rows = await self.db.fetchall(
+            "SELECT pc.id, pc.employeeID, pc.punchInTime, e.autoClockOutMinutes "
+            "FROM punch_clock pc JOIN employee e ON pc.employeeID = e.id "
+            "WHERE pc.punchOutTime IS NULL AND pc.legacy = 0 AND e.autoClockOutMinutes IS NOT NULL"
+        )
+        now = datetime.strptime(sync.now_local_str(), "%Y-%m-%d %H:%M:%S")
+        for r in rows:
+            try:
+                punch_in = datetime.strptime(str(r["punchInTime"])[:19], "%Y-%m-%d %H:%M:%S")
+            except (TypeError, ValueError):
+                continue
+            trigger = _auto_clockout_trigger(punch_in, int(r["autoClockOutMinutes"]))
+            if now >= trigger:
+                await self._perform_auto_clockout(
+                    r["id"], r["employeeID"], trigger.strftime("%Y-%m-%d %H:%M:%S"))
+
+    async def _perform_auto_clockout(self, punch_id: int, employee_id: int, end_str: str):
+        """Clock a forgotten-open punch out at `end_str`. Mirrors a non-standard manual
+        clock-out: ends any open worktime, marks the punch out but PENDING approval (the
+        time is a guess), posts the Approve/Edit message, pushes to Odoo, refreshes the
+        clock, and DMs the employee. Every Discord step is best-effort."""
+        db = self.db
+        # 1. End any open jobsite worktime at the trigger time (shared helper).
+        try:
+            for wt_id, ptype, minutes in await close_open_worktimes(db, punch_id, end_str):
+                timecard_log.info(f"[AutoClockout] ended open {ptype} worktime {wt_id} ({minutes / 60:g}h) on punch {punch_id}.")
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"[AutoClockout] worktime close failed on punch {punch_id}: {e}")
+
+        # 2 + 3. Approval message (reuse an existing one from an unapproved clock-in).
+        hhmm = end_str[11:16]
+        existing = await db.fetchone(
+            "SELECT checkChannelId, checkMessageId FROM punch_clock WHERE id = ?", (punch_id,))
+        approval_message = None
+        try:
+            if existing and existing["checkChannelId"] and existing["checkMessageId"]:
+                approval_message = await self.obtain_message(
+                    int(existing["checkChannelId"]), int(existing["checkMessageId"]))
+                await approval_message.edit(
+                    content=approval_message.content
+                    + f"\n🕛 System auto-clocked <@{employee_id}> out at {hhmm} (forgot to clock out).")
+            else:
+                admin_ch = self.bot.get_channel(int(os.getenv("TIMECARD_ADMIN_CHANNEL_ID")))
+                approval_message = await admin_ch.send(
+                    f"🕛 <@{employee_id}> forgot to clock out — the system auto-clocked them out at "
+                    f"**{hhmm}**.\nApprove, or **Edit** the clock-out to the correct time.")
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"[AutoClockout] could not post approval for punch {punch_id}: {e}")
+
+        # 4. Mark the punch out, PENDING approval (the trigger time is a guess).
+        if approval_message is not None:
+            await db.execute(
+                "UPDATE punch_clock SET punchOutTime = ?, punchOutApproval = 0, "
+                "checkChannelId = ?, checkMessageId = ? WHERE id = ?",
+                (end_str, approval_message.channel.id, approval_message.id, punch_id))
+            try:
+                await approval_message.edit(view=await ApprovePunch.create(self, punch_id, approval_message))
+            except Exception as e:  # noqa: BLE001
+                log.warning(f"[AutoClockout] could not attach approval buttons for punch {punch_id}: {e}")
+        else:
+            # No admin channel reachable — still clock them out (pending) so the day is capped.
+            await db.execute(
+                "UPDATE punch_clock SET punchOutTime = ?, punchOutApproval = 0 WHERE id = ?",
+                (end_str, punch_id))
+
+        # 5. Push the clock-out to Odoo (offline -> stays pending in the outbox).
+        await sync.enqueue(db, "punch", punch_id, "out")
+
+        # 6. Re-render their clock, and DM the employee (best-effort).
+        await self._refresh_clock(employee_id)
+        try:
+            user = self.bot.get_user(employee_id) or await self.bot.fetch_user(employee_id)
+            await user.send(
+                f"You forgot to clock out, so I automatically clocked you out at **{hhmm}**. "
+                "If that's not right, let a manager know — your clock-out is pending their approval.")
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"[AutoClockout] could not DM employee {employee_id}: {e}")
+
+        erow = await db.fetchone("SELECT name FROM employee WHERE id = ?", (employee_id,))
+        timecard_log.info(
+            f"[AutoClockout] Auto-clocked out {erow['name'] if erow else employee_id} "
+            f"(employee {employee_id}) at {end_str} — punch {punch_id}, pending approval.")
+
     async def close_db(self):
         """Stop the workers and close the db connection (leaves the file)."""
         # Strip buttons off any live ephemeral /viewtimecard views so a post-shutdown
@@ -331,6 +481,9 @@ class TimeTracking(commands.Cog):
                 pass
         self._ephemeral_timecard_views.clear()
         async with self._lock:
+            if self._auto_clockout_task is not None:
+                self._auto_clockout_task.cancel()
+                self._auto_clockout_task = None
             if self._view_sweep_task is not None:
                 self._view_sweep_task.cancel()
                 self._view_sweep_task = None
@@ -982,10 +1135,11 @@ class TimeTracking(commands.Cog):
         try:
             await db.execute(
                 "INSERT INTO employee (id, name, phoneNumber, addressLine1, addressLine2, "
-                "addressCity, addressState, addressZip, payrate, pay_type, employeeTypeID, odooId) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "addressCity, addressState, addressZip, payrate, pay_type, employeeTypeID, odooId, "
+                "autoClockOutMinutes) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (emp_id, name, phonenumber, addressline1, addressline2, city, state, zip,
-                 payrate, pay_type, employeetype, odoo_employee),
+                 payrate, pay_type, employeetype, odoo_employee, _default_auto_clockout_minutes()),
             )
             # Seed the initial effective-dated pay record (effective today) so the
             # employee is costable from day one and shows in /payhistory.
@@ -2466,6 +2620,62 @@ class TimeTracking(commands.Cog):
         await ctx.respond(f"Deleted worktime #{worktime}.", ephemeral=self._eph(ctx))
 
     # ---- clock commands ----------------------------------------------------
+
+    @discord.slash_command(name="setautoclockout", description="Set an employee's auto-clock-out time (quarter-hour), or 'off' to disable.")
+    @is_timecard_admin()
+    async def setautoclockout(
+        self, ctx: discord.ApplicationContext,
+        employee: discord.Option(str, description="The employee", autocomplete=employee_autocomplete),  # type: ignore
+        time: discord.Option(str, default=None, description="24-hour HH:MM (quarter-hour), or 'off'. Leave blank to view the current setting."),  # type: ignore
+    ):
+        db = await self._ensure_db()
+        emp_id = self._emp_from_mention(employee)
+        if emp_id is None:
+            await ctx.respond(f"'{employee}' is not a valid user mention.", ephemeral=self._eph(ctx))
+            return
+        row = await db.fetchone("SELECT name, autoClockOutMinutes FROM employee WHERE id = ?", (emp_id,))
+        if row is None:
+            await ctx.respond(f"{employee} isn't in the employee system.", ephemeral=self._eph(ctx))
+            return
+        if time is None:   # view-only
+            await ctx.respond(
+                f"**{row['name']}**'s auto-clock-out is **{_fmt_minutes(row['autoClockOutMinutes'])}**.",
+                ephemeral=self._eph(ctx))
+            return
+        try:
+            minutes = _parse_time_of_day(time)
+        except ValueError as e:
+            await ctx.respond(str(e), ephemeral=self._eph(ctx))
+            return
+        await db.execute("UPDATE employee SET autoClockOutMinutes = ? WHERE id = ?", (minutes, emp_id))
+        label = _fmt_minutes(minutes)
+        timecard_log.info(f"[AutoClockout] {ctx.author} set {row['name']} ({emp_id}) auto-clock-out to {label}.")
+        if minutes is None:
+            msg = f"Auto-clock-out **disabled** for **{row['name']}** — they'll never be auto-clocked-out."
+        else:
+            msg = (f"**{row['name']}** will be auto-clocked-out at **{label}** if still clocked in "
+                   "(it posts an Approve/Edit prompt so the time can be corrected).")
+        await ctx.respond(msg, ephemeral=self._eph(ctx))
+
+    @discord.slash_command(name="autoclockouts", description="List every employee's auto-clock-out time.")
+    @is_timecard_admin()
+    async def autoclockouts(self, ctx: discord.ApplicationContext):
+        db = await self._ensure_db()
+        await ctx.defer(ephemeral=self._eph(ctx))
+        rows = await db.fetchall(
+            "SELECT name, autoClockOutMinutes FROM employee WHERE archived = 0 OR archived IS NULL "
+            "ORDER BY name")
+        if not rows:
+            await ctx.respond("No employees.", ephemeral=self._eph(ctx))
+            return
+        on = [r for r in rows if r["autoClockOutMinutes"] is not None]
+        off = [r for r in rows if r["autoClockOutMinutes"] is None]
+        lines = [f"**Auto-clock-out** ({len(on)} on · {len(off)} off)"]
+        for r in sorted(on, key=lambda r: r["autoClockOutMinutes"]):
+            lines.append(f"`{_fmt_minutes(r['autoClockOutMinutes'])}` · {r['name']}")
+        if off:
+            lines.append(f"\n**off:** {', '.join(r['name'] for r in off)}")
+        await ctx.respond("\n".join(lines)[:1990], ephemeral=self._eph(ctx))
 
     @discord.slash_command(name="createclock", description="Create a time clock embed for a user.")
     @is_timecard_admin()

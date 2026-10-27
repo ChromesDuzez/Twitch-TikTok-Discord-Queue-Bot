@@ -435,39 +435,14 @@ class InboxWorker:
         return True
 
     async def _close_open_worktimes(self, punch_id: int, end_local_str: str) -> None:
-        """End any open jobsite worktime on a punch that Odoo just clocked out.
-
-        Behaves exactly like the "End Work Now" button -- it reuses the same
-        ``round_quarter_hours`` + ``finalize_worktime`` helpers -- but derives the
-        span from timeStarted -> the Odoo check-out time instead of "now". Without
-        this an open Service/Construction/Office worktime would be stranded at 0h.
-        """
-        rows = await self.db.fetchall(
-            "SELECT id, punchType, timeStarted FROM work_time "
-            "WHERE punchID = ? AND timeSpent = 0 AND detached = 0",
-            (punch_id,),
-        )
-        if not rows:
-            return
-        # Local import mirrors _refresh_employee_clock -- avoids an import cycle and
-        # keeps "how a worktime is finished" defined once, in views.
-        from ..views import round_quarter_hours, finalize_worktime
-        try:
-            end_dt = datetime.strptime(end_local_str[:19], "%Y-%m-%d %H:%M:%S")
-        except (TypeError, ValueError):
-            log.warning(f"[Inbox] Can't parse check-out time {end_local_str!r}; not closing worktimes on punch {punch_id}.")
-            return
-        for wt in rows:
-            try:
-                started = datetime.strptime(wt["timeStarted"][:19], "%Y-%m-%d %H:%M:%S")
-            except (TypeError, ValueError):
-                log.warning(f"[Inbox] worktime {wt['id']} has an unparseable start time; skipping auto-close.")
-                continue
-            span = (end_dt - started).total_seconds() / 3600
-            hours = round_quarter_hours(span)  # floors at 0.25h, tames clock skew
-            minutes = await finalize_worktime(self.db, wt["id"], hours)
+        """End any open jobsite worktime on a punch that Odoo just clocked out — same
+        "End Work Now" math, but spanning to the Odoo check-out time. Delegates to the
+        shared helper in views (also used by auto-clock-out) so the logic lives once."""
+        # Local import mirrors _refresh_employee_clock -- avoids an import cycle.
+        from ..views import close_open_worktimes
+        for wt_id, punch_type, minutes in await close_open_worktimes(self.db, punch_id, end_local_str):
             log.info(
-                f"[Inbox] Odoo check-out ended open {wt['punchType']} worktime {wt['id']} "
+                f"[Inbox] Odoo check-out ended open {punch_type} worktime {wt_id} "
                 f"({minutes / 60:g}h) on punch {punch_id}."
             )
 
