@@ -56,6 +56,7 @@ Legend — **Use:** R = read (`fields`), F = filter (`domain`), O = order, W = w
 | `private_city` | R/W | ✅ | env `ODOO_EMPLOYEE_CITY_FIELD`. |
 | `private_state_id` | R/W | ✅ | Many2one → `res.country.state`; env `ODOO_EMPLOYEE_STATE_FIELD`. |
 | `private_zip` | R/W | ✅ | env `ODOO_EMPLOYEE_ZIP_FIELD`. |
+| `user_id` | F | ✅ | Many2one → `res.users`. Searched to map an Odoo editor (`write_uid`) back to a local employee for the approval-message credit. |
 
 The address/phone field names differ across Odoo configs, so they're
 **env-overridable** (`_employee_field_map()` in `inbox.py`); defaults are the
@@ -68,6 +69,7 @@ standard Odoo 19 private-address fields.
 | `employee_id` | R/W | ✅ | Many2one → `hr.employee`. |
 | `check_in` | R/W | ✅ | UTC datetime string. |
 | `check_out` | R/W | ✅ | UTC datetime string. |
+| `write_uid` | R | ✅ | Many2one → `res.users` ("last updated by"). Read to credit who edited a punch in Odoo on its open approval message. |
 
 ### `project.task`
 | Field | Use | Stored | Notes |
