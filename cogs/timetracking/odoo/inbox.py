@@ -373,7 +373,8 @@ class InboxWorker:
         local_emp = await self._local_employee_id(emp_odoo)
 
         punch = await self.db.fetchone(
-            "SELECT id, employeeID, punchInTime, punchOutTime FROM punch_clock WHERE odooId = ?",
+            "SELECT id, employeeID, punchInTime, punchOutTime, checkChannelId, checkMessageId "
+            "FROM punch_clock WHERE odooId = ?",
             (odoo_id,),
         )
 
@@ -424,6 +425,11 @@ class InboxWorker:
         if new_out and not punch["punchOutTime"]:
             await self._close_open_worktimes(punch["id"], new_out)
 
+        # If this punch still has a live approval message in the admin channel, note the
+        # Odoo-driven time change on it (like the Edit-punch button does) so it's visible
+        # that something came through and edited the value.
+        await self._note_approval_time_change(punch, new_in, new_out)
+
         await self.db.execute(
             "UPDATE punch_clock SET employeeID = ?, punchInTime = ?, punchOutTime = ? WHERE id = ?",
             (new_emp, new_in, new_out, punch["id"]),
@@ -445,6 +451,25 @@ class InboxWorker:
                 f"[Inbox] Odoo check-out ended open {punch_type} worktime {wt_id} "
                 f"({minutes / 60:g}h) on punch {punch_id}."
             )
+
+    async def _note_approval_time_change(self, punch, new_in, new_out) -> None:
+        """When an Odoo update changes a punch's time AND the punch still has a live
+        approval message in the admin channel, append a note to that message (mirrors the
+        Edit-punch button) so admins see the value was edited from Odoo. Best-effort."""
+        if not (punch["checkChannelId"] and punch["checkMessageId"]):
+            return
+        parts = []
+        if new_in != punch["punchInTime"]:
+            parts.append(f"clock-in `{punch['punchInTime'] or 'unset'}` → `{new_in or 'unset'}`")
+        if new_out != punch["punchOutTime"]:
+            parts.append(f"clock-out `{punch['punchOutTime'] or 'unset'}` → `{new_out or 'unset'}`")
+        if not parts:
+            return
+        try:
+            msg = await self.cog.obtain_message(int(punch["checkChannelId"]), int(punch["checkMessageId"]))
+            await msg.edit(content=msg.content + "\n☁️ Odoo updated " + " and ".join(parts) + ".")
+        except Exception as e:  # noqa: BLE001 - visibility nicety; never block the reconcile
+            log.warning(f"[Inbox] couldn't annotate approval message for punch {punch['id']}: {e}")
 
     async def _reconcile_analytic_line(self, odoo_id: int):
         fields = ["id", "unit_amount", "date", "task_id", "project_id", "partner_id", shift_field()]
