@@ -8,7 +8,9 @@ from _helpers import asynctest, new_db
 CHECK_IN_UTC, CHECK_OUT_UTC = "2026-10-01 14:00:00", "2026-10-01 22:00:00"
 NEW_IN = sync.utc_str_to_local_str(CHECK_IN_UTC)
 NEW_OUT = sync.utc_str_to_local_str(CHECK_OUT_UTC)
-REC = {"employee_id": [50, "Tester"], "check_in": CHECK_IN_UTC, "check_out": CHECK_OUT_UTC}
+# write_uid [res.users id, name]; hr_emp = the hr.employee id user_id maps to (or None).
+REC = {"employee_id": [50, "Tester"], "check_in": CHECK_IN_UTC, "check_out": CHECK_OUT_UTC,
+       "write_uid": [7, "Admin User"]}
 
 
 class _Msg:
@@ -17,11 +19,15 @@ class _Msg:
 
 
 class _Client:
-    async def read_record(s, model, odoo_id, fields): return dict(REC, id=odoo_id)
+    def __init__(s, rec=REC, hr_emp=None): s._rec = rec; s._hr_emp = hr_emp
+    async def read_record(s, model, odoo_id, fields): return dict(s._rec, id=odoo_id)
+    async def call(s, endpoint, data):
+        # Only /hr.employee/search_read (editor mapping) is exercised here.
+        return [{"id": s._hr_emp}] if s._hr_emp is not None else []
 
 
-def _worker(db, msg):
-    cog = types.SimpleNamespace(db=db, client=_Client())
+def _worker(db, msg, client=None):
+    cog = types.SimpleNamespace(db=db, client=client or _Client())
 
     async def _obtain(cid, mid): cog.obtained = (cid, mid); return msg
     cog.obtain_message = _obtain
@@ -42,17 +48,31 @@ async def _punch(db, *, check_ids=True, pin="2026-01-01 00:00:00", pout="2026-01
 
 
 @asynctest
-async def test_annotates_approval_message_on_odoo_time_change():
+async def test_annotates_with_odoo_name_when_editor_not_linked():
     db = await new_db(employee_odoo=50)
     try:
         await _punch(db)                       # existing punch, different times, has a live approval msg
         msg = _Msg()
-        w, cog = _worker(db, msg)
+        w, cog = _worker(db, msg)              # default client: editor maps to no local employee
         await w._reconcile_attendance(900)
         assert msg.edits == 1, "approval message should be annotated"
-        assert "☁️ Odoo updated" in msg.content
+        assert "Admin User updated this in Odoo" in msg.content   # falls back to the Odoo write_uid name
         assert "clock-in" in msg.content and NEW_IN in msg.content
         assert "clock-out" in msg.content and NEW_OUT in msg.content
+    finally:
+        await db.close()
+
+
+@asynctest
+async def test_annotates_with_discord_mention_when_editor_linked():
+    db = await new_db(employee_odoo=50)        # local employee 1 <-> hr.employee 50
+    try:
+        await _punch(db)
+        msg = _Msg()
+        # Odoo editor's res.users -> hr.employee id 50 -> local employee 1.
+        w, cog = _worker(db, msg, client=_Client(hr_emp=50))
+        await w._reconcile_attendance(900)
+        assert "<@1> updated this in Odoo" in msg.content          # relates to the linked Discord account
     finally:
         await db.close()
 

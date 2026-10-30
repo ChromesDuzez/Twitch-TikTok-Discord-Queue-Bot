@@ -362,7 +362,7 @@ class InboxWorker:
 
     async def _reconcile_attendance(self, odoo_id: int) -> bool:
         rec = await self.client.read_record(
-            "hr.attendance", odoo_id, ["id", "employee_id", "check_in", "check_out"]
+            "hr.attendance", odoo_id, ["id", "employee_id", "check_in", "check_out", "write_uid"]
         )
         if rec is None:
             return False
@@ -426,9 +426,9 @@ class InboxWorker:
             await self._close_open_worktimes(punch["id"], new_out)
 
         # If this punch still has a live approval message in the admin channel, note the
-        # Odoo-driven time change on it (like the Edit-punch button does) so it's visible
-        # that something came through and edited the value.
-        await self._note_approval_time_change(punch, new_in, new_out)
+        # Odoo-driven time change on it (like the Edit-punch button does), crediting the
+        # Odoo user who made the edit, so it's visible that something came through.
+        await self._note_approval_time_change(punch, new_in, new_out, rec.get("write_uid"))
 
         await self.db.execute(
             "UPDATE punch_clock SET employeeID = ?, punchInTime = ?, punchOutTime = ? WHERE id = ?",
@@ -452,10 +452,31 @@ class InboxWorker:
                 f"({minutes / 60:g}h) on punch {punch_id}."
             )
 
-    async def _note_approval_time_change(self, punch, new_in, new_out) -> None:
+    async def _editor_label(self, write_uid) -> str | None:
+        """A human label for the Odoo user who last wrote the record (its ``write_uid``):
+        the linked Discord employee's @mention when we can map res.users -> hr.employee
+        (user_id) -> local employee (odooId), otherwise the Odoo user's name."""
+        if not write_uid:
+            return None
+        uid = write_uid[0] if isinstance(write_uid, (list, tuple)) else write_uid
+        odoo_name = write_uid[1] if isinstance(write_uid, (list, tuple)) and len(write_uid) > 1 else None
+        try:
+            rows = await self.client.call(
+                "/hr.employee/search_read",
+                {"domain": [["user_id", "=", uid]], "fields": ["id"], "limit": 1})
+            if rows:
+                emp = await self.db.fetchone("SELECT id FROM employee WHERE odooId = ?", (rows[0]["id"],))
+                if emp:
+                    return f"<@{emp['id']}>"
+        except Exception as e:  # noqa: BLE001 - mapping is a nicety; fall back to the name
+            log.warning(f"[Inbox] couldn't map Odoo editor {uid} to a Discord account: {e}")
+        return odoo_name or f"Odoo user {uid}"
+
+    async def _note_approval_time_change(self, punch, new_in, new_out, write_uid=None) -> None:
         """When an Odoo update changes a punch's time AND the punch still has a live
         approval message in the admin channel, append a note to that message (mirrors the
-        Edit-punch button) so admins see the value was edited from Odoo. Best-effort."""
+        Edit-punch button) crediting the Odoo editor, so admins see the value was edited
+        from Odoo and by whom. Best-effort."""
         if not (punch["checkChannelId"] and punch["checkMessageId"]):
             return
         parts = []
@@ -465,9 +486,11 @@ class InboxWorker:
             parts.append(f"clock-out `{punch['punchOutTime'] or 'unset'}` → `{new_out or 'unset'}`")
         if not parts:
             return
+        who = await self._editor_label(write_uid) or "Someone"
         try:
             msg = await self.cog.obtain_message(int(punch["checkChannelId"]), int(punch["checkMessageId"]))
-            await msg.edit(content=msg.content + "\n☁️ Odoo updated " + " and ".join(parts) + ".")
+            await msg.edit(content=msg.content + f"\n☁️ {who} updated this in Odoo — " + " and ".join(parts) + ".")
+            log.info(f"[Inbox] punch {punch['id']} time changed in Odoo by {who}; noted on its approval message.")
         except Exception as e:  # noqa: BLE001 - visibility nicety; never block the reconcile
             log.warning(f"[Inbox] couldn't annotate approval message for punch {punch['id']}: {e}")
 
