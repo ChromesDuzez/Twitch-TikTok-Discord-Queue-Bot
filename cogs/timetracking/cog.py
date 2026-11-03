@@ -2226,15 +2226,18 @@ class TimeTracking(commands.Cog):
             await ctx.respond("That punch doesn't exist.", ephemeral=self._eph(ctx))
             return
         sets, params, changes = [], [], []  # changes = human "field: old → new" for the log
+        time_changed = False   # only a real time change needs an Odoo push
         try:
             if clock_in is not None:
                 nv = _parse_punch_time(clock_in)
                 sets.append("punchInTime = ?"); params.append(nv)
                 changes.append(f"clock-in {row['punchInTime'] or '—'} → {nv}")
+                time_changed = time_changed or nv != row["punchInTime"]
             if clock_out is not None:
                 nv = _parse_punch_time(clock_out)
                 sets.append("punchOutTime = ?"); params.append(nv)
                 changes.append(f"clock-out {row['punchOutTime'] or 'open'} → {nv}")
+                time_changed = time_changed or nv != row["punchOutTime"]
         except ValueError as e:
             await ctx.respond(str(e), ephemeral=self._eph(ctx))
             return
@@ -2252,12 +2255,16 @@ class TimeTracking(commands.Cog):
             await ctx.respond("Nothing to change — provide a new clock-in, clock-out, approval, or lunch setting.", ephemeral=self._eph(ctx))
             return
         await db.execute(f"UPDATE punch_clock SET {', '.join(sets)} WHERE id = ?", (*params, punch))
-        await sync.enqueue(db, "punch", punch, "edit")
+        # Only push to Odoo when a TIME actually changed — approval/lunch are Discord-only,
+        # and a redundant re-write just adds load to a rate-limited Odoo.
+        if time_changed:
+            await sync.enqueue(db, "punch", punch, "edit")
         await self._refresh_clock(row["employeeID"])
         erow = await db.fetchone("SELECT name FROM employee WHERE id = ?", (row["employeeID"],))
         ename = erow["name"] if erow else f"employee {row['employeeID']}"
         timecard_log.info(f"[Punch] {ctx.author} edited punch {punch} for {ename}: {'; '.join(changes)}.")
-        await ctx.respond(f"Updated punch #{punch}.", ephemeral=self._eph(ctx))
+        note = " — time change queued to Odoo." if time_changed else ""
+        await ctx.respond(f"Updated punch #{punch}.{note}", ephemeral=self._eph(ctx))
 
     @discord.slash_command(name="deletepunch", description="Delete a punch — review each linked worktime first.")
     @is_timecard_admin()

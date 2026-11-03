@@ -2,9 +2,13 @@
 import types
 
 from cogs.timetracking.cog import TimeTracking
-from _helpers import asynctest, db_ctx
+from _helpers import asynctest, db_ctx, outbox
 
 EDIT = TimeTracking.editpunch.callback
+
+
+async def _punch_ops(db):
+    return {op for (_t, _i, op) in await outbox(db, "punch")}
 
 
 class _Ctx:
@@ -74,3 +78,38 @@ async def test_lunch_change_is_independent_of_times():
         row = await db.fetchone("SELECT punchInTime, punchOutTime FROM punch_clock WHERE id=900")
         assert row["punchInTime"] == "2026-11-02 08:00:00"    # times untouched
         assert row["punchOutTime"] == "2026-11-02 16:30:00"
+
+
+# ---- Odoo push is gated on a real TIME change (rate-limit friendly) ---------
+
+@asynctest
+async def test_lunch_only_edit_does_not_push_to_odoo():
+    async with db_ctx() as db:
+        await _seed_punch(db, lunch=0)
+        await _call(db, ignore_lunch=True)
+        assert await _punch_ops(db) == set()       # no Odoo enqueue for a lunch-only change
+
+
+@asynctest
+async def test_approval_only_edit_does_not_push_to_odoo():
+    async with db_ctx() as db:
+        await _seed_punch(db)
+        await _call(db, approved=False)
+        assert await _punch_ops(db) == set()       # approval is Discord-only
+
+
+@asynctest
+async def test_same_time_resubmitted_does_not_push():
+    async with db_ctx() as db:
+        await _seed_punch(db)
+        await _call(db, clock_in="2026-11-02 08:00")   # identical to the stored time
+        assert await _punch_ops(db) == set()           # no real change -> no push
+
+
+@asynctest
+async def test_real_time_change_pushes_to_odoo():
+    async with db_ctx() as db:
+        await _seed_punch(db)
+        ctx = await _call(db, clock_out="2026-11-02 17:00")
+        assert "edit" in await _punch_ops(db)          # a real time change does push
+        assert any("queued to Odoo" in m for m in ctx.responses)
