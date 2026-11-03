@@ -2211,6 +2211,7 @@ class TimeTracking(commands.Cog):
         clock_in: discord.Option(str, default=None, description="New clock-in time [YYYY-MM-DD HH:MM]"),  # type: ignore
         clock_out: discord.Option(str, default=None, description="New clock-out time [YYYY-MM-DD HH:MM]"),  # type: ignore
         approved: discord.Option(bool, default=None, description="Set approval (leave blank to keep as-is)"),  # type: ignore
+        ignore_lunch: discord.Option(bool, default=None, description="Ignore the lunch for this punch (True = don't deduct the 30 min / pay it back)"),  # type: ignore
     ):
         db = await self._ensure_db()
         punch = _opt_int(punch)
@@ -2218,7 +2219,7 @@ class TimeTracking(commands.Cog):
             await ctx.respond("Pick a punch from the autocomplete list.", ephemeral=self._eph(ctx))
             return
         row = await db.fetchone(
-            "SELECT employeeID, punchInTime, punchOutTime, punchInApproval, punchOutApproval "
+            "SELECT employeeID, punchInTime, punchOutTime, punchInApproval, punchOutApproval, ignoreLunchBreak "
             "FROM punch_clock WHERE id = ?", (punch,)
         )
         if row is None:
@@ -2242,8 +2243,13 @@ class TimeTracking(commands.Cog):
             sets += ["punchInApproval = ?", "punchOutApproval = ?"]; params += [v, v]
             was = "approved" if (row["punchInApproval"] and row["punchOutApproval"]) else "pending"
             changes.append(f"approval {was} → {'approved' if approved else 'unapproved'}")
+        if ignore_lunch is not None:
+            v = 1 if ignore_lunch else 0
+            sets.append("ignoreLunchBreak = ?"); params.append(v)
+            was = "ignored" if row["ignoreLunchBreak"] else "deducted"
+            changes.append(f"lunch {was} → {'ignored (paid back)' if ignore_lunch else 'deducted'}")
         if not sets:
-            await ctx.respond("Nothing to change — provide a new clock-in, clock-out, or approval.", ephemeral=self._eph(ctx))
+            await ctx.respond("Nothing to change — provide a new clock-in, clock-out, approval, or lunch setting.", ephemeral=self._eph(ctx))
             return
         await db.execute(f"UPDATE punch_clock SET {', '.join(sets)} WHERE id = ?", (*params, punch))
         await sync.enqueue(db, "punch", punch, "edit")
