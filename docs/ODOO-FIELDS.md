@@ -134,7 +134,7 @@ customer against a partner's **former** name (renamed since). All stored.
 
 | Field | Model | Env override | Notes |
 | --- | --- | --- | --- |
-| `x_studio_shift` | `account.analytic.line` | `ODOO_SHIFT_FIELD` | **Studio** Many2one → `hr.attendance` linking a timesheet line to its shift. Requires Odoo Studio. Presence is probed at startup (`check_shift_field`); **deletion/reassignment support is gated on it**. Written only when present. |
+| `x_studio_shift` | `account.analytic.line` | `ODOO_SHIFT_FIELD` | **Studio** Many2one → `hr.attendance` linking a timesheet line to its shift. Requires Odoo Studio. Presence is probed on a schedule (`maybe_check_shift_field`: every ~5 min until found, then startup + daily; snoozable via `/shiftprobe`); **deletion/reassignment support is gated on it**. Written only when present. |
 
 ## Config-driven ids (not fields, but referenced in domains/logic)
 
