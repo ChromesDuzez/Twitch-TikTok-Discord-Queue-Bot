@@ -52,7 +52,7 @@ _MANAGEMENT_COMMANDS = {
     "viewtimecard", "abandonedworktime",
     "synccustomers", "linkcustomer", "unlinkcustomer", "unlinkedcustomers",
     "addcustomer", "editcustomer", "mergecustomers", "archivecustomer", "unarchivecustomer",
-    "deletecustomer", "purgeimportedcontacts", "reconcileattendance", "resync", "configureprojects", "configureroles", "configurecategories",
+    "deletecustomer", "purgeimportedcontacts", "reconcileattendance", "resync", "shiftprobe", "configureprojects", "configureroles", "configurecategories",
     "addemployee", "linkemployee", "unlinkemployee", "archiveemployee", "unarchiveemployee",
     "setpay", "payhistory", "bankadjust", "bankbalance",
     "creategroup", "addtogroup", "removefromgroup", "groupmembers",
@@ -1924,6 +1924,51 @@ class TimeTracking(commands.Cog):
                     worktimes += 1
 
         return punches, worktimes
+
+    @discord.slash_command(name="shiftprobe", description="Control how often the bot probes Odoo for the Studio shift field.")
+    @is_timecard_admin()
+    async def shiftprobe(
+        self, ctx: discord.ApplicationContext,
+        action: discord.Option(str, default="status", choices=["status", "snooze", "resume"], description="status (default), snooze frequent probing, or resume it"),  # type: ignore
+        days: discord.Option(int, default=7, description="Snooze length in days (for 'snooze'; default 7)"),  # type: ignore
+    ):
+        await self._ensure_db()
+        client = self.client
+        if not client.loaded:
+            await ctx.respond("Odoo isn't configured — there's nothing to probe.", ephemeral=self._eph(ctx))
+            return
+        key = "ODOO_SHIFT_PROBE_SNOOZE_UNTIL"
+        if action == "snooze":
+            days = max(1, days)
+            until = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+            config.set_env(key, until)
+            client.reset_shift_probe_schedule()
+            timecard_log.info(f"[Odoo] {ctx.author} snoozed shift-field probing for {days}d (until {until}).")
+            await ctx.respond(
+                f"🔕 Frequent shift-field probing snoozed for **{days} day(s)** (until `{until[:10]}`) — "
+                "it drops to a daily check, then resumes the ~5-minute check automatically.",
+                ephemeral=self._eph(ctx))
+            return
+        if action == "resume":
+            config.set_env(key, "")
+            client.reset_shift_probe_schedule()
+            timecard_log.info(f"[Odoo] {ctx.author} resumed normal shift-field probing.")
+            await ctx.respond("🔔 Resumed normal shift-field probing (~5 minutes until the field is found).",
+                              ephemeral=self._eph(ctx))
+            return
+        # status
+        raw = (os.getenv(key) or "").strip()
+        if client.shift_field_available:
+            cadence = "daily (the shift field is present — just a sanity re-check)"
+        elif raw:
+            cadence = f"daily (frequent probing snoozed until `{raw[:10]}`)"
+        else:
+            cadence = "every ~5 minutes (looking for the shift field)"
+        await ctx.respond(
+            f"Shift field: **{'found' if client.shift_field_available else 'not found yet'}**. "
+            f"Probing **{cadence}**." + ("" if client.shift_field_available else
+            "\nNot planning to add it? `/shiftprobe snooze` to quiet it down."),
+            ephemeral=self._eph(ctx))
 
     @discord.slash_command(name="resync", description="Force-push to Odoo now: retries failures and sends local-only items that were never synced.")
     @is_timecard_admin()

@@ -42,12 +42,25 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from datetime import date, timedelta
+import time
+from datetime import date, datetime, timedelta
 
 import requests
 
 import config
 from botlog import log
+
+
+def _shift_probe_snoozed() -> bool:
+    """True while the admin has snoozed frequent shift-field probing (via /shiftprobe) —
+    reads ODOO_SHIFT_PROBE_SNOOZE_UNTIL (a local timestamp; blank/invalid = not snoozed)."""
+    raw = (os.getenv("ODOO_SHIFT_PROBE_SNOOZE_UNTIL") or "").strip()
+    if not raw:
+        return False
+    try:
+        return datetime.now() < datetime.strptime(raw[:19], "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return False
 
 DEFAULT_TIMEOUT = 15
 
@@ -70,6 +83,9 @@ class OdooClient:
         # Set by detect_version(): the connected Odoo major series (e.g. 19). Foundation
         # for upcoming Odoo 19/20 support (Field Service moved into Planning in v20).
         self.odoo_version: int | None = None
+        # Monotonic time of the next shift-field probe (0 = probe on the next loop pass,
+        # i.e. at startup). See maybe_check_shift_field() for the cadence.
+        self._shift_probe_next = 0.0
 
     # ---- core --------------------------------------------------------------
 
@@ -146,6 +162,31 @@ class OdooClient:
                         "enabled" if available else "DISABLED")
         self.shift_field_available = available
         return available
+
+    def _shift_probe_interval(self) -> float:
+        """Seconds until the next shift-field probe. Frequent (5 min) while the field
+        hasn't been found yet — so a newly-created Studio field is picked up quickly —
+        unless an admin has snoozed it; once found (or snoozed) it's a daily sanity check."""
+        if self.shift_field_available or _shift_probe_snoozed():
+            return 86400.0   # daily
+        return 300.0         # every 5 minutes
+
+    async def maybe_check_shift_field(self):
+        """Probe the shift field only when due (see _shift_probe_interval). Because the
+        schedule starts at 0 and resets on restart, there's always one probe at startup,
+        then the computed cadence."""
+        if not self.loaded:
+            return
+        now = time.monotonic()
+        if now < self._shift_probe_next:
+            return
+        await self.check_shift_field()
+        self._shift_probe_next = now + self._shift_probe_interval()
+
+    def reset_shift_probe_schedule(self):
+        """Force the next loop pass to re-probe + recompute the interval (used after a
+        /shiftprobe snooze/resume so the change takes effect immediately)."""
+        self._shift_probe_next = 0.0
 
     async def detect_version(self) -> int | None:
         """Probe the connected Odoo's major series and cache it on ``odoo_version``.

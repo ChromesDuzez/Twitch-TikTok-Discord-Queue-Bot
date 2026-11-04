@@ -97,18 +97,16 @@ class SyncWorker:
             self._task = None
 
     async def _loop(self):
-        probe = 0
         while True:
             try:
                 if self.client.loaded:
-                    # Re-probe the Studio shift field periodically (self-heals if
-                    # it's added later); gates deletion support. ~every 10th pass.
-                    if probe % 10 == 0:
-                        await self.client.check_shift_field()
+                    # Probe the Studio shift field on its own schedule (frequent until
+                    # found, then daily; snoozable via /shiftprobe) — self-heals if the
+                    # field is added later and gates deletion support.
+                    await self.client.maybe_check_shift_field()
                     # Detect the Odoo major version once (self-heals until it sticks).
                     if self.client.odoo_version is None:
                         await self.client.detect_version()
-                    probe += 1
                     await self.drain()
             except asyncio.CancelledError:
                 raise
