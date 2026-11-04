@@ -17,7 +17,10 @@ import discord
 
 from botlog import log, timecard_log
 from .db import Database, db_dir
-from .modals import Confirm, CustomerInputModal, CustomerSelectMenu, EditPunchTimeModal, GetTimeSpent
+from .modals import (
+    CustomerInputModal, CustomerSelectMenu, DeleteShiftConfirmModal,
+    EditPunchTimeModal, GetTimeSpent,
+)
 from .perms import CLOCK_ROLES, has_perms
 from .odoo import sync
 from .costing import punch_span
@@ -750,10 +753,12 @@ async def _refresh_clock_for_employee(cog, employee_id: int):
 
 # ---- deletion (accidental shift + Odoo-side delete approvals) ---------------
 
-async def delete_punch_cascade(cog, punch_id: int, to_odoo: bool = True) -> int | None:
+async def delete_punch_cascade(cog, punch_id: int, to_odoo: bool = True,
+                               remove_message: bool = True) -> int | None:
     """Delete a punch and its worktime, clean up its approval message, and
     (optionally) cascade the deletes to Odoo. Returns the employee id so the
-    caller can refresh their clock."""
+    caller can refresh their clock. Set ``remove_message=False`` to leave the
+    approval message in place (the caller annotates it instead of deleting it)."""
     db = cog.db
     punch = await db.fetchone(
         "SELECT odooId, employeeID, checkChannelId, checkMessageId FROM punch_clock WHERE id = ?",
@@ -787,8 +792,9 @@ async def delete_punch_cascade(cog, punch_id: int, to_odoo: bool = True) -> int 
     await db.execute("DELETE FROM work_time WHERE punchID = ?", (punch_id,))
     await db.execute("DELETE FROM punch_clock WHERE id = ?", (punch_id,))
 
-    # Remove the approval message so no orphaned buttons linger.
-    if punch["checkChannelId"] and punch["checkMessageId"]:
+    # Remove the approval message so no orphaned buttons linger — unless the caller wants
+    # to keep it (e.g. to annotate "deleted by …" and just strip the buttons).
+    if remove_message and punch["checkChannelId"] and punch["checkMessageId"]:
         try:
             msg = await cog.obtain_message(punch["checkChannelId"], punch["checkMessageId"])
             await msg.delete()
@@ -945,7 +951,9 @@ class DeletePunchFlow(discord.ui.View):
 
 
 class DeleteShiftButton(discord.ui.Button):
-    """Admin-only: delete an accidental shift from the approval message."""
+    """Admin-only: delete an accidental shift — behind a typed-CONFIRM modal that shows
+    the shift's details. On confirm, the approval message is kept (buttons stripped) with
+    a 'deleted by …' note, rather than vanishing."""
 
     def __init__(self):
         super().__init__(label="Delete shift", style=discord.ButtonStyle.danger)
@@ -955,24 +963,60 @@ class DeleteShiftButton(discord.ui.Button):
         if not has_perms(interaction.user, accepted_roles=("TIMECARD_ADMIN_ROLE",)):
             await interaction.response.send_message("This is not for you!", ephemeral=True)
             return
-        row = await view.db.fetchone(
-            "SELECT count(*) AS c FROM work_time WHERE punchID = ?", (view.punch_id,)
-        )
-        wt_count = row["c"]
-        if wt_count:
-            confirm = Confirm(user=interaction.user, timeout=60)
-            await interaction.response.send_message(
-                f"This shift has {wt_count} worktime entr{'y' if wt_count == 1 else 'ies'}. "
-                "Delete them too?", view=confirm, ephemeral=True)
-            await confirm.wait()
-            if not confirm.value:
-                await interaction.followup.send("Deletion cancelled.", ephemeral=True)
-                return
-        else:
-            await interaction.response.defer(ephemeral=True)
-        emp = await delete_punch_cascade(view.cog, view.punch_id, to_odoo=True)
-        if emp:
-            await _refresh_clock_for_employee(view.cog, emp)
+        details = await self._shift_details(view.db, view.punch_id)
+        if details is None:
+            await interaction.response.send_message("That shift no longer exists.", ephemeral=True)
+            return
+        await interaction.response.send_modal(
+            DeleteShiftConfirmModal(view.punch_id, details, self._do_delete))
+
+    async def _shift_details(self, db, punch_id) -> str | None:
+        """A human summary of the shift for the confirm modal (None if it's gone)."""
+        punch = await db.fetchone(
+            "SELECT pc.punchInTime, pc.punchOutTime, e.name AS ename FROM punch_clock pc "
+            "JOIN employee e ON pc.employeeID = e.id WHERE pc.id = ?", (punch_id,))
+        if punch is None:
+            return None
+        wts = await db.fetchall(
+            "SELECT wt.id, wt.punchType, wt.timeSpent, wt.detached, c.name AS cname "
+            "FROM work_time wt LEFT JOIN customer c ON wt.customerID = c.id "
+            "WHERE wt.punchID = ? ORDER BY wt.timeStarted, wt.id", (punch_id,))
+        lines = [
+            f"Employee:  {punch['ename']}",
+            f"Clock-in:  {punch['punchInTime'] or 'unset'}",
+            f"Clock-out: {punch['punchOutTime'] or 'open'}",
+            "",
+            f"Worktime ({len(wts)}):" if wts else "Worktime: none",
+        ]
+        for w in wts:
+            hrs = (w["timeSpent"] or 0) / 60
+            cust = f" · {w['cname']}" if w["cname"] else ""
+            tag = "  [detached — Odoo line kept]" if w["detached"] else ""
+            lines.append(f" • #{w['id']} {w['punchType']} {hrs:g}h{cust}{tag}")
+        lines += ["", "This permanently deletes the shift and its worktime (and the matching "
+                  "Odoo records). This cannot be undone."]
+        return "\n".join(lines)
+
+    async def _do_delete(self, interaction: discord.Interaction):
+        view: ApprovePunch = self.view
+        await interaction.response.defer(ephemeral=True)
+        wt_count = (await view.db.fetchone(
+            "SELECT count(*) AS c FROM work_time WHERE punchID = ?", (view.punch_id,)))["c"]
+        emp = await delete_punch_cascade(view.cog, view.punch_id, to_odoo=True, remove_message=False)
+        if emp is None:
+            await interaction.followup.send("That shift no longer exists.", ephemeral=True)
+            return
+        # Keep the approval message: strip its buttons and note who deleted it (mirrors
+        # the edit-time annotation) rather than deleting the message outright.
+        try:
+            wt_note = (f" and its {wt_count} worktime entr{'y' if wt_count == 1 else 'ies'}"
+                       if wt_count else "")
+            await view.message.edit(
+                content=view.message.content + f"\n🗑️ {interaction.user} deleted this shift{wt_note}.",
+                view=None)
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"[Punch] couldn't annotate deleted-shift message for punch {view.punch_id}: {e}")
+        await _refresh_clock_for_employee(view.cog, emp)
         timecard_log.info(
             f"[Punch] {interaction.user} deleted shift (punch {view.punch_id}, {wt_count} worktime).")
         await interaction.followup.send("Shift deleted.", ephemeral=True)

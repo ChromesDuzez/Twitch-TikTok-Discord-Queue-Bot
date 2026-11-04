@@ -154,3 +154,37 @@ class CustomerSelectMenu(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.defer()
         await self._on_select(interaction, int(self.values[0]))
+
+
+class DeleteShiftConfirmModal(discord.ui.Modal):
+    """Guard shift deletion: show the shift's details and require typing CONFIRM, so a
+    deletion is always a conscious choice. The details field is reference-only (ignored);
+    only the typed confirmation gates ``on_confirm``."""
+
+    def __init__(self, punch_id: int, details: str,
+                 on_confirm: Callable[[discord.Interaction], Awaitable[None]]):
+        super().__init__(title=f"Delete shift #{punch_id}?"[:45])
+        self._on_confirm = on_confirm
+        self.add_item(
+            discord.ui.InputText(
+                label="Shift being deleted (reference only)",
+                value=details[:4000],
+                required=False,
+                style=discord.InputTextStyle.paragraph,
+            )
+        )
+        self.add_item(
+            discord.ui.InputText(
+                label="Type CONFIRM to delete",
+                placeholder="CONFIRM",
+                max_length=20,
+                style=discord.InputTextStyle.short,
+            )
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if (self.children[1].value or "").strip().lower() != "confirm":
+            await interaction.response.send_message(
+                "Deletion cancelled — you didn't type `CONFIRM`.", ephemeral=True)
+            return
+        await self._on_confirm(interaction)
