@@ -8,8 +8,9 @@ from _helpers import asynctest, db_ctx, add_punch, add_worktime, outbox
 
 
 class _Msg:
-    def __init__(s): s.deleted = False
+    def __init__(s): s.deleted = False; s.content = "approval prompt"
     async def delete(s): s.deleted = True
+    async def edit(s, **k): s.content = k.get("content", s.content)
 
 
 class _Cog:
@@ -42,7 +43,7 @@ async def test_cascade_deletes_odoo_lines_then_attendance_no_orphans():
     async with db_ctx() as db:
         await _seed(db)
         cog = _Cog(db)
-        emp = await delete_punch_cascade(cog, 900, to_odoo=True, remove_message=False)
+        emp = await delete_punch_cascade(cog, 900, to_odoo=True, annotate="\n🗑️ deleted.")
         assert emp == 1
         # local rows gone
         assert await db.fetchone("SELECT 1 FROM punch_clock WHERE id=900") is None
@@ -60,20 +61,23 @@ async def test_cascade_deletes_odoo_lines_then_attendance_no_orphans():
 
 
 @asynctest
-async def test_remove_message_false_keeps_the_approval_message():
+async def test_annotate_keeps_and_edits_the_approval_message():
     async with db_ctx() as db:
         await _seed(db)
         cog = _Cog(db)
-        await delete_punch_cascade(cog, 900, to_odoo=True, remove_message=False)
-        assert cog.obtained is None and cog.msg.deleted is False   # message left for the caller to annotate
+        await delete_punch_cascade(cog, 900, to_odoo=True, annotate="\n🗑️ gone.")
+        # message kept + edited (not deleted)
+        assert cog.obtained == (111, 222)
+        assert cog.msg.deleted is False
+        assert "🗑️ gone." in cog.msg.content
 
 
 @asynctest
-async def test_remove_message_true_deletes_the_approval_message():
+async def test_no_annotate_deletes_the_approval_message():
     async with db_ctx() as db:
         await _seed(db)
         cog = _Cog(db)
-        await delete_punch_cascade(cog, 900, to_odoo=True, remove_message=True)
+        await delete_punch_cascade(cog, 900, to_odoo=True)   # annotate=None -> delete message
         assert cog.obtained == (111, 222) and cog.msg.deleted is True
 
 
@@ -83,7 +87,7 @@ async def test_offline_delete_enqueues_nothing_but_removes_local():
         await add_punch(db, 901, odoo=None)
         await add_worktime(db, 300, 901, odoo=None, mins=30)
         cog = _Cog(db)
-        emp = await delete_punch_cascade(cog, 901, to_odoo=False, remove_message=False)
+        emp = await delete_punch_cascade(cog, 901, to_odoo=False, annotate="\n🗑️ gone.")
         assert emp == 1
         assert await db.fetchone("SELECT 1 FROM punch_clock WHERE id=901") is None
         assert await outbox(db) == set()

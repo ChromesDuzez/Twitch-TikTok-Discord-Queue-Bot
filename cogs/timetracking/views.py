@@ -754,11 +754,12 @@ async def _refresh_clock_for_employee(cog, employee_id: int):
 # ---- deletion (accidental shift + Odoo-side delete approvals) ---------------
 
 async def delete_punch_cascade(cog, punch_id: int, to_odoo: bool = True,
-                               remove_message: bool = True) -> int | None:
+                               annotate: str | None = None) -> int | None:
     """Delete a punch and its worktime, clean up its approval message, and
     (optionally) cascade the deletes to Odoo. Returns the employee id so the
-    caller can refresh their clock. Set ``remove_message=False`` to leave the
-    approval message in place (the caller annotates it instead of deleting it)."""
+    caller can refresh their clock. If ``annotate`` is given, the punch's approval
+    message is kept — its buttons stripped and the text appended — instead of being
+    deleted (used so a 'deleted by …' note survives)."""
     db = cog.db
     punch = await db.fetchone(
         "SELECT odooId, employeeID, checkChannelId, checkMessageId FROM punch_clock WHERE id = ?",
@@ -792,12 +793,15 @@ async def delete_punch_cascade(cog, punch_id: int, to_odoo: bool = True,
     await db.execute("DELETE FROM work_time WHERE punchID = ?", (punch_id,))
     await db.execute("DELETE FROM punch_clock WHERE id = ?", (punch_id,))
 
-    # Remove the approval message so no orphaned buttons linger — unless the caller wants
-    # to keep it (e.g. to annotate "deleted by …" and just strip the buttons).
-    if remove_message and punch["checkChannelId"] and punch["checkMessageId"]:
+    # The approval message: annotate + strip buttons (keep it) when the caller passed
+    # text, otherwise delete it so no orphaned buttons linger.
+    if punch["checkChannelId"] and punch["checkMessageId"]:
         try:
             msg = await cog.obtain_message(punch["checkChannelId"], punch["checkMessageId"])
-            await msg.delete()
+            if annotate:
+                await msg.edit(content=msg.content + annotate, view=None)
+            else:
+                await msg.delete()
         except Exception:  # noqa: BLE001
             pass
     return punch["employeeID"]
@@ -858,6 +862,16 @@ def _punch_label(row) -> str:
     return f"{pin}→{pout} (#{row['id']})"
 
 
+async def reassign_candidates(db, punch_id: int):
+    """The employee's OTHER shifts, as reassignment targets for a punch being deleted."""
+    p = await db.fetchone("SELECT employeeID FROM punch_clock WHERE id = ?", (punch_id,))
+    if not p:
+        return []
+    return await db.fetchall(
+        "SELECT id, punchInTime, punchOutTime FROM punch_clock WHERE employeeID = ? AND id != ? "
+        "ORDER BY id DESC LIMIT 24", (p["employeeID"], punch_id))
+
+
 class _WorktimeDecisionSelect(discord.ui.Select):
     """Per-worktime dropdown: delete it with the punch, or reassign to another."""
 
@@ -901,18 +915,28 @@ class _ConfirmDeleteFlowButton(discord.ui.Button):
                 reassigned += 1
         # Whatever is still marked "delete" remains on the punch and is removed
         # by the cascade; reassigned rows now hang off their new punch instead.
-        emp = await delete_punch_cascade(flow.cog, flow.punch_id, to_odoo=True)
+        annotate = None
+        if flow.annotate:
+            kept = f" ({reassigned} worktime reassigned)" if reassigned else ""
+            annotate = flow.annotate + kept + "."
+        emp = await delete_punch_cascade(
+            flow.cog, flow.punch_id, to_odoo=flow.cascade_to_odoo, annotate=annotate)
         if emp:
             emps.add(emp)
         for e in emps:
             await _refresh_clock_for_employee(flow.cog, e)
         flow.disable_all_items()
-        msg = f"Deleted punch #{flow.punch_id}."
+        msg = f"Deleted shift #{flow.punch_id}."
         if reassigned:
             msg += (f" Reassigned {reassigned} worktime "
                     f"entr{'y' if reassigned == 1 else 'ies'} to another shift "
                     f"(Odoo shift links updated).")
         await interaction.edit_original_response(content=msg, view=flow)
+        if flow.on_complete:
+            try:
+                await flow.on_complete(interaction, reassigned)
+            except Exception as e:  # noqa: BLE001
+                log.warning(f"[Punch] delete-flow on_complete failed for punch {flow.punch_id}: {e}")
         timecard_log.info(f"[Punch] {interaction.user} confirmed delete review for punch {flow.punch_id}: {msg}")
         flow.stop()
 
@@ -932,11 +956,19 @@ class DeletePunchFlow(discord.ui.View):
     """Interactive /deletepunch review: decide each linked worktime's fate
     (delete with the punch or reassign to another shift) before deleting."""
 
-    def __init__(self, cog, punch_id, worktimes, candidates, author_id):
+    def __init__(self, cog, punch_id, worktimes, candidates, author_id,
+                 *, cascade_to_odoo: bool = True, annotate: str | None = None, on_complete=None):
         super().__init__(timeout=180)
         self.cog = cog
         self.punch_id = punch_id
         self.author_id = author_id
+        # cascade_to_odoo: push the deletes to Odoo (False when Odoo already deleted the
+        # shift). annotate: keep + annotate the punch's approval message instead of deleting
+        # it. on_complete(interaction, reassigned): extra bookkeeping (e.g. the Odoo-delete
+        # path clears its pending action + marks its own prompt).
+        self.cascade_to_odoo = cascade_to_odoo
+        self.annotate = annotate
+        self.on_complete = on_complete
         self.decisions = {wt["id"]: "delete" for wt in worktimes}
         for wt in worktimes:  # up to 4 (Discord row limit; the 5th row is the buttons)
             self.add_item(_WorktimeDecisionSelect(self, wt, candidates))
@@ -966,6 +998,24 @@ class DeleteShiftButton(discord.ui.Button):
         details = await self._shift_details(view.db, view.punch_id)
         if details is None:
             await interaction.response.send_message("That shift no longer exists.", ephemeral=True)
+            return
+        wts = await view.db.fetchall(
+            "SELECT wt.id, wt.punchType, wt.timeSpent, c.name AS cname FROM work_time wt "
+            "LEFT JOIN customer c ON wt.customerID = c.id WHERE wt.punchID = ? "
+            "ORDER BY wt.timeStarted, wt.id", (view.punch_id,))
+        # 1–4 worktime entries: open the per-worktime review (delete or reassign each).
+        # Discord caps a view at 4 such dropdowns, so for 0 or >4 fall back to the
+        # typed-CONFIRM modal (and point >4 at /reassignworktime to keep any).
+        if 1 <= len(wts) <= 4:
+            candidates = await reassign_candidates(view.db, view.punch_id)
+            note = "" if candidates else "\n(No other shift for this employee, so reassignment isn't available.)"
+            flow = DeletePunchFlow(
+                view.cog, view.punch_id, wts, candidates, interaction.user.id,
+                cascade_to_odoo=True, annotate=f"\n🗑️ {interaction.user} deleted this shift")
+            await interaction.response.send_message(
+                f"Deleting shift #{view.punch_id} — for each worktime entry choose **delete with "
+                f"the shift** or **reassign to another shift**, then Confirm.{note}",
+                view=flow, ephemeral=True)
             return
         await interaction.response.send_modal(
             DeleteShiftConfirmModal(view.punch_id, details, self._do_delete))
@@ -1002,20 +1052,15 @@ class DeleteShiftButton(discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
         wt_count = (await view.db.fetchone(
             "SELECT count(*) AS c FROM work_time WHERE punchID = ?", (view.punch_id,)))["c"]
-        emp = await delete_punch_cascade(view.cog, view.punch_id, to_odoo=True, remove_message=False)
+        wt_note = (f" and its {wt_count} worktime entr{'y' if wt_count == 1 else 'ies'}"
+                   if wt_count else "")
+        # Keep the approval message (annotate + strip buttons) rather than deleting it.
+        emp = await delete_punch_cascade(
+            view.cog, view.punch_id, to_odoo=True,
+            annotate=f"\n🗑️ {interaction.user} deleted this shift{wt_note}.")
         if emp is None:
             await interaction.followup.send("That shift no longer exists.", ephemeral=True)
             return
-        # Keep the approval message: strip its buttons and note who deleted it (mirrors
-        # the edit-time annotation) rather than deleting the message outright.
-        try:
-            wt_note = (f" and its {wt_count} worktime entr{'y' if wt_count == 1 else 'ies'}"
-                       if wt_count else "")
-            await view.message.edit(
-                content=view.message.content + f"\n🗑️ {interaction.user} deleted this shift{wt_note}.",
-                view=None)
-        except Exception as e:  # noqa: BLE001
-            log.warning(f"[Punch] couldn't annotate deleted-shift message for punch {view.punch_id}: {e}")
         await _refresh_clock_for_employee(view.cog, emp)
         timecard_log.info(
             f"[Punch] {interaction.user} deleted shift (punch {view.punch_id}, {wt_count} worktime).")
@@ -1053,18 +1098,59 @@ class DeleteApproveButton(discord.ui.Button):
             await interaction.response.send_message("This is not for you!", ephemeral=True)
             return
         # Odoo already deleted it -> don't cascade back to Odoo.
-        if view.local_kind == "punch":
-            emp = await delete_punch_cascade(view.cog, view.local_id, to_odoo=False)
-        else:
+        # A single timesheet deletion: nothing to review.
+        if view.local_kind != "punch":
             emp = await delete_worktime_local(view.cog, view.local_id, to_odoo=False)
+            if emp:
+                await _refresh_clock_for_employee(view.cog, emp)
+            await view.cog.clear_pending_action(view.pending_id)
+            await interaction.message.edit(
+                content=interaction.message.content + f"\n✅ {interaction.user} approved the deletion.",
+                view=None)
+            timecard_log.info(f"[Delete] {interaction.user} approved Odoo deletion of {view.model}:{view.odoo_id}.")
+            await interaction.response.send_message("Deletion approved.", ephemeral=True)
+            return
+
+        # A shift: if it has worktime, review each entry (delete or reassign to a surviving
+        # shift) before removing it — mirrors the Discord "Delete shift" flow. The punch's
+        # own approval message (if any) is annotated "deleted in Odoo" instead of removed.
+        annotate = f"\n🗑️ this shift was deleted in Odoo — approved by {interaction.user}."
+        wts = await view.db.fetchall(
+            "SELECT wt.id, wt.punchType, wt.timeSpent, c.name AS cname FROM work_time wt "
+            "LEFT JOIN customer c ON wt.customerID = c.id WHERE wt.punchID = ? "
+            "ORDER BY wt.timeStarted, wt.id", (view.local_id,))
+        prompt_msg, pending_id, cog = interaction.message, view.pending_id, view.cog
+        if 1 <= len(wts) <= 4:
+            candidates = await reassign_candidates(view.db, view.local_id)
+            note = "" if candidates else "\n(No other shift for this employee, so reassignment isn't available.)"
+
+            async def _on_complete(flow_interaction, reassigned):
+                await cog.clear_pending_action(pending_id)
+                try:
+                    await prompt_msg.edit(
+                        content=prompt_msg.content + f"\n✅ {flow_interaction.user} approved the deletion.",
+                        view=None)
+                except Exception as e:  # noqa: BLE001
+                    log.warning(f"[Delete] couldn't annotate delete prompt for punch {view.local_id}: {e}")
+
+            flow = DeletePunchFlow(
+                cog, view.local_id, wts, candidates, interaction.user.id,
+                cascade_to_odoo=False, annotate=annotate, on_complete=_on_complete)
+            await interaction.response.send_message(
+                f"Odoo deleted this shift — for each worktime entry choose **delete** or "
+                f"**reassign to another shift**, then Confirm.{note}", view=flow, ephemeral=True)
+            return
+
+        # No worktime (or >4 — can't show per-entry dropdowns): apply the delete directly.
+        emp = await delete_punch_cascade(cog, view.local_id, to_odoo=False, annotate=annotate)
         if emp:
-            await _refresh_clock_for_employee(view.cog, emp)
-        await view.cog.clear_pending_action(view.pending_id)
+            await _refresh_clock_for_employee(cog, emp)
+        await cog.clear_pending_action(pending_id)
+        extra = f" ({len(wts)} worktime removed — reassign any to keep with /reassignworktime beforehand)" if len(wts) > 4 else ""
         await interaction.message.edit(
-            content=interaction.message.content + f"\n✅ {interaction.user} approved the deletion.",
+            content=interaction.message.content + f"\n✅ {interaction.user} approved the deletion.{extra}",
             view=None)
-        timecard_log.info(
-            f"[Delete] {interaction.user} approved Odoo deletion of {view.model}:{view.odoo_id}.")
+        timecard_log.info(f"[Delete] {interaction.user} approved Odoo deletion of {view.model}:{view.odoo_id}.")
         await interaction.response.send_message("Deletion approved.", ephemeral=True)
 
 
